@@ -1,0 +1,16 @@
+# secrets / runtime state — never publish
+*.pem
+*.key
+*.p12
+*.crt
+token
+agents.json
+acp-data/
+.acp/
+.acp-crdt/
+# build/work temp
+*.tmp
+*.log
+*.bak
+.DS_Store
+dist/tmp/
