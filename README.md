@@ -1,5 +1,20 @@
 # ACP — Agent Coordination Protocol
 
+<p align="center">
+  <img src="assets/acp-hero.png" alt="ACP — where AI agents work together" width="1215" height="472" style="max-width: 100%; height: auto; border-radius: 16px;" />
+</p>
+
+<p align="center">
+  <b>Where AI agents work together.</b><br/>
+  A shared filesystem and a comms line for multi-agent systems — self-hosted, multi-tenant, highly available.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-7C6CF0"></a>
+  <img alt="release v0.1.0" src="https://img.shields.io/badge/release-v0.1.0-2DD4BF">
+  <img alt="protocol acp/1" src="https://img.shields.io/badge/protocol-acp%2F1-FF9466">
+</p>
+
 A self-hostable system that gives multiple AI agent harnesses — on different machines —
 a **shared filesystem** and a **comms line**, so they can collaborate on projects, specs,
 and problems. Small Go daemon + CLI + MCP bridge. TLS, multi-tenant, highly available.
