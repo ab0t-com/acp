@@ -1,0 +1,830 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/1                                          ab0t.com
+Category: Protocol Specification                                   June 2026
+ISSN: n/a
+
+
+            ACP: The Agent Coordination Protocol, Version 1
+
+Abstract
+
+   The Agent Coordination Protocol (ACP) gives two or more autonomous
+   software agents -- typically AI "agent harnesses" running on different
+   machines -- a shared filesystem and a communications channel so they
+   can collaborate: co-author files and documents, exchange messages,
+   coordinate exclusive access to resources, and observe a single ordered
+   record of what happened.  ACP is a client/authority protocol over
+   HTTPS: a daemon ("coordd") is the authority; agents are clients.  This
+   document specifies version 1 of the protocol ("acp/1"): its transport,
+   authentication and authorization, multi-tenant "spaces", the totally-
+   ordered event log, the directed mailbox, fencing-token leases, the
+   content-addressed shared filesystem (blobs + a CAS-versioned
+   manifest), collaborative documents (a sequence CRDT), presence, the
+   high-availability (Raft) clustering model, administration, the error
+   model, and security considerations.
+
+Status of This Memo
+
+   This is a product protocol specification published for implementers
+   and integrators of ACP.  It is complete and normative for "acp/1".
+   Distribution is unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  This specification is licensed under the MIT
+   License, the same license as the reference implementation.
+
+
+Table of Contents
+
+   1.  Introduction
+   2.  Conventions and Terminology
+   3.  Architecture
+   4.  Transport
+   5.  Authentication and Authorization
+   6.  Message Conventions (Headers, Encoding, Errors)
+   7.  Spaces (Multi-Tenancy)
+   8.  Event Log
+   9.  Mailbox
+   10. Leases
+   11. Shared Filesystem: Blobs and Manifest
+   12. Collaborative Documents (CRDT)
+   13. Presence
+   14. High Availability (Clustering)
+   15. Administration
+   16. Wire API Reference
+   17. Determinism Requirements
+   18. Versioning and Compatibility
+   19. Security Considerations
+   20. References
+   Appendix A.  Data Types
+   Appendix B.  Error Catalog
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction
+
+   Multiple autonomous agents that work together need two things they do
+   not get from a bare network: a place to share files and state with a
+   consistent view, and a channel to message and coordinate without
+   corrupting one another's work.  Peer-to-peer file sync provides
+   eventual consistency and conflict files; that is insufficient for
+   questions like "did I acquire the lock?" or "what is the current task
+   state?".  ACP therefore defines a single AUTHORITY that imposes a
+   total order on all coordination events and mediates all shared state.
+
+   ACP provides, per isolated "space":
+
+   o  a content-addressed SHARED FILESYSTEM with compare-and-swap commits
+      and 3-way reconciliation;
+   o  COLLABORATIVE DOCUMENTS that converge automatically when many
+      agents edit the same text concurrently (a sequence CRDT);
+   o  a directed MAILBOX for agent-to-agent messages;
+   o  a totally-ordered, durable EVENT LOG that all agents replay to
+      derive shared state;
+   o  fencing-token LEASES for safe mutual exclusion;
+   o  PRESENCE and identity.
+
+   The authority MAY run as a single node or as a Raft cluster for high
+   availability.  Clients are unaffected by which.
+
+   This document specifies the wire protocol, not any particular
+   implementation, except where determinism (Section 17) constrains
+   implementations of a cluster.
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in RFC 2119 and RFC 8174
+   when, and only when, they appear in all capitals.
+
+   Agent          A client participant, identified by an agent id.  An AI
+                  harness (e.g., a coding agent) is the typical agent.
+
+   Authority      The logical service that owns all coordination state.
+                  Realized by one daemon ("coordd") or a cluster thereof.
+
+   coordd         The reference daemon implementing the authority.
+
+   Node           One process/member of an authority cluster.
+
+   Leader         In a cluster, the node that accepts writes (Section 14).
+
+   Space          A named, fully isolated tenant: its own event log,
+                  mailbox, leases, filesystem, documents, and presence.
+                  Spaces share nothing.  The default space is "default".
+
+   Event          One immutable, sequence-numbered record in the event
+                  log (Section 8).
+
+   Seq            A strictly increasing 64-bit unsigned integer assigned
+                  by the authority to each event, defining total order.
+
+   Message        A directed mailbox item from one agent to another
+                  (Section 9).
+
+   Lease          A TTL-bounded advisory lock on a named resource, with a
+                  fencing token (Section 10).
+
+   Fencing token  A strictly increasing 64-bit unsigned integer minted on
+                  each lease grant, used to reject a stale lock holder.
+
+   Blob           An immutable byte object addressed by the SHA-256 hash
+                  of its (plaintext) contents (Section 11).
+
+   Manifest       The versioned map of logical paths to blob hashes that
+                  defines a space's shared filesystem (Section 11).
+
+   Document       A collaborative text object edited via CRDT operations
+                  (Section 12).
+
+   Op             A single CRDT mutation (insert or delete).
+
+   Epoch          A per-document generation counter, incremented when a
+                  document's operation log is compacted (Section 12).
+
+   Write          Any request that mutates authority state.  Reads do not
+                  mutate state.
+
+3.  Architecture
+
+   ACP is client/authority.  Agents are clients; the authority is a
+   single source of truth.  Agents do not communicate peer-to-peer; they
+   rendezvous through the authority, which is what makes ordering,
+   locking, and audit consistent.
+
+      machine 1                                       machine 2
+   +-----------+      HTTPS (TLS, bearer token)      +-----------+
+   | agent A   |<----------------------------------->| agent B   |
+   | (client)  |                  |                  | (client)  |
+   +-----------+         +------------------+         +-----------+
+                         |   authority      |
+                         |  (coordd / Raft) |
+                         |  per space:      |
+                         |   event log      |
+                         |   mailbox        |
+                         |   leases         |
+                         |   blobs+manifest |
+                         |   documents      |
+                         |   presence       |
+                         +------------------+
+
+   The authority MUST present one logical HTTPS endpoint.  An
+   implementation MAY be a single node or a cluster (Section 14); the
+   client-visible protocol is identical.
+
+   All state is partitioned by space (Section 7).  Within a space the
+   authority maintains the six subsystems above.
+
+4.  Transport
+
+   ACP runs over HTTP/1.1 or HTTP/2 on TLS ("HTTPS").
+
+   4.1.  TLS
+
+   The authority MUST serve TLS 1.2 or later (TLS 1.3 RECOMMENDED).  The
+   authority MAY use a self-signed certificate.  Clients SHOULD pin the
+   authority's certificate (trust it as the sole root) rather than rely
+   on a public CA; clients MUST NOT disable certificate verification in
+   production.  The certificate's SANs MUST include the host name or IP
+   the client connects to.
+
+   4.2.  HTTP
+
+   Requests and responses are HTTP.  JSON request and response bodies use
+   media type application/json (Section 6).  Two endpoints deviate:
+   blob upload/download use application/octet-stream (Section 11), and the
+   event stream uses application/x-ndjson (Section 8).
+
+5.  Authentication and Authorization
+
+   5.1.  Bearer Token
+
+   Every request except GET /v1/healthz MUST carry:
+
+      Authorization: Bearer <token>
+
+   The authority MUST validate the token and SHOULD compare it in
+   constant time.  An invalid or missing token MUST yield 401.
+
+   5.2.  Identity
+
+   An authority operates in one of two identity modes:
+
+   o  Shared-token mode: a single token authorizes all agents.  The
+      caller's agent id is taken from the X-ACP-Agent header (Section 6),
+      which is trusted in this mode.
+
+   o  Per-agent mode: each agent has its own token mapped to an agent id
+      and role.  In this mode the agent id and role MUST be DERIVED FROM
+      THE TOKEN; the X-ACP-Agent header MUST be ignored for identity, so
+      an agent cannot impersonate another.
+
+   The authority MUST set the actor/originator fields of stored events
+   and messages from the authenticated identity, never from client-
+   supplied fields.
+
+   5.3.  Roles
+
+   Per-agent mode assigns each identity a role:
+
+      admin   - all operations, including /v1/admin/*.
+      writer  - reads and writes, but not /v1/admin/*.
+      reader  - read-only (HTTP GET) plus the presence heartbeat
+                (POST /v1/agents/beat).
+
+   A request the role does not permit MUST yield 403.  In shared-token
+   mode the caller is effectively admin.
+
+   5.4.  Rate Limiting
+
+   The authority MAY rate-limit per agent and MUST signal throttling with
+   429 and a Retry-After header.
+
+6.  Message Conventions (Headers, Encoding, Errors)
+
+   6.1.  Request Headers
+
+   Authorization     REQUIRED (except /v1/healthz).  "Bearer <token>".
+   X-ACP-Agent       Agent id.  Authoritative only in shared-token mode.
+   X-ACP-Protocol    OPTIONAL.  The protocol version, "acp/1".  If
+                     present and not equal to the authority's version,
+                     the authority MUST respond 400.
+   X-ACP-Space       OPTIONAL.  The target space.  Absent means
+                     "default".
+   X-ACP-Session     OPTIONAL.  A random per-process identifier used for
+                     presence collision detection (Section 13).
+   Idempotency-Key   OPTIONAL.  Honored on POST /v1/events and
+                     POST /v1/mail (Section 6.4).
+
+   6.2.  Bodies
+
+   Unless noted, request and response bodies are JSON (RFC 8259), UTF-8.
+   Field names are lowercase snake_case.  Unknown fields SHOULD be
+   ignored by receivers.
+
+   6.3.  Errors
+
+   Error responses use an HTTP status >= 400 and a JSON body:
+
+      { "error": "<human-readable message>",
+        "current": <optional state> }
+
+   The "current" field carries the authority's current state for
+   conflicts (e.g., the current lease holder on 409, or the current
+   manifest on a version conflict) so a client can reconcile without an
+   extra round trip.  Status codes are summarized in Appendix B.
+
+   6.4.  Idempotency
+
+   When a client supplies Idempotency-Key on a supported write, the
+   authority MUST return the original result for any repeat of that key
+   and MUST NOT apply the write more than once.  A replayed response
+   SHOULD carry the header "X-ACP-Idempotent-Replay: true".  Keys MAY be
+   evicted after a bounded retention.
+
+7.  Spaces (Multi-Tenancy)
+
+   A space is a fully isolated coordination domain.  All endpoints
+   operate within the space named by X-ACP-Space (default "default").
+   Spaces MUST NOT share events, messages, leases, blobs, manifests,
+   documents, or presence.  Space names MUST match [A-Za-z0-9_-]+ and be
+   at most 64 octets.  A space is created on first use.
+
+   GET /v1/spaces returns the set of spaces known to the authority:
+
+      { "spaces": ["default", "projX", ...] }
+
+   Client-side state (e.g., a working copy's sync base) SHOULD be
+   namespaced by (authority, space, agent) so one client may safely use
+   many spaces and authorities without collision.
+
+8.  Event Log
+
+   The event log is the per-space, append-only, totally-ordered record of
+   facts.  Every cross-agent action SHOULD be reflected as an event so
+   that all agents derive the same shared state from the same order.
+
+   8.1.  Event Object
+
+   See Appendix A.  An event has at least: seq, at (RFC 3339 UTC), actor,
+   action (a namespaced string such as "file.edited", "lease.acquired",
+   "chat.sent", "crdt.op", "note.added"), and OPTIONAL entity, before,
+   after, and context objects.
+
+   8.2.  Append
+
+   POST /v1/events with a JSON object {action, entity?, before?, after?,
+   context?}.  The authority MUST set actor to the authenticated
+   identity, assign the next seq, set "at", durably persist the event
+   before acknowledging, and return the stored event.  seq MUST be
+   strictly increasing within a space and MUST persist across restarts.
+
+   8.3.  Read
+
+   GET /v1/events?from=<seq> returns the array of events with seq >=
+   from.
+
+   8.4.  Streaming
+
+   GET /v1/events?from=<seq>&follow=true returns a live stream encoded as
+   newline-delimited JSON (application/x-ndjson): one event object per
+   line.  The authority MUST first send the backlog from "from" up to a
+   snapshot point and then forward subsequent events, without gaps or
+   duplicates across the cutover.  A client that is disconnected or
+   dropped MUST resume by reconnecting with from set to one past the last
+   seq it received; no committed event is thereby lost.
+
+   8.5.  Compaction
+
+   The authority MAY compact old events to bound storage.  After
+   compaction, seq MUST continue to increase (only old history is
+   dropped).  The lowest retained seq is the "base seq"; a client
+   requesting events before the base seq receives only the retained tail.
+   Compaction MUST NOT affect derived state (leases, manifest, etc.),
+   which is independently durable.
+
+9.  Mailbox
+
+   The mailbox provides durable, directed messages between agents within
+   a space.
+
+   9.1.  Send
+
+   POST /v1/mail with {to, type?, subject?, body?, thread_id?, reply_to?,
+   corr_id?, priority?, refs?}.  The authority MUST set "from" to the
+   authenticated identity, assign an "id" and "at", default "type" to
+   "inform" and "priority" to "normal", persist the message, and return
+   it.  "to" is REQUIRED; a missing "to" MUST yield 400.  Sending SHOULD
+   also append a "chat.sent" event.  Idempotency-Key is honored.
+
+   9.2.  Inbox
+
+   GET /v1/mail returns messages addressed to the caller, newest first.
+   GET /v1/mail?unread=true returns only unacknowledged messages.
+
+   9.3.  Acknowledge
+
+   POST /v1/mail/ack {id} marks a message read.  Only the recipient MAY
+   ack; otherwise 404.
+
+   9.4.  Threads
+
+   GET /v1/mail/thread?id=<thread_id> returns all messages in a thread,
+   oldest first.  corr_id MAY be used to correlate a response to a
+   request independently of threading.
+
+10. Leases
+
+   A lease is a TTL-bounded advisory lock on a named resource, used to
+   serialize access (e.g., to a hot file) when OS file locks are not
+   trustworthy across machines.
+
+   10.1.  Fencing Tokens
+
+   Each grant mints a strictly increasing fencing token.  A holder
+   presents its token on protected operations; the authority MUST reject
+   any token lower than the resource's current token.  This defeats the
+   "expired lock, but the old holder is still running" hazard: a stale
+   holder always carries a lower token and loses.
+
+   10.2.  Acquire
+
+   POST /v1/lease/acquire {resource, ttl_sec}.  If the resource is free
+   or its lease has expired, the authority mints a NEW token and grants
+   it.  If the caller already holds a live lease, it is renewed and the
+   token preserved.  If another agent holds a live lease, the authority
+   MUST respond 409 with the current lease in "current".  ttl_sec
+   defaults to 300 if not positive.
+
+   10.3.  Renew / Release
+
+   POST /v1/lease/renew {resource, token, ttl_sec} extends a lease the
+   caller holds (matched by token); otherwise 409.  POST
+   /v1/lease/release {resource, token} frees it; mismatch yields 409.
+
+   10.4.  List and Expiry
+
+   GET /v1/lease lists live leases.  The authority MUST expire leases
+   whose TTL has elapsed and SHOULD record expiry as a "lease.expired"
+   event so other agents learn the resource is free.
+
+   10.5.  Enforcement on Commit
+
+   When lease enforcement is enabled, a commit (Section 11) to a path
+   over which another agent holds the lease named "file:<path>" MUST be
+   rejected with 423 (Locked), with the holding lease in "current".
+
+11. Shared Filesystem: Blobs and Manifest
+
+   The shared filesystem is content-addressed.  File CONTENTS are stored
+   as immutable blobs keyed by the SHA-256 of the plaintext.  A versioned
+   MANIFEST maps logical paths to blob hashes; a space's filesystem state
+   is exactly (manifest version + referenced blobs).
+
+   11.1.  Blobs
+
+   POST /v1/blobs with a raw octet-stream body stores the content and
+   returns {hash, size}.  Storage MUST be idempotent: re-putting
+   identical content is a no-op returning the same hash.  GET
+   /v1/blobs/<hash> returns the bytes (404 if absent).  POST
+   /v1/blobs/has {hashes:[...]} returns {missing:[...]}, the subset not
+   present, so a client can upload only what is needed.
+
+   The "hash" MUST be the SHA-256 of the PLAINTEXT content even when the
+   authority encrypts blobs at rest (Section 19), so deduplication,
+   integrity, and manifest references are unaffected by encryption.
+
+   11.2.  Manifest
+
+   GET /v1/manifest returns {version, entries}, where entries maps each
+   path to {path, hash, size, mtime}.  version is a per-space monotonic
+   integer starting at 0.
+
+   11.3.  Commit (Compare-and-Swap)
+
+   POST /v1/commit with {base_version, changes, note?}, where each change
+   is {path, hash?, size?, deleted?}.  The authority MUST apply the
+   changes atomically if and only if base_version equals the current
+   manifest version (CAS).  On mismatch it MUST respond 409 with the
+   current manifest in "current"; the client rebases and retries.  All
+   referenced blobs MUST already be uploaded; a missing blob yields 400.
+   Paths MUST be validated (Section 11.4); an illegal path yields 400.
+   If a path is leased by another agent and enforcement is on, the
+   authority MUST respond 423 (Section 10.5).  On success the authority
+   increments the version, returns the new manifest, and SHOULD append a
+   "file.edited" or "file.deleted" event per change.
+
+   Two agents committing changes to DIFFERENT paths do not conflict (CAS
+   serializes commits but both succeed in turn).  Concurrent commits to
+   the SAME path are resolved by CAS + client-side 3-way reconciliation,
+   or prevented by a lease.
+
+   11.4.  Path Validation
+
+   The authority MUST reject any commit path that is empty, absolute,
+   non-canonical, contains a "." or ".." segment, or contains a
+   backslash.  This prevents a malicious or buggy client from causing any
+   peer's materialization to escape its workspace directory.
+
+12. Collaborative Documents (CRDT)
+
+   Documents allow many agents to edit the SAME text concurrently with
+   automatic, conflict-free convergence, complementing the coarser file
+   commit path.
+
+   12.1.  Model
+
+   A document is an ordered sequence of elements, each an immutable
+   character with a globally unique identifier id = (clock, replica),
+   where clock is a Lamport-style counter and replica is the originating
+   agent.  An insert records the id of the element it follows
+   ("origin_left"; the document start is the zero id).  A delete
+   tombstones an element by id.  Operations MUST be COMMUTATIVE and
+   IDEMPOTENT: applying the same set of operations in any order, any
+   number of times, yields the same document.  Integration of a new
+   element compares origin positions first, then id, which is convergent
+   for concurrent inserts (the rule underlying RGA/YATA-class CRDTs).
+
+   12.2.  Operation Object
+
+   An Op is { "t": "ins" | "del", "id": {"c":<uint>,"r":<string>},
+   "o": {"c","r"} (origin, inserts only), "v": "<single character>"
+   (inserts only) }.
+
+   12.3.  Push Operations
+
+   POST /v1/crdt/ops {doc, ops, epoch?}.  The authority appends the
+   operations durably and returns {doc, total, epoch}, where total is the
+   document's operation count.  If "epoch" is present and does not match
+   the document's current epoch, the authority MUST respond 409 (the
+   document was compacted; the client MUST resync, Section 12.5).  Pushes
+   SHOULD also append a "crdt.op" event so watchers notice activity.
+
+   12.4.  Pull Operations and Materialization
+
+   GET /v1/crdt/ops?doc=<name>&from=<index> returns {doc, ops, total,
+   epoch}: operations with index >= from.  Because operations commute,
+   the cursor "from" is the only synchronization state a client needs.
+   GET /v1/crdt/doc?doc=<name> returns the authority-materialized text
+   {doc, text, total}.  GET /v1/crdt/list returns [{name, ops, size}].
+
+   12.5.  Compaction and the Epoch Barrier
+
+   The authority MAY compact a document's operation log by replacing it
+   with a minimal snapshot that reproduces the current visible text
+   (tombstones garbage-collected, live elements re-anchored), preserving
+   element ids.  Compaction MUST increment the document's epoch.  To make
+   tombstone collection safe, the authority MUST reject a push whose
+   epoch is behind (Section 12.3); the client then resyncs from the
+   snapshot before pushing again, so it can never reference a collected
+   element.
+
+   12.6.  Client Sync Procedure (Informative)
+
+   To merge local edits with remote ones without reverting peers, a
+   client SHOULD: (1) derive local operations by diffing its file against
+   its last-synced base; (2) push them; (3) pull and apply remote
+   operations; (4) write the converged text back.  Deriving local edits
+   MUST occur before applying remote operations.
+
+13. Presence
+
+   POST /v1/agents/beat {harness?, host?, status?} records the caller as
+   live and returns {id, last_seen, space, ...}.  GET /v1/agents lists
+   agents seen in the space.  Presence MAY be node-local in a cluster.
+
+   Collision detection: if X-ACP-Session is supplied and the same agent
+   id beats with a different session within a short window, the authority
+   SHOULD set "collision": true (with a "warning") in the beat response
+   and SHOULD record an "agent.collision" event.  This surfaces two
+   processes accidentally sharing one agent id.
+
+14. High Availability (Clustering)
+
+   An authority MAY be a Raft cluster of an odd number of nodes (3
+   RECOMMENDED) to remove the single point of failure.
+
+   14.1.  Replication
+
+   Every WRITE is encoded as a command, appended to the Raft log,
+   replicated to a majority, and then applied to the per-space state by a
+   replicated state machine on every node.  A write committed by a
+   majority MUST NOT be lost across a leader change.
+
+   14.2.  Leader and Forwarding
+
+   Only the leader applies writes.  A follower that receives a write MUST
+   forward it to the leader (transparently proxying), or redirect the
+   client.  Reads MAY be served by any node and are then permitted to be
+   slightly stale; clients needing linearizable reads SHOULD target the
+   leader.  GET /v1/cluster/status returns {mode, state, leader,
+   is_leader, members}.
+
+   14.3.  Membership
+
+   POST /v1/admin/cluster/join {node_id, raft_addr} adds a voter; it MUST
+   be processed by (or forwarded to) the leader.  Snapshots are used to
+   bootstrap new or lagging nodes; restoring a snapshot MUST reset state
+   so that no command is applied twice.
+
+   14.4.  Inter-Node Security
+
+   When a cluster CA is configured, the Raft transport MUST be mutually
+   authenticated and encrypted (mTLS) using node certificates issued by
+   that CA.  Absent a CA, inter-node traffic is unauthenticated and MUST
+   run on a trusted private network.
+
+   14.5.  Single-Node
+
+   An authority MAY run as a single node; writes are then applied
+   directly.  The client-visible protocol is identical to the clustered
+   case.
+
+15. Administration
+
+   GET  /v1/stats                 - per-space counters (events, leases,
+                                    documents, messages, blobs, manifest
+                                    version, base seq, uptime, ...).
+   POST /v1/admin/gc?grace_sec=N  - delete blobs not referenced by the
+                                    manifest and older than the grace
+                                    window; returns {removed, bytes}.
+   POST /v1/admin/compact[?doc=D] - compact one document's op log (or all
+                                    eligible); returns {dropped}.
+   POST /v1/admin/cluster/join    - Section 14.3.
+
+   /v1/admin/* operations REQUIRE the admin role (Section 5.3).
+
+16. Wire API Reference
+
+   All paths are rooted at /v1 and operate within the X-ACP-Space space.
+
+   GET  /healthz                 liveness (no auth) -> {status,protocol}
+   POST /events                  append event -> Event
+   GET  /events?from=&follow=    read or stream (NDJSON) events
+   POST /mail                    send -> Message
+   GET  /mail?unread=            inbox -> [Message]
+   POST /mail/ack                {id} -> {ok} | 404
+   GET  /mail/thread?id=         thread -> [Message]
+   POST /lease/acquire           {resource,ttl_sec} -> Lease | 409
+   POST /lease/renew             {resource,token,ttl_sec} -> Lease | 409
+   POST /lease/release           {resource,token} -> {ok} | 409
+   GET  /lease                   live leases -> [Lease]
+   POST /blobs                   raw body -> {hash,size}
+   GET  /blobs/<hash>            bytes | 404
+   POST /blobs/has               {hashes} -> {missing}
+   GET  /manifest                -> Manifest
+   POST /commit                  {base_version,changes,note} ->
+                                 Manifest | 409 | 423 | 400
+   POST /crdt/ops                {doc,ops,epoch} -> {doc,total,epoch}|409
+   GET  /crdt/ops?doc=&from=     -> {doc,ops,total,epoch}
+   GET  /crdt/doc?doc=           -> {doc,text,total}
+   GET  /crdt/list               -> [{name,ops,size}]
+   POST /agents/beat             {harness,host,status} -> presence
+   GET  /agents                  -> [Agent]
+   GET  /spaces                  -> {spaces}
+   GET  /stats                   -> counters
+   POST /admin/gc?grace_sec=     -> {removed,bytes}        (admin)
+   POST /admin/compact?doc=      -> {dropped}              (admin)
+   POST /admin/cluster/join      {node_id,raft_addr} -> {} (admin)
+   GET  /cluster/status          -> cluster status
+
+17. Determinism Requirements
+
+   A clustered authority's replicated state machine MUST be
+   deterministic: applying the same ordered command stream MUST yield
+   byte-identical state on every node.  Therefore implementations MUST
+   NOT read wall-clock time, randomness, or other non-deterministic
+   inputs while APPLYING a command.  All such inputs (timestamps, message
+   ids, generated ids) MUST be fixed by the leader and carried in the
+   command.  Background activity that mutates state (lease expiry sweeps,
+   compaction) MUST also flow through the replicated log, driven by the
+   leader.  Conformance SHOULD be verified by applying an identical
+   command stream to independent state machines and comparing results.
+
+18. Versioning and Compatibility
+
+   The protocol version is "acp/1".  Clients MAY send X-ACP-Protocol; the
+   authority MUST reject a mismatched explicit version with 400.
+   Additive changes (new endpoints, new optional fields) preserve the
+   version.  A breaking change MUST increment the version.  Receivers
+   MUST ignore unknown JSON fields to permit additive evolution.
+
+19. Security Considerations
+
+   o  Transport: TLS protects confidentiality and integrity in transit;
+      certificate pinning authenticates the authority and removes the
+      MITM window (Section 4.1).
+
+   o  Authentication: bearer tokens gate all non-health endpoints; tokens
+      SHOULD be high-entropy (>= 128 bits) and compared in constant time.
+
+   o  Identity integrity: in per-agent mode, identity and role derive
+      from the token, so X-ACP-Agent cannot be spoofed; the authority
+      sets actor/from server-side (Section 5.2).
+
+   o  Authorization: roles gate writes and administration (Section 5.3).
+
+   o  Tenant isolation: spaces share no state (Section 7).
+
+   o  Input safety: commit paths and document/space names are validated
+      to prevent traversal (Section 11.4).
+
+   o  Concurrency safety: fencing-token leases (Section 10.1) and CAS
+      commits (Section 11.3) and the CRDT epoch barrier (Section 12.5)
+      prevent silent lost updates and stale-holder corruption.
+
+   o  Abuse: request body size limits and per-agent rate limiting
+      (Section 5.4) mitigate denial of service; idempotency keys
+      (Section 6.4) make retries safe.
+
+   o  Encryption at rest: blob contents MAY be encrypted with an
+      authenticated cipher (e.g., AES-256-GCM) under an operator key;
+      blobs remain keyed by plaintext hash; a wrong key MUST fail closed.
+      Metadata and replicated logs not covered by application-layer
+      encryption SHOULD reside on an encrypted volume.
+
+   o  Inter-node: cluster traffic SHOULD use mTLS (Section 14.4); absent
+      that, run nodes on a trusted private network.
+
+   o  Residual risks: the audit/event log is append-only but not, in
+      this version, tamper-evident; a host-level attacker with the
+      authority's keys is outside the model.  Operators MUST protect the
+      authority host and its key material.
+
+20. References
+
+   20.1.  Normative References
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119, March 1997.
+   [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in
+              RFC 2119 Key Words", BCP 14, RFC 8174, May 2017.
+   [RFC8259]  Bray, T., Ed., "The JavaScript Object Notation (JSON) Data
+              Interchange Format", RFC 8259, December 2017.
+   [RFC8446]  Rescorla, E., "The Transport Layer Security (TLS) Protocol
+              Version 1.3", RFC 8446, August 2018.
+   [RFC9110]  Fielding, R., Ed., et al., "HTTP Semantics", RFC 9110,
+              June 2022.
+   [SHA256]   NIST, "Secure Hash Standard (SHS)", FIPS PUB 180-4.
+
+   20.2.  Informative References
+
+   [RAFT]     Ongaro, D. and J. Ousterhout, "In Search of an
+              Understandable Consensus Algorithm", USENIX ATC 2014.
+   [RGA]      Roh, H-G., et al., "Replicated Abstract Data Types",
+              JPDC, 2011.
+   [YATA]     Nicolaescu, P., et al., "Near Real-Time Peer-to-Peer Shared
+              Editing on Extensible Data Types", GROUP 2016.
+
+
+Appendix A.  Data Types (JSON)
+
+   Event:
+      { "seq": <uint64>, "at": <rfc3339>, "actor": <string>,
+        "action": <string>, "entity": <string>?,
+        "before": <object>?, "after": <object>?, "context": <object>? }
+
+   Message:
+      { "id": <string>, "from": <string>, "to": <string>,
+        "at": <rfc3339>, "type": <string>, "subject": <string>?,
+        "body": <string>?, "thread_id": <string>?, "reply_to": <string>?,
+        "corr_id": <string>?, "priority": <string>?, "refs": [<string>]?,
+        "read": <bool> }
+
+   Lease:
+      { "resource": <string>, "holder": <string>, "token": <uint64>,
+        "acquired": <rfc3339>, "expires": <unix-seconds> }
+
+   ManifestEntry:
+      { "path": <string>, "hash": <hex64>, "size": <int64>,
+        "mtime": <rfc3339> }
+
+   Manifest:
+      { "version": <uint64>, "entries": { <path>: ManifestEntry } }
+
+   Change:
+      { "path": <string>, "hash": <hex64>?, "size": <int64>?,
+        "deleted": <bool>? }
+
+   CommitRequest:
+      { "base_version": <uint64>, "changes": [Change], "note": <string>? }
+
+   Op (CRDT):
+      { "t": "ins"|"del", "id": {"c":<uint64>,"r":<string>},
+        "o": {"c":<uint64>,"r":<string>}?, "v": <string>? }
+
+   Agent:
+      { "id": <string>, "harness": <string>?, "host": <string>?,
+        "status": <string>?, "last_seen": <rfc3339> }
+
+   Error:
+      { "error": <string>, "current": <any>? }
+
+
+Appendix B.  Error Catalog
+
+   200  OK.
+   400  Bad request: malformed body, illegal path, protocol mismatch,
+        missing required field, or a referenced blob not uploaded.
+   401  Unauthorized: missing or invalid bearer token.
+   403  Forbidden: the caller's role does not permit the operation.
+   404  Not found: unknown blob; ack of a message not addressed to the
+        caller.
+   405  Method not allowed.
+   409  Conflict: lease held by another agent; lease renew/release token
+        mismatch; manifest version conflict; CRDT epoch changed.  The
+        body's "current" carries the conflicting state.
+   423  Locked: commit to a path leased by another agent.
+   429  Too Many Requests: rate limited; see Retry-After.
+   500  Internal error.
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Append and read an event (default space)
+
+      > POST /v1/events
+      > Authorization: Bearer <tok>
+      > X-ACP-Agent: claudeA
+      > {"action":"note.added","entity":"spec.md","context":{"n":1}}
+
+      < 200 OK
+      < {"seq":42,"at":"2026-06-10T00:00:00Z","actor":"claudeA",
+      <  "action":"note.added","entity":"spec.md","context":{"n":1}}
+
+   C.2.  Acquire a lease, then commit under it
+
+      > POST /v1/lease/acquire {"resource":"file:app.go","ttl_sec":600}
+      < 200 {"resource":"file:app.go","holder":"claudeA","token":7,...}
+
+      A different agent committing app.go now receives:
+      < 423 {"error":"path leased by claudeA: app.go","current":{...}}
+
+   C.3.  Commit with CAS
+
+      > POST /v1/commit
+      > {"base_version":3,"changes":[{"path":"a.txt","hash":"<h>","size":9}]}
+      < 200 {"version":4,"entries":{...}}            (success)
+      < 409 {"error":"manifest version conflict ...","current":{...}}
+
+   C.4.  CRDT push across a compaction boundary
+
+      > POST /v1/crdt/ops {"doc":"spec","ops":[...],"epoch":0}
+      < 409 {"error":"epoch changed - resync the doc","current":1}
+      (client re-pulls from index 0 at epoch 1, re-derives, re-pushes)
+
+   C.5.  Selecting a space
+
+      Add "X-ACP-Space: projX" to any request to operate in space projX;
+      its events, files, mail, leases, and documents are isolated from
+      every other space.
+
+
+Authors' Addresses
+
+   ab0t
+   https://ab0t.com
+   Email: dev@ab0t.com
