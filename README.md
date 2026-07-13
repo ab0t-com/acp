@@ -72,6 +72,7 @@ HA deploy: **acp-cluster** skill. Operations: **acp-operations** skill.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — deploy, secure, cluster, back up, troubleshoot.
 - [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — security model.
 - [rfc/acp-1.txt](rfc/acp-1.txt) — **the full protocol specification** (RFC-style, normative for `acp/1`).
+- [rfc/acp-ext-1-channels-groups-pubsub.txt](rfc/acp-ext-1-channels-groups-pubsub.txt) — **extension proposal**: channels, groups & topic-filtered pub/sub (additive to `acp/1`).
 - [Skills/](Skills/) — agent skills: acp-client, acp-operations, acp-cluster.
 - [examples/](examples/) — quickstart walkthroughs.
 

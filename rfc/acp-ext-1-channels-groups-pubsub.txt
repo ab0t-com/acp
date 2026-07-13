@@ -1,0 +1,683 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-1                                      ab0t.com
+Updates: ACP/1                                                     June 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+      ACP Extension Proposal 1: Channels, Groups, and Topic-Filtered
+                                Pub/Sub
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies three additive,
+   backward-compatible features that turn ACP's existing per-space event
+   log and directed mailbox into a first-class publish/subscribe and
+   group-communication system:
+
+     (1) CHANNELS -- an OPTIONAL label on events plus server-side
+         filtered subscription, giving topic-scoped pub/sub over the
+         single totally-ordered log.
+
+     (2) GROUPS -- named, mutable sets of agents within a space, with a
+         durable registry.
+
+     (3) GROUP AND BROADCAST MAIL -- one-to-many directed messaging that
+         expands a group (or the reserved "@all") into per-recipient
+         deliveries.
+
+   None of these change the wire version "acp/1": every addition is an
+   OPTIONAL field or a NEW endpoint, negotiated by a capability probe.
+   A daemon or client that does not implement this extension interoperates
+   unchanged with one that does.
+
+Status of This Memo
+
+   PARTIALLY ACCEPTED.  Section 4 (Channels, including the 2026-07-12
+   wildcard/actions revision) was ACCEPTED by the protocol owner and
+   IMPLEMENTED in the reference implementation on 2026-07-12
+   (capability "channels"; the OPTIONAL POST /v1/channels metadata path
+   is not yet implemented — see Section 4.4).  Sections 5 (Groups) and
+   6 (Group and Broadcast Mail) remain PROPOSALS pending the owner's
+   approval and ship, if accepted, with their durable registry store.
+   The base protocol version string remains "acp/1" and features are
+   advertised via Section 7.  Distribution is unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Channels (Topic-Filtered Pub/Sub)
+   5.  Groups
+   6.  Group and Broadcast Mail
+   7.  Capability Negotiation and Backward Compatibility
+   8.  Wire API Additions
+   9.  Determinism and High Availability
+   10. Security Considerations
+   11. Rollout Plan
+   12. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/1 already provides a coordination substrate that two agents use
+   well: a single per-space, totally-ordered event log (Section 8 of
+   ACP/1) and a durable, directed, one-to-one mailbox (Section 9).  In
+   practice the event log is used as a broadcast bus -- every subscriber
+   in a space receives every event and filters client-side on the
+   "action" and "entity" fields -- and the mailbox is used for targeted
+   "A says this to B" messages.
+
+   This is sufficient for two agents.  It begins to strain as the number
+   of agents in a space grows (ACP/1 is N-agent-safe by construction;
+   this proposal is about making N>2 ERGONOMIC -- the open item recorded
+   in ticket T19).  Three concrete problems motivate this extension:
+
+   1.1.  No topic scoping on the bus.
+
+      Every follower receives the entire space stream.  With many agents
+      and many concurrent activities (a build pipeline, a code review, an
+      incident, idle chatter), each agent must download and discard
+      traffic it does not care about.  There is no way to say "stream me
+      only the 'build' events" -- the filtering burden is entirely on the
+      client, and the bytes cross the wire regardless.  ACP/1's own
+      header documentation already anticipates "channels" within a space
+      ("X-ACP-Space selects the isolated shared space (filesystem +
+      channels)"), but no channel primitive exists yet.
+
+   1.2.  No notion of a group.
+
+      Roles (admin/writer/reader, Section 5 of ACP/1) describe
+      PERMISSIONS, not TEAMS.  There is no way to name a set of agents
+      ("frontend", "reviewers", "the two of us on incident-42"), to ask
+      "who is on this team", or to address them collectively.  Membership
+      lives only in operators' heads.
+
+   1.3.  No one-to-many messaging.
+
+      The mailbox "to" field is a single agent id.  Messaging five agents
+      means five sends, or abusing the event log as a pseudo-mailbox
+      (which loses per-recipient read/ack tracking).  There is no
+      "deliver to the team" and no authenticated space-wide broadcast.
+      Prior art in the project's own research (vibe's "DeliverToTeam",
+      see 02_vibe_prior_art) called this out as a core multi-agent
+      primitive.
+
+   Together these gaps mean ACP has a pub/sub-shaped mechanism without
+   pub/sub ergonomics, and a messaging mechanism that cannot address more
+   than one recipient.  This extension closes all three with the smallest
+   additive surface that preserves ACP/1's central invariant: one
+   space, one total order.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, space, event, and mailbox definitions of ACP/1 without
+   restating them; section references of the form "ACP/1 Section N" point
+   into rfc/acp-1.txt.
+
+   CHANNEL:  A free-form, short, opaque label attached to an event and
+      usable as a subscription filter.  A channel is a VIEW over the
+      single per-space log, NOT a separate log and NOT a security
+      boundary.
+
+   GROUP:  A named, mutable set of agent identities scoped to a space.
+
+   FAN-OUT:  The server-side expansion of a group (or "@all") into
+      individual per-recipient mailbox deliveries at send time.
+
+   RESERVED GROUP:  The name "all" (addressed as "@all"), which always
+      denotes every known agent in the space; it is never stored in the
+      group registry and cannot be created or deleted.
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  One space, one total order (preserved).
+
+      Channels MUST NOT partition the event log.  An event keeps a single
+      space-global "seq" (ACP/1 Section 8); a channel is only a tag and a
+      filter.  A client subscribing to a channel sees a SUBSEQUENCE of the
+      global order, in the same order, with the same resume-by-seq
+      guarantees.  This deliberately rejects per-channel sequence numbers:
+      cross-channel causality (e.g., a "lease.acquired" event that gates a
+      "file.edited" event in another channel) would otherwise be lost, and
+      log-global facts (leases, manifest commits, CRDT ops) have no single
+      natural channel.
+
+   3.2.  Additive and negotiated, never breaking.
+
+      Every change is an OPTIONAL field or a NEW endpoint.  An ACP/1
+      client that ignores this extension behaves exactly as today; a
+      daemon without the extension returns 404 for the new endpoints and
+      silently ignores unknown OPTIONAL fields, and clients detect this
+      via the capability list (Section 7).  The protocol version string
+      stays "acp/1".
+
+   3.3.  Channels are not access control.
+
+      The space remains the ONLY isolation boundary (ACP/1 Section 7).
+      Any agent that can read a space can subscribe to any channel in it.
+      Channels organize traffic; they do not restrict it.  This
+      principle is normative and is repeated in Security Considerations.
+
+   3.4.  Reuse the existing durability shapes.
+
+      Groups use the same append-only op-log + replay-on-startup model as
+      the mailbox (ACP/1 Section 9).  Group mail reuses the existing
+      Message store via fan-out, so Inbox, Ack, and Thread semantics are
+      unchanged per recipient.
+
+   3.5.  Non-goals.
+
+      This extension does NOT add: per-channel access control lists;
+      message queues with consumer groups / exactly-once work handoff
+      (that is the separate "task board / claim protocol" item in T19);
+      cross-space messaging; or presence-scoped delivery guarantees
+      beyond best-effort snapshot expansion.  These MAY be future
+      extensions.
+
+
+4.  Channels (Topic-Filtered Pub/Sub)
+
+   4.1.  The channel field.
+
+      The Event object (ACP/1 Appendix A) gains one OPTIONAL field:
+
+         "channel": <string>   ; short opaque label, e.g. "build"
+
+      An absent or empty channel denotes the unlabeled/default channel.
+      A channel name SHOULD match [A-Za-z0-9._:-]{1,64}; a daemon MAY
+      reject names outside this set with 400.  Names are case-sensitive
+      and compared by exact byte equality.
+
+      FILTER PATTERNS (revision, 2026-07-12): a filter pattern is either
+      a LITERAL (matched by exact byte equality) or a PREFIX PATTERN --
+      a literal ending in ".*", meaning "the literal prefix up to and
+      including the dot, followed by anything".  So "ladder.*" matches
+      "ladder.gate.failed" but NOT the bare "ladder" (list both to
+      cover the parent: "ladder,ladder.*").  "*" is legal ONLY as the
+      trailing ".*" form: no mid-string wildcards, no "?", no regular
+      expressions -- patterns must match in O(length).  An authority
+      MUST contain at least one byte before the trailing ".*"; the bare
+      ".*" is ILLEGAL (an empty prefix would match every dotted name).
+      An authority MUST reject an illegal pattern with 400 and SHOULD cap the
+      number of patterns per request (RECOMMENDED: 32).  The name
+      consisting solely of "_" is RESERVED for the unlabeled filter
+      pattern (Section 4.3); an authority MUST reject publishing an
+      event whose channel is "_" with 400.
+
+   4.2.  Publishing to a channel.
+
+      POST /v1/events accepts an OPTIONAL "channel" in the body.  The
+      authority MUST store it on the event and MUST NOT alter "seq"
+      semantics: seq remains strictly increasing space-globally,
+      independent of channel.  Convenience helpers (e.g., "acp chat
+      --channel build") set both "action" and "channel".
+
+   4.3.  Filtered subscription.
+
+      GET /v1/events gains three OPTIONAL query parameters:
+
+         channel=<pat>      ; include only events whose channel matches
+         channels=a,b.*     ; comma list of patterns; match any listed
+         actions=x,y.*      ; comma list of patterns applied to the
+                            ;   event's "action" field (ACP/1 Section 8.1
+                            ;   actions are already dotted-namespaced)
+
+      Each list element is a filter pattern per Section 4.1 (literal or
+      trailing-".*" prefix).  Within one parameter, patterns OR-combine;
+      when BOTH channels and actions are present the event MUST match
+      BOTH (the channel routes, the action selects).  When any filter is
+      present, the authority MUST return (for the snapshot read) and
+      stream (when follow=true) ONLY matching events, in ascending seq
+      order, preserving the gap-free / duplicate-free cutover guarantee
+      of ACP/1 Section 8.4 with respect to the EVALUATED stream.
+      Resume-by-seq is unchanged: a client reconnects with
+      from=<last-received+1> and the SAME filters.  An empty filter (no
+      parameter) behaves exactly as ACP/1 today: all events.
+
+      SEQ GAPS ARE EXPECTED under a filter: the delivered events are a
+      subsequence of the space's log, so consecutive delivered events
+      need not have consecutive seq values.  A filtered subscriber MUST
+      NOT treat a seq gap as loss.
+
+      The reserved pattern "_" is meaningful only in channel filters
+      (it matches events with no channel); an authority SHOULD reject
+      "_" in "actions=" with 400.  List parameters MAY be repeated
+      (e.g. "channels=a&channels=b"); occurrences concatenate and all
+      count against the pattern cap.
+
+      A client MAY request the unlabeled channel explicitly with
+      channel= (empty) is NOT used for this; instead the reserved name
+      "_" MAY be requested to mean "only unlabeled events".  Absent any
+      channel parameter means "no filter".
+
+      NOTE: filtering is server-side, so a narrow subscriber no longer
+      pays for traffic it discards.  This is the pub/sub win.
+
+   4.4.  Channel registry (discovery).
+
+      To answer "what channels exist", the authority SHOULD maintain a
+      lightweight registry:
+
+         GET  /v1/channels            -> [ChannelInfo]
+         POST /v1/channels {name, description?, purpose?}  -> ChannelInfo
+
+      Channels are created IMPLICITLY by first use (publishing an event
+      with a new channel name).  POST /v1/channels is OPTIONAL and only
+      attaches human-facing metadata (description, purpose) and marks a
+      channel "declared" for discoverability.  ChannelInfo carries at
+      least {name, declared (bool), last_seq, last_at, description?}.
+      Implicitly-created channels appear with declared=false.  A daemon
+      MAY derive last_seq/last_at lazily by scanning retained events.
+      A daemon MAY serve GET /v1/channels without the OPTIONAL POST;
+      the POST path then yields 405 (method not allowed) rather than
+      the 404 of an absent capability.
+
+   4.5.  Backward compatibility.
+
+      Old daemons ignore the "channel" body field (events store no
+      channel) and ignore channel query parameters (returning all
+      events) -- functionally degrading to "one big channel".  Old
+      clients never send channel parameters and receive everything, as
+      today.  Therefore mixed fleets remain correct, only less selective.
+
+
+5.  Groups
+
+   5.1.  Group object.
+
+      A Group is space-scoped state:
+
+         { "name": <string>, "members": [<agent-id>], "owner": <agent-id>,
+           "description": <string>?, "created_at": <rfc3339>,
+           "updated_at": <rfc3339> }
+
+      "name" MUST match [A-Za-z0-9._:-]{1,64} and MUST be unique within a
+      space.  The reserved name "all" MUST NOT be created, modified, or
+      deleted (Section 6.3).
+
+   5.2.  Durability.
+
+      Groups are persisted as an append-only op-log (group.jsonl) with
+      ops {create, set-members, add-member, remove-member, delete},
+      rebuilt by replay on startup -- mirroring the mailbox model (ACP/1
+      Section 9, internal/mailbox).  This keeps groups in the same durable
+      shape as the rest of ACP and makes membership history auditable.
+
+   5.3.  Endpoints.
+
+         POST   /v1/groups {name, members?, description?}   -> Group
+         GET    /v1/groups                                  -> [Group]
+         GET    /v1/groups/{name}                           -> Group
+         POST   /v1/groups/{name}/members {add?:[], remove?:[]} -> Group
+         DELETE /v1/groups/{name}                           -> 204
+
+      Creating a group with an existing name updates its metadata and (if
+      "members" is present) replaces its membership.  Idempotency-Key is
+      honored on POST.
+
+   5.4.  Authorization.
+
+      Creating a group and modifying its OWN-created groups requires the
+      "writer" role or higher (ACP/1 Section 5).  Modifying or deleting a
+      group the caller does not own requires the "admin" role.  The owner
+      is the creating identity.  "reader" MAY list and read groups but
+      MUST NOT mutate them.
+
+   5.5.  Events.
+
+      Group mutations SHOULD append events with actions "group.created",
+      "group.updated", and "group.deleted" (channel "_groups"
+      RECOMMENDED) so that watchers learn of membership changes without
+      polling.
+
+   5.6.  Membership of unknown agents.
+
+      A group MAY list an agent id that is not currently present.  Group
+      membership is a declaration, not a presence assertion; delivery
+      (Section 6) is to the listed ids regardless of online status, and
+      the mailbox holds messages until acked (ACP/1 Section 9).
+
+
+6.  Group and Broadcast Mail
+
+   6.1.  Addressing a group.
+
+      POST /v1/mail (ACP/1 Section 9.1) is extended so the recipient MAY
+      be a group:
+
+         - "to": "@<group>"      ; the "@" prefix denotes a group, OR
+         - "to_group": "<group>" ; explicit field (equivalent)
+
+      Exactly one of {a single agent "to", a group reference} MUST be
+      present; supplying both an agent "to" and "to_group" MUST yield 400.
+
+   6.2.  Fan-out semantics.
+
+      On a group send the authority MUST:
+
+         1. Resolve the group's CURRENT membership (snapshot at send
+            time; late joiners do not receive the message -- consistent
+            with email and with the durable per-recipient model).
+         2. Mint one common "corr_id" (if absent) and set "group" to the
+            group name on every copy.
+         3. Store ONE Message per distinct resolved recipient, each with
+            "to" set to that recipient and its own "id" and "read" state.
+         4. OPTIONALLY append a single "chat.sent" event (channel
+            defaulting to the group name) recording the one-to-many send.
+
+      The sender SHOULD be excluded from its own fan-out unless
+      "include_self": true is set.  The response returns the list of
+      created message ids and the resolved recipient count.
+
+      Per-recipient fan-out (rather than one shared message with N read
+      bits) is chosen deliberately: it leaves Inbox, Ack, and Thread
+      (ACP/1 Sections 9.2-9.4) byte-for-byte unchanged for each recipient,
+      and each agent acks only its own copy.  The cost is N stored copies;
+      Section 10 bounds N.
+
+   6.3.  Broadcast: the reserved "@all".
+
+      "to": "@all" (or to_group "all") MUST expand to every agent the
+      authority knows in the space.  "knows" means agents that have ever
+      announced presence in the space (ACP/1 Section 13), MINUS the
+      sender unless include_self is true.  "@all" is never stored as a
+      group and cannot be created or deleted.
+
+   6.4.  Idempotency and atomicity.
+
+      A single Idempotency-Key covers the WHOLE fan-out: a retried group
+      send MUST NOT produce duplicate per-recipient copies.  The fan-out
+      SHOULD be all-or-nothing with respect to the durable store (persist
+      the batch, then acknowledge).
+
+   6.5.  Backward compatibility.
+
+      A daemon without this extension treats "to": "@frontend" as a
+      literal agent id named "@frontend" -- which no real agent will ack,
+      and which a conformant client avoids by first checking capabilities
+      (Section 7).  Clients MUST NOT send group addresses to a daemon that
+      does not advertise the "groupmail" capability.
+
+
+7.  Capability Negotiation and Backward Compatibility
+
+   Because all additions are OPTIONAL, clients need a way to discover what
+   a given daemon supports.  This extension adds a capability list to an
+   existing introspection endpoint:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain:
+
+         "protocol": "acp/1",
+         "capabilities": [ "channels", "groups", "groupmail", ... ]
+
+   A client MUST treat the ABSENCE of a capability as "not supported" and
+   fall back to ACP/1 behavior (client-side filtering; per-agent sends).
+   A daemon MUST advertise a capability only when it fully implements the
+   corresponding section here.  Capability strings defined by this
+   document are: "channels" (Section 4), "groups" (Section 5), and
+   "groupmail" (Section 6).  Future extensions register additional
+   strings.
+
+
+8.  Wire API Additions
+
+   Summary (full detail in Sections 4-6; types in Appendix A):
+
+      Modified:
+         POST /v1/events            + OPTIONAL body field "channel"
+         GET  /v1/events            + OPTIONAL query "channel"/"channels"
+         POST /v1/mail              + "to":"@group" or "to_group"
+         GET  /v1/healthz, /v1/stats+ "capabilities" array
+
+      New:
+         GET    /v1/channels
+         POST   /v1/channels
+         GET    /v1/groups
+         POST   /v1/groups
+         GET    /v1/groups/{name}
+         POST   /v1/groups/{name}/members
+         DELETE /v1/groups/{name}
+
+   All new endpoints follow ACP/1 Section 6 conventions: JSON bodies, the
+   standard headers (X-ACP-Agent, X-ACP-Protocol, X-ACP-Space), bearer
+   auth (Section 5), and the standard error model (Appendix B of ACP/1
+   plus Appendix B here).
+
+
+9.  Determinism and High Availability
+
+   ACP/1 Section 17 requires the replicated state machine to be
+   deterministic.  This extension preserves that:
+
+      o  Channels add a stored field only; event ordering is unchanged.
+
+      o  Group ops are replicated as logical ops in the Raft log; every
+         replica applies the SAME op sequence to reach identical group
+         state.
+
+      o  Group/broadcast mail MUST be replicated as the LOGICAL send
+         (the group reference, the common corr_id, the minted message
+         ids, and any "Now"/timestamp the leader stamps), NOT as a set of
+         pre-expanded copies generated non-deterministically per node.
+         Each replica then expands against its own copy of the (already
+         committed) group state, yielding identical per-recipient copies.
+         Message ids and timestamps MUST be leader-assigned and carried
+         in the op so replicas do not diverge (consistent with ACP/1's
+         leader-stamps-Now rule).
+
+   Group reads, channel reads, and filtered streams are served from
+   committed state and require no special handling beyond ACP/1's
+   leader/follower read rules.
+
+
+10. Security Considerations
+
+   10.1.  Channels are not a security boundary.
+
+      This is the most important caveat.  A channel is a label; any agent
+      that can read a space can subscribe to any channel in it.
+      Implementers and operators MUST NOT present channels as
+      confidentiality.  Confidential separation requires a separate SPACE
+      (ACP/1 Section 7), which shares nothing.
+
+   10.2.  Fan-out amplification.
+
+      Group and broadcast mail let one request create many durable
+      writes.  To prevent a mail storm or storage-exhaustion abuse, a
+      daemon:
+
+         o  MUST count the EXPANDED recipient set against the sender's
+            rate limit (ACP/1 rate limiting), not count the request as
+            one.
+         o  SHOULD enforce a configurable maximum group size and a
+            maximum fan-out per send (e.g., default 256), returning 400
+            or 429 when exceeded.
+         o  SHOULD restrict "@all" to the "writer" role or higher and
+            subject it to the same caps.
+
+   10.3.  Membership disclosure.
+
+      GET /v1/groups reveals who is grouped within a space.  This is
+      acceptable because membership is already within the space trust
+      boundary, but daemons MAY gate group listing to "writer"+ if an
+      operator wants to reduce intra-space metadata exposure.
+
+   10.4.  Spoofing and authorization.
+
+      As in ACP/1, the authority MUST set "from"/"actor"/"owner" to the
+      authenticated identity and MUST NOT trust client-supplied values
+      for these.  Group mutation authorization is per Section 5.4.
+
+   10.5.  Channel name injection.
+
+      Channel and group names are echoed in events and discovery
+      responses.  Daemons MUST validate names against the documented
+      character set and length to avoid log/display injection, and
+      consumers MUST treat names as opaque data, not markup.
+
+
+11. Rollout Plan
+
+   The features are independent and SHOULD ship incrementally; each is
+   independently valuable and independently negotiated:
+
+      Phase 1 -- "channels".  Add the Event.channel field, server-side
+         filtered subscription, and the capability flag.  Highest
+         value-to-effort: it makes the existing log a real pub/sub bus
+         with no new storage subsystem.
+
+      Phase 2 -- "groups".  Add the group op-log, registry endpoints, and
+         events.  No messaging change yet.
+
+      Phase 3 -- "groupmail".  Add group/broadcast addressing on
+         /v1/mail, building on Phase 2.
+
+   Each phase is additive and reversible (a daemon can drop a capability
+   without breaking ACP/1 peers).  Reference-implementation work maps to
+   ticket T19 (N-agent ergonomics).
+
+
+12. Open Questions
+
+   o  Hierarchical / wildcard channels -- RESOLVED (2026-07-12): the
+      trailing-".*" prefix grammar of Section 4.1 was adopted (driven by
+      demonstrated downstream demand for action patterns such as
+      "ladder.*"); full glob/regex remains rejected.
+
+   o  Shared-message group mail (one copy, per-recipient read bits)
+      versus fan-out.  This proposal picks fan-out for semantic
+      simplicity; a future revision MAY add a shared mode for very large
+      audiences where N copies are too costly.
+
+   o  Dynamic groups (membership by query, e.g., "all writers") versus
+      the static lists specified here.
+
+   o  Channel retention/quotas independent of the global event-log
+      compaction (ACP/1 Section 8.5).
+
+   o  Presence-scoped delivery ("only agents online now") as an explicit
+      send option.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   Event (changed -- one added OPTIONAL field):
+      { ...all ACP/1 Event fields...,
+        "channel": <string>? }
+
+   ChannelInfo (new):
+      { "name": <string>, "declared": <bool>,
+        "last_seq": <uint64>, "last_at": <rfc3339>?,
+        "description": <string>? }
+
+   Group (new):
+      { "name": <string>, "members": [<string>],
+        "owner": <string>, "description": <string>?,
+        "created_at": <rfc3339>, "updated_at": <rfc3339> }
+
+   Message (changed -- two added OPTIONAL fields):
+      { ...all ACP/1 Message fields...,
+        "group": <string>?,        ; group/@all this copy came from
+        "include_self": <bool>? }  ; request-only hint, not stored
+
+   GroupSendResult (new -- response to a group send):
+      { "ids": [<string>], "recipients": <int>, "corr_id": <string> }
+
+   Health/Stats (changed):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [<string>] }
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: invalid channel/group name; both an agent "to" and a
+        group reference supplied; attempt to create/delete reserved group
+        "all"; fan-out exceeds the configured maximum.
+   403  Forbidden: role insufficient to create/modify/delete a group, or
+        to use "@all".
+   404  Not found: unknown group on GET/POST members/DELETE; new endpoint
+        on a daemon without the capability.
+   429  Too Many Requests: the expanded fan-out exceeds the sender's rate
+        budget; see Retry-After.
+
+   All other status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Topic-filtered subscribe.
+
+      Publish on a channel:
+         POST /v1/events
+         { "action": "build.failed", "channel": "build",
+           "entity": "ci#4127", "context": {"job": "lint"} }
+
+      Subscribe only to build traffic, live, resumable:
+         GET /v1/events?from=8120&follow=true&channels=build,deploy
+         -> application/x-ndjson, only events whose channel is "build"
+            or "deploy", in seq order, resumable with from=<last+1>.
+
+   C.2.  Create a group and message it.
+
+      POST /v1/groups
+         { "name": "frontend",
+           "members": ["claudeA", "codexB"],
+           "description": "UI workstream" }
+
+      POST /v1/mail
+         { "to": "@frontend", "subject": "freeze",
+           "body": "UI freeze at 1700 UTC", "priority": "urgent" }
+      -> { "ids": ["m_1a2b", "m_1a2c"], "recipients": 2,
+           "corr_id": "c_99f1" }
+      Each of claudeA and codexB finds one message in GET /v1/mail and
+      acks its own copy.
+
+   C.3.  Authenticated broadcast.
+
+      POST /v1/mail
+         { "to": "@all", "type": "inform",
+           "subject": "maintenance", "body": "daemon restart in 5m" }
+      -> fan-out to every known agent in the space except the sender;
+         rate-limited by the expanded count.
+
+   C.4.  Capability check before using group mail.
+
+      GET /v1/healthz
+      -> { "ok": true, "protocol": "acp/1",
+           "capabilities": ["channels","groups","groupmail"] }
+      A client that does not see "groupmail" falls back to N individual
+      sends.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .

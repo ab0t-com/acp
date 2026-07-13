@@ -1,0 +1,944 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-7                                      ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+      ACP Extension Proposal 7: Scoped Tokens, Per-Space Quotas, and
+              Optional Sub-Scopes (Least-Privilege Within a Space)
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies three additive,
+   backward-compatible features that add LEAST-PRIVILEGE authorization
+   and RESOURCE BOUNDS below ACP/1's space boundary, without creating a
+   new isolation boundary:
+
+     (1) SCOPED TOKENS -- an OPTIONAL scope on a per-agent grant so a
+         token can be read-only, actor-pinned, and/or confined to a
+         resource-name prefix, instead of holding full-space power for
+         its role.
+
+     (2) PER-SPACE QUOTAS -- OPTIONAL upper bounds on a space's retained
+         events, stored blob bytes, concurrent leases, and mail fan-out,
+         so one tenant cannot exhaust a shared daemon.
+
+     (3) OPTIONAL SUB-SCOPES -- a lightweight "project" label that scoped
+         tokens and quotas MAY key on, giving soft sub-tenancy within a
+         space without the cost of a separate space.
+
+   None of these change the wire version "acp/1": every addition is an
+   OPTIONAL field or a NEW endpoint, negotiated by a capability probe.
+   A daemon or client that does not implement this extension interoperates
+   unchanged with one that does.  Because an un-enforced scope FAILS OPEN
+   (Section 3.2, Section 10.1), a principal relying on scopes for security
+   MUST first confirm support via the capability list.
+
+Status of This Memo
+
+   PARTIALLY ACCEPTED.  Sections 4 (Scoped Tokens) and 5 (Per-Space
+   Quotas) were ACCEPTED by the
+   protocol owner and IMPLEMENTED in the reference implementation on
+   2026-07-13, under the final extension number EXT-7 and a GRANULAR
+   capability string "quotas" (NOT "tenancy": only Section 5 is enforced,
+   so a "tenancy" capability -- which would also assert Sections 4 and 6
+   -- would be dishonest; when scopes/sub-scopes ship, a "tenancy"
+   capability MAY be added).  Owner refinements adopted (these GOVERN over
+   the body where they differ; reconcile on the next revision):
+
+     1. Enforced quotas are max_events, max_blob_bytes (both -> 507
+        Insufficient Storage; persist until compaction/GC frees room) and
+        max_leases (-> 429 + Retry-After hinting the soonest lease
+        expiry; transient).  max_mail_fanout and max_groups are RESERVED
+        in the type but NOT enforced -- the features they bound (group
+        mail, groups; ext-1 Sections 5-6) are not yet shipped.
+
+     2. Quota config is REPLICATED state: a quota.set command through the
+        Raft log, persisted per-space and carried by the snapshot, so
+        enforcement inside the deterministic FSM reads replicated config
+        and replicated counters -- never a per-node value (which would
+        diverge state, as a per-node cap does; see EXT/idempotency).
+        Section 9's determinism requirement is therefore MANDATORY, not
+        advisory, for quota config.
+
+     3. GET /v1/stats reports each configured quota under a per-space
+        "quota" block { used, limit } that appears ONLY when configured,
+        so an unconfigured space's stats stay byte-compatible (the
+        body-example shape in Section 5.3 would morph legacy scalar
+        counters -- avoided).
+
+     4. Absent OR zero limit = unlimited (today's behavior); a negative
+        limit is 400 at the admin API.  Limits are uint64 in the
+        implementation (the memo's uint32 for some fields is narrowed).
+
+     5. A lease RENEW by the current holder at max_leases still succeeds
+        (a renew is not a new lease); lease CONTENTION stays 409, never
+        over-quota.
+
+   Section 4 (Scoped Tokens) was ALSO ACCEPTED and IMPLEMENTED on
+   2026-07-13, under a granular capability string "scopedtokens", with
+   these owner refinements (GOVERNING over the body):
+
+     6. FAIL-CLOSED replaces the memo's fail-OPEN (Sections 3.2, 4.7,
+        10.1).  A scope is a security control that lives in the daemon's
+        OWN agents.json, so the real hazard is an OLDER binary of the
+        same deployment (a rollback, or a not-yet-upgraded follower that
+        wins an election) silently dropping the scope and granting full
+        role.  Scoped grants are therefore written in a VERSIONED
+        envelope { "version": 2, "agents": {...} }; an old binary's flat
+        parser errors on it and REFUSES TO START rather than run
+        unscoped.  A minter still confirms the "scopedtokens" capability,
+        but enforcement no longer depends on that check being made.
+        (Replacement text for Section 4.7: "A daemon that predates this
+        extension MUST fail to load an agents.json containing scoped
+        grants -- the versioned envelope guarantees this -- so a scope
+        can never silently degrade to full role.")
+
+     7. read_only and actor are TRIMMED, not implemented: role "reader"
+        (Section 5.3 of ACP/1) already is read_only, and identity is
+        already token-derived (ACP/1 Section 5.2), so a per-agent grant
+        already IS actor pinning.  Section 4.3 and 4.4 are withdrawn as
+        redundant.  path_prefix is enforced by exact byte prefix on
+        commit paths and lease names (Section 4.2); the operator uses a
+        trailing slash for subtree isolation.  EXT-1 channel/doc name
+        scoping is NOT folded onto path_prefix (the channel charset
+        excludes "/", so it needs its own field if ever added).
+
+   Section 6 (Optional Sub-Scopes) remains a PROPOSAL pending the owner's
+   approval.
+
+   A 2026-07-13 revision of this memo adds Section 4.8 (read_prefix --
+   read-path scoping), a PROPOSED resolution of the first open question
+   of Section 12.  Like Section 6, Section 4.8 is a PROPOSAL pending the
+   owner's approval: it is NOT implemented, and it is NOT asserted by
+   the accepted "scopedtokens" capability (see Section 4.8.6).  The
+   accepted status of Sections 4.1-4.7 and 5 is unchanged by that
+   revision.  The base protocol version string remains "acp/1".
+   Distribution is unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Scoped Tokens (Least-Privilege Grants)
+   5.  Per-Space Quotas
+   6.  Optional Named Sub-Scopes (Projects)
+   7.  Capability Negotiation and Backward Compatibility
+   8.  Wire API Additions
+   9.  Determinism and High Availability
+   10. Security Considerations
+   11. Rollout Plan
+   12. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/1 provides multi-tenancy at exactly one granularity: the SPACE
+   (ACP/1 Section 7).  Spaces share nothing -- "Spaces MUST NOT share
+   events, messages, leases, blobs, manifests" -- which makes one space
+   per tenant a clean hard boundary.  Authorization WITHIN a space,
+   however, is coarse.  ACP/1 Section 5.3 defines three roles
+   (admin/writer/reader), and in shared-token mode "the caller is
+   effectively admin".  Even in per-agent mode, a single "writer" token
+   may commit to ANY manifest path (Section 11), acquire ANY lease
+   (Section 10), publish ANY event, and read ALL mail in the space.
+   Three concrete gaps follow.
+
+   1.1.  No least-privilege token scoping.
+
+      A writer token is all-or-nothing across the space.  There is no way
+      to mint "this token may only write under projects/42/ and may only
+      read elsewhere", or "this token is read-only", or "this token always
+      acts as actor pod-42a".  A leaked or over-broad token therefore has
+      full-space write power.  Least privilege is a universal security
+      posture; ACP/1 has no mechanism for it below the space boundary.
+
+   1.2.  No bound on a space's accumulated state.
+
+      ACP/1 Section 5.4 rate-limits the request RATE (429 + Retry-After),
+      but nothing bounds accumulated STATE: a space's event log
+      (Section 8), stored blob bytes (Section 11), concurrent lease count
+      (Section 10), and mail fan-out (EXT-1 Section 6) can all grow
+      without limit.  On a shared daemon hosting many tenants, one noisy
+      tenant can exhaust storage or lease capacity for all co-tenants.
+      GET /v1/stats already exposes per-space counters -- but nothing
+      caps them.
+
+   1.3.  No lightweight sub-tenant grouping.
+
+      Deployments that host many projects or pods within one tenant space
+      want to scope tokens and quotas to a project WITHOUT paying for a
+      whole separate space.  A separate space shares nothing, so it cannot
+      share the tenant's common context (its shared manifest, its team
+      mail); yet today the only partition available is a whole space.
+
+   Prior art: downstream engines enforce all of this by BROKER
+   CONVENTION -- path-prefixing manifests as projects/<id>/, prefixing
+   lease names, setting a project label on events, and applying per-tenant
+   byte/rate budgets as engine policy.  This works, but it is engine-side
+   ONLY: the protocol cannot enforce it, so a leaked space token still
+   holds full-space power, and a co-tenant on the same daemon is bounded
+   only by another tenant's good behavior.  This extension lets the daemon
+   ENFORCE least privilege and resource bounds at the protocol edge, as
+   defense in depth beneath the space boundary -- with the space remaining
+   the only hard isolation boundary.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the architecture, transport, authentication, role,
+   space, event, mailbox, lease, and manifest definitions of ACP/1 without
+   restating them; section references of the form "ACP/1 Section N" point
+   into rfc/acp-1.txt, and "EXT-1 Section N" into
+   acp-ext-1-channels-groups-pubsub.txt.
+
+   GRANT:  The per-agent authorization record ACP/1 Section 5.2 maps a
+      token to: an agent id and a role.  This extension adds an OPTIONAL
+      scope to it.
+
+   SCOPED TOKEN:  A token whose grant carries a non-empty scope, so the
+      daemon constrains it below its role.
+
+   RESOURCE NAME:  The name a write op targets -- a manifest commit path
+      (ACP/1 Section 11), a lease name (Section 10), and OPTIONALLY a
+      channel or group name (EXT-1).  A path-prefix scope constrains these.
+
+   QUOTA:  A configured upper bound on an accumulated per-space (or
+      per-sub-scope) resource.  Absent means unbounded (today's behavior).
+
+   SUB-SCOPE (PROJECT):  An OPTIONAL short label that partitions resource
+      names within a space for scoping and accounting.  Like an EXT-1
+      channel is a VIEW over the log, a sub-scope is a NAMESPACE convention
+      over resource names -- NOT an isolation boundary.
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  The space is the only hard boundary (preserved).
+
+      Scopes, quotas, and sub-scopes are least-privilege and accounting
+      WITHIN a space.  They MUST NOT create a new isolation boundary and
+      MUST NOT weaken ACP/1 Section 7.  Any agent that can read a space can
+      still read every sub-scope in it; confidential separation still
+      requires a separate SPACE.  This is normative and repeated in
+      Security Considerations.
+
+   3.2.  Additive and negotiated -- but note the FAIL-OPEN direction.
+
+      Every change is an OPTIONAL field or a NEW endpoint; the wire version
+      stays "acp/1"; support is advertised as the "tenancy" capability
+      (Section 7).  A grant with no scope behaves exactly as an ACP/1
+      per-agent grant today.  CRUCIAL asymmetry: a daemon WITHOUT this
+      extension IGNORES the scope, so a scoped token there acts as an
+      UNSCOPED full-role token -- the scope fails OPEN, not closed.
+      Therefore a principal that mints a scoped token AS A SECURITY CONTROL
+      MUST first confirm the daemon advertises "tenancy"; otherwise the
+      scope is advisory only and enforcement must remain broker-side.
+      Quotas fail the safe way (an un-enforcing daemon simply does not
+      bound state, i.e. today's behavior).
+
+   3.3.  Least privilege only narrows, never widens.
+
+      A scope can only REDUCE what a role permits, never grant more.  An
+      out-of-scope operation MUST yield 403.  A scope on a token whose
+      role already forbids the op is a no-op.
+
+   3.4.  Reuse the existing shapes.
+
+      Scopes ride the existing per-agent grant (ACP/1 Section 5.2).
+      Quotas ride the existing per-space counters exposed at GET /v1/stats
+      and the Section 5.4 throttling machinery.  Sub-scopes reuse the name
+      fields already carried by events, leases, and manifest commits; no
+      new store is introduced for them.
+
+   3.5.  Non-goals.
+
+      This extension does NOT add: per-path access-control lists beyond a
+      name prefix; read-path filtering (a token that may READ only a
+      subset -- see Section 12; a PROPOSED read_prefix is now specified
+      in Section 4.8); cross-space anything; at-rest encryption;
+      billing/metering beyond the counters ACP/1 already keeps; or token
+      revocation/rotation semantics (Section 12).  Sub-scopes are NOT a
+      replacement for spaces.  These MAY be future extensions.
+
+
+4.  Scoped Tokens (Least-Privilege Grants)
+
+   4.1.  The scoped grant.
+
+      ACP/1 Section 5.2 (per-agent mode) maps a token to { agent, role }.
+      This extension extends the grant with an OPTIONAL scope:
+
+         Grant = { "agent": <string>, "role": <admin|writer|reader>,
+                   "scope": Scope? }
+
+         Scope = {
+           "read_only":   <bool>?,     ; forbid all mutating ops
+           "path_prefix": [<string>]?, ; write resource names must start
+                                       ;   with one of these
+           "read_prefix": [<string>]?, ; PROPOSED (Section 4.8): readable
+                                       ;   resource names must start with
+                                       ;   one of these
+           "actor":       <string>?,   ; pin from/actor/owner to this id
+           "sub_scope":   <string>?    ; confine to this sub-scope (Sec 6)
+         }
+
+      An absent or empty scope means "no additional constraint" -- exactly
+      today's grant.  All constraints in a scope are ANDed.
+
+   4.2.  path_prefix -- constraining WRITE resource names.
+
+      When path_prefix is present, every WRITE op whose target has a
+      resource name (Section 2) MUST have a name that begins, by exact
+      byte prefix, with at least one listed value; otherwise the authority
+      MUST reject it with 403.  The write ops constrained are, at minimum:
+
+         o  a manifest commit (ACP/1 Section 11) -- the committed path;
+         o  a lease acquire (ACP/1 Section 10) -- the lease name;
+         o  OPTIONALLY, an event publish (EXT-1) keyed by channel, and a
+            group mutation (EXT-1) keyed by group name, if the daemon
+            elects to scope those.
+
+      path_prefix constrains WRITES only; it does not by itself narrow
+      reads (a PROPOSED read_prefix is specified in Section 4.8; it
+      remains open per Section 12 until accepted).  Prefixes are opaque
+      byte strings validated per Section 10.7.
+
+   4.3.  read_only -- a token that cannot mutate.
+
+      When read_only is true, the authority MUST reject EVERY mutating
+      operation from this token with 403 -- regardless of the token's
+      nominal role -- while still permitting GET reads and the presence
+      heartbeat (as ACP/1 Section 5.3 permits for "reader").  This is
+      orthogonal to path_prefix: a token MAY be both read_only and (moot)
+      prefixed.  read_only is the least-privilege default for observers,
+      dashboards, and thin renderers.
+
+   4.4.  actor -- identity pinning.
+
+      When actor is present, the authority MUST set the authenticated
+      "from"/"actor"/"owner" on every op to that id and MUST reject (403)
+      any op that would attribute to a different id.  This reinforces
+      ACP/1 Section 5.2 (identity is DERIVED FROM THE TOKEN; the
+      X-ACP-Agent header MUST be ignored for identity).  actor is useful
+      when one token is shared by a pod yet must always attribute to one
+      logical actor id; commonly actor == agent.
+
+   4.5.  Minting and introspection.
+
+      Scoped grants are created admin-side.  This extension defines two
+      equivalent minting paths; a daemon MAY implement either or both, and
+      the ENFORCEMENT (4.2-4.4) -- not the minting mechanism -- is the
+      normative core:
+
+         o  CLI (informative), extending the existing per-agent minting:
+              coordd -data <dir> -mkagent pod-42a -role writer \
+                     -path-prefix projects/42/ -sub-scope 42
+              coordd -data <dir> -mkagent watcher -role writer -read-only
+
+         o  OPTIONAL admin API (admin role, ACP/1 Section 5.3):
+              POST /v1/admin/agents { agent, role, scope? } -> { token }
+              GET  /v1/admin/agents -> [ Grant ]   ; tokens NEVER echoed
+
+      A token MAY introspect its OWN grant so a well-behaved client can
+      self-limit:
+
+              GET /v1/whoami -> { agent, role, scope? }   ; no token echoed
+
+   4.6.  Enforcement and errors.
+
+      Enforcement is server-side and MUST NOT be bypassable by request
+      headers (ACP/1 Section 5.2).  A write outside path_prefix, a mutate
+      on a read_only token, and an actor mismatch each yield 403 with a
+      body naming the violated constraint (Appendix B).  A scoped token
+      MUST NOT be able to reach ACP/1 Section 5.3 admin operations unless
+      its role is admin.
+
+   4.7.  Backward compatibility (FAIL-OPEN caveat, normative).
+
+      A daemon that does not advertise "tenancy" ignores the scope: the
+      token then behaves as an UNSCOPED grant of its role.  Consequently a
+      minter MUST verify the "tenancy" capability (Section 7) before
+      issuing a scoped token as a security control; otherwise the daemon
+      does not enforce the scope and the least-privilege guarantee does not
+      hold.  Clients that merely CARRY a scoped token need do nothing; the
+      obligation is on the party that RELIES on the scope.
+
+   4.8.  read_prefix -- constraining READ visibility (PROPOSED
+         addition, 2026-07-13; a resolution of Section 12's first open
+         question, pending the owner's approval).
+
+      This subsection is a PROPOSAL: it is NOT implemented and NOT part
+      of the accepted Sections 4.1-4.7 (see Status of This Memo).  It
+      completes the least-privilege story those sections began: a token
+      write-scoped to projects/42/ can today still read the WHOLE space
+      -- the entire manifest, any blob, any collaborative document, and
+      every event.  For a principal that holds its own token yet should
+      see only its slice (a browser pod, a per-project bot), that is an
+      over-broad read grant.  read_prefix narrows it.
+
+      4.8.1.  The field.
+
+         The Scope of Section 4.1 gains an OPTIONAL
+
+            "read_prefix": [<string>]?
+
+         Absent means "read everything" -- exactly today's behavior.
+         read_prefix is INDEPENDENT of path_prefix (a token may be
+         write-scoped but read-unscoped, or the reverse); as with all
+         scope constraints it only NARROWS (Section 3.3) and is ANDed
+         with the rest of the scope.  Prefix values are validated per
+         Section 10.7 and matched by exact byte prefix, like
+         path_prefix (Section 4.2); the operator uses a trailing slash
+         for subtree isolation.
+
+      4.8.2.  Scoped read surfaces (v1: the path-shaped reads).
+
+         When read_prefix is present the authority MUST constrain the
+         three read surfaces whose resources have path-shaped names:
+
+         o  MANIFEST: GET /v1/manifest returns only entries whose path
+            begins with at least one listed prefix -- a FILTERED
+            manifest with status 200, NOT a 403.  The token sees its
+            slice as if it were the whole tree; an unscoped token's
+            response is byte-identical to today's.
+
+         o  BLOB READS: a blob GET is permitted only when the requested
+            hash is referenced by at least one manifest path within
+            read_prefix; otherwise the authority MUST return 404 with a
+            body indistinguishable from a genuinely missing blob (no
+            existence oracle).  Content addressing makes one hash
+            reachable from many paths; the rule is "referenced by ANY
+            in-scope path grants the read" -- if an in-scope file and
+            an out-of-scope file share bytes, the token was already
+            entitled to those bytes via its in-scope reference.
+
+         o  COLLABORATIVE DOCUMENTS (text, ACP/1 Section 12;
+            structured, EXT-5): document NAMES are path-like.  A doc
+            read whose name does not begin with a listed prefix MUST
+            return the same response as a NONEXISTENT document (the
+            empty-document 200 of the CRDT endpoints -- again no
+            oracle), and doc LISTS are filtered like the manifest.
+            Whether doc names should also join path_prefix WRITE
+            enforcement stays with Section 12 (the accepted
+            Section 4.2 enforces commit paths and lease names only).
+
+         Reads NOT constrained in v1 -- deliberately, see 4.8.4: the
+         event stream, mailbox reads, /v1/stats, the presence roster,
+         and lease listings.
+
+      4.8.3.  Fail-closed carriage.
+
+         Consistent with the accepted owner refinement 6 (fail-closed
+         versioned grants): an agents.json containing ANY read_prefix
+         MUST be written with a BUMPED envelope version (version 3), so
+         a binary that enforces write scopes but predates read scoping
+         refuses to start rather than silently serving unfiltered
+         reads.  A daemon that accepts grants through the OPTIONAL
+         admin API MUST either enforce read_prefix or reject a grant
+         containing it (400); it MUST NOT store and ignore the field.
+
+      4.8.4.  The honest caveat (normative): reads are broader than
+              writes.
+
+         Write scoping is airtight because writes funnel through few,
+         name-bearing operations.  Reads do not: a space leaks
+         information through many surfaces, and this cut scopes only
+         the path-shaped ones (4.8.2).  A daemon and its documentation
+         MUST NOT present read_prefix as confinement.  Specifically, a
+         read-scoped token can still:
+
+            o  tail the EVENT LOG and see every event, including
+               entities (paths), lease names, and actions outside its
+               prefix -- event filtering is deferred (Section 12; many
+               events are not path-shaped, and a filtered log is
+               closer to EXT-1 channels than to a name check);
+            o  read /v1/stats aggregate counters (space-wide usage);
+            o  receive MAIL (directed at the agent, not path-shaped)
+               and see the presence roster -- who is in the space;
+            o  observe lease names via lease operations and events.
+
+         read_prefix is therefore least-privilege HYGIENE for CONTENT
+         (tree shape, blob bytes, document contents) -- not
+         confidentiality, and not a boundary.  The space remains the
+         only hard boundary (Section 3.1); this is the same honesty
+         rule as "sub-scopes are not isolation" (Section 6.3).
+
+      4.8.5.  Minting (informative).
+
+         coordd -data <dir> -mkagent pod-42w -role writer \
+                -path-prefix projects/42/ -read-prefix projects/42/
+         and the admin API Scope carries the field per Section 4.8.1.
+
+      4.8.6.  Capability and compatibility.
+
+         This proposal keeps the capability string unchanged
+         ("scopedtokens"), matching its wire posture (reads simply
+         degrade to filtered/404 for scoped tokens; unscoped tokens
+         are byte-identical).  The enforcement guarantee against
+         same-deployment version skew comes from the versioned
+         envelope (Section 4.8.3), not from a capability probe.  The
+         residual gap -- a REMOTE minter cannot distinguish "enforces
+         write scopes only" from "enforces read scopes too" by
+         capability alone -- is recorded for the owner: a granular
+         "scopedtokens.read" advertisement MAY be preferred on
+         acceptance (the precedent set by the granular "quotas"/
+         "scopedtokens" split in this memo's own acceptance).
+
+
+5.  Per-Space Quotas
+
+   5.1.  Quota configuration.
+
+      A daemon MAY enforce, per space (and OPTIONALLY per sub-scope,
+      Section 6), any subset of:
+
+         Quota = {
+           "max_events":      <uint64>?,  ; retained events in the log
+           "max_blob_bytes":  <uint64>?,  ; total stored blob bytes
+           "max_leases":      <uint32>?,  ; concurrent live leases
+           "max_mail_fanout": <uint32>?,  ; expanded recipients per send
+           "max_groups":      <uint32>?   ; EXT-1 groups in the space
+         }
+
+      An absent field is unbounded (today's behavior).  Quotas are set by
+      daemon configuration or, OPTIONALLY, an admin API:
+
+         PUT /v1/admin/quota { space?, sub_scope?, ...limits } -> Quota
+
+   5.2.  Enforcement points and error classes.
+
+      Quotas separate cleanly into TRANSIENT (count/rate) bounds, which
+      use 429 + Retry-After per ACP/1 Section 5.4, and PERSISTENT (stored)
+      bounds, which use 507 (Insufficient Storage; introduced by this
+      extension, Appendix B) and persist until state is freed:
+
+         o  max_events    -> appending beyond the RETAINED cap yields 507.
+            Interacts with compaction (ACP/1 Section 8.5): the cap is on
+            retained events, so compaction frees room.
+         o  max_blob_bytes-> a blob PUT (Section 11) that would exceed the
+            space's stored bytes yields 507; blob GC frees room.
+         o  max_leases    -> acquiring a lease beyond the concurrent cap
+            yields 429 + Retry-After (a live lease will expire).
+         o  max_mail_fanout-> an expanded fan-out (EXT-1 Section 6) beyond
+            the cap yields 429 (consistent with EXT-1 Section 10.2, which
+            already counts the EXPANDED recipient set).
+         o  max_groups    -> creating a group beyond the cap yields 429.
+
+   5.3.  Advertisement.
+
+      GET /v1/stats SHOULD report each configured quota alongside its
+      existing counter as { "used": <n>, "limit": <n>? }, e.g.
+      { "events": {"used":812004,"limit":1000000},
+        "blob_bytes": {"used":...,"limit":...}, "leases": {...} }.
+      A daemon near a quota SHOULD warn (a stats field or a response
+      header) so clients can back off before hitting a hard error.
+
+   5.4.  Relationship to rate limiting.
+
+      ACP/1 Section 5.4 bounds request RATE; quotas bound accumulated
+      STATE.  Both MAY apply to the same request.  A 429 (rate or transient
+      quota) carries Retry-After and is expected to clear with time; a 507
+      (storage quota) persists until state is compacted or garbage-
+      collected and MUST NOT be retried blindly.
+
+   5.5.  Per-sub-scope quotas (optional).
+
+      When sub-scopes (Section 6) are enabled, a daemon MAY additionally
+      key quotas per sub-scope, so a single project cannot exhaust its
+      tenant's space.  Per-space and per-sub-scope quotas MAY both apply;
+      the tighter bound governs.
+
+
+6.  Optional Named Sub-Scopes (Projects)
+
+   6.1.  The sub_scope label.
+
+      An OPTIONAL "sub_scope" label MAY be attached to events, lease
+      acquisitions, and manifest commits, and MAY be carried by a scoped
+      grant (Section 4.1).  A sub-scope partitions resource names within a
+      space for SCOPING and ACCOUNTING only.  By convention a sub-scope
+      "42" corresponds to a resource-name prefix such as "projects/42/",
+      but the mapping is operator-chosen; a scoped token's path_prefix is
+      what the daemon actually enforces on writes (Section 4.2).
+
+   6.2.  What a sub-scope keys.
+
+      o  A scoped token MAY be confined to one sub-scope (Section 4.1).
+      o  Quotas MAY be applied per sub-scope (Section 5.5).
+      o  GET /v1/stats MAY break its counters down per sub-scope.
+
+   6.3.  Not an isolation boundary (normative).
+
+      A sub-scope is NOT a security boundary.  Any token that can read the
+      space can read any sub-scope in it (like EXT-1 channels).
+      Confidential separation requires a separate SPACE (ACP/1 Section 7).
+
+   6.4.  Discovery (optional).
+
+      A daemon that tracks sub-scopes MAY expose:
+         GET /v1/subscopes -> [ { "name": <string>, ...counters } ]
+      mirroring the EXT-1 channel registry.  Sub-scopes MAY be created
+      implicitly by first use of a new label.
+
+   6.5.  Backward compatibility.
+
+      A daemon without this extension ignores the "sub_scope" field
+      (unstored) and degrades to "one space, no sub-scoping".
+
+
+7.  Capability Negotiation and Backward Compatibility
+
+   Support is advertised as a single capability string on the existing
+   introspection endpoints (the mechanism of EXT-1 Section 7):
+
+      GET /v1/healthz  (and GET /v1/stats) responses gain:
+         "protocol": "acp/1",
+         "capabilities": [ ..., "tenancy" ]
+
+   A daemon MUST advertise "tenancy" ONLY when it fully enforces Section 4
+   (scoped tokens) and Section 5 (quotas).  A daemon that also implements
+   Section 6 MAY additionally advertise "tenancy.subscope"; absent that,
+   clients MUST assume sub-scopes are unenforced labels.
+
+   A client MUST treat the ABSENCE of "tenancy" as "not enforced" and,
+   critically (Section 3.2, Section 4.7), MUST NOT rely on a scoped token
+   as a security control against such a daemon -- enforcement then remains
+   broker-side.  This fail-open direction is the single most important
+   interoperability rule in this document.
+
+
+8.  Wire API Additions
+
+   Summary (full detail in Sections 4-6; types in Appendix A):
+
+      Modified:
+         per-agent grant           + OPTIONAL "scope" (Section 4.1)
+         GET /v1/stats             + per-quota {used,limit}; per-sub-scope
+         GET /v1/healthz,/v1/stats + "tenancy" capability
+         POST /v1/events           + OPTIONAL "sub_scope"
+         POST /v1/mail             + OPTIONAL "sub_scope"
+         lease acquire, commit     + OPTIONAL "sub_scope"
+
+      New:
+         GET  /v1/whoami                         ; self grant (no token)
+         POST /v1/admin/agents                   ; mint scoped grant [OPT]
+         GET  /v1/admin/agents                   ; list grants [OPT]
+         PUT  /v1/admin/quota                    ; set quotas [OPT]
+         GET  /v1/subscopes                      ; sub-scope discovery [OPT]
+
+   All new endpoints follow ACP/1 Section 6 conventions: JSON bodies, the
+   standard headers, bearer auth (Section 5), and the standard error model
+   (Appendix B of ACP/1 plus Appendix B here).  All /v1/admin/* endpoints
+   require the admin role (ACP/1 Section 5.3).
+
+
+9.  Determinism and High Availability
+
+   ACP/1 Section 17 requires the replicated state machine to be
+   deterministic.  This extension preserves that:
+
+      o  Grants and quota configuration are replicated as admin ops in the
+         Raft log; every replica holds identical grants and limits.
+
+      o  Scope enforcement (Section 4) is a PURE FUNCTION of the replicated
+         grant and the request, so every replica accepts or rejects an op
+         identically.  No node-local or wall-clock input participates.
+
+      o  Quota enforcement (Section 5) is decided against COMMITTED
+         per-space counters -- already-replicated derived state -- at apply
+         time.  Where the accept/reject decision must precede commit, the
+         leader decides and records the decision in the op so followers
+         apply the same outcome; counters and any "Now" the leader stamps
+         are leader-assigned and carried in the op (consistent with ACP/1's
+         leader-stamps-Now rule), so replicas never diverge.
+
+   Reads (/v1/whoami, /v1/stats, /v1/subscopes) are served from committed
+   state under ACP/1's ordinary leader/follower read rules.
+
+
+10. Security Considerations
+
+   10.1.  Fail-open is the sharpest edge (normative).
+
+      A scoped token presented to a daemon that does not enforce "tenancy"
+      acts as an UNSCOPED full-role token.  Least privilege that silently
+      fails open is more dangerous than none, because operators may believe
+      a leaked token is bounded when it is not.  A minter MUST verify the
+      "tenancy" capability (Section 7) before issuing scoped tokens as a
+      control, and operators MUST NOT make scoped tokens their SOLE control
+      without confirming enforcement.  Broker-side policy remains the
+      backstop (Section 10.3).
+
+   10.2.  Scopes and sub-scopes are not confidentiality.
+
+      path_prefix and read_only constrain a TOKEN; they do not hide data
+      from other tokens in the same space, and a sub-scope is not a
+      boundary.  Confidential separation requires a separate SPACE (ACP/1
+      Section 7), which shares nothing.
+
+   10.3.  Defense in depth, not replacement.
+
+      This extension enforces least privilege and resource bounds AT THE
+      PROTOCOL EDGE; it complements, and does not replace, an application/
+      broker acting as the tenancy policy authority (mapping tenants to
+      spaces and sub-scopes, setting budgets).  Both layers SHOULD hold
+      independently.
+
+   10.4.  Quotas as an availability control.
+
+      Per-space quotas prevent one tenant from exhausting storage, lease
+      capacity, or mail capacity on a shared daemon (the noisy-neighbor
+      problem).  A quota error (429/507) MUST NOT reveal another tenant's
+      usage or the existence of other spaces; it reports only the calling
+      space's own used/limit.
+
+   10.5.  Identity pinning.
+
+      The actor scope reinforces ACP/1 Section 5.2: the authority sets
+      identity from the token and MUST NOT trust client-supplied
+      from/actor/owner values; a pinned actor further constrains the
+      token to a single attributable id.
+
+   10.6.  Admin surface.
+
+      Minting scoped grants and setting quotas are admin-only operations
+      (ACP/1 Section 5.3, /v1/admin/*).  Compromise of an admin token
+      confers full control, exactly as in ACP/1; this extension does not
+      widen the admin surface beyond the two documented endpoints.
+
+   10.7.  Name validation and injection.
+
+      path_prefix values and sub_scope names are echoed in error bodies
+      and in /v1/stats.  Daemons MUST validate them against a documented
+      character set and length bound (RECOMMENDED [A-Za-z0-9._:/-]{1,128}
+      for a prefix; [A-Za-z0-9._:-]{1,64} for a sub-scope name) to avoid
+      log/display injection, and consumers MUST treat them as opaque data,
+      not markup.
+
+
+11. Rollout Plan
+
+   The features are independent, independently valuable, and independently
+   negotiated; they SHOULD ship incrementally:
+
+      Phase 1 -- "tenancy" scoped tokens (Section 4).  Highest security
+         value-to-effort: enforce read_only, path_prefix, and actor on the
+         existing per-agent grant, plus GET /v1/whoami.  This alone turns a
+         leaked writer token from full-space power into a bounded,
+         least-privilege credential.
+
+      Phase 2 -- per-space quotas (Section 5).  Availability / noisy-
+         neighbor protection: wire quota checks into event append, blob
+         PUT, lease acquire, and mail fan-out, and surface used/limit on
+         /v1/stats.
+
+      Phase 3 -- optional sub-scopes (Section 6).  Only for deployments
+         that want project-granular scoping/accounting without new spaces;
+         MAY ship as the sub-capability "tenancy.subscope".
+
+   Each phase is additive, independently negotiated, and reversible: a
+   daemon can drop the capability without breaking ACP/1 peers (subject to
+   the fail-open rule of Section 3.2 for any principal that was relying on
+   a scope).
+
+
+12. Open Questions
+
+   o  READ-path scoping: a read_prefix (or a read_only-elsewhere mode) so
+      a token may READ only a subset of the space, not just be barred from
+      writing outside a prefix.  Deferred; this cut scopes WRITES and
+      offers a whole-token read_only.  Read scoping interacts with the
+      totally-ordered log (a filtered read is closer to EXT-1 channels).
+      (2026-07-13: a PROPOSED resolution is specified in Section 4.8,
+      covering the path-shaped read surfaces only; it is pending the
+      owner's approval, and the event-log part of this question remains
+      open regardless.)
+
+   o  Wildcards / hierarchy in path_prefix versus exact byte prefix.
+
+   o  Whether sub-scope quotas need their own compaction/GC accounting
+      distinct from the space's.
+
+   o  A standard admin token-mint API versus CLI-only minting (some
+      deployments never expose /v1/admin/*).
+
+   o  Grant REVOCATION and rotation (short-TTL scoped tokens versus a
+      revocation list) -- likely a separate extension.
+
+   o  Soft (warn-only) versus hard (reject) quotas, and a grace band.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   Grant (new -- the per-agent authorization record, Section 4.1):
+      { "agent": <string>, "role": <admin|writer|reader>,
+        "scope": Scope? }
+
+   Scope (new):
+      { "read_only":   <bool>?,
+        "path_prefix": [<string>]?,
+        "actor":       <string>?,
+        "sub_scope":   <string>? }
+
+   Quota (new -- Section 5.1):
+      { "max_events": <uint64>?, "max_blob_bytes": <uint64>?,
+        "max_leases": <uint32>?, "max_mail_fanout": <uint32>?,
+        "max_groups": <uint32>? }
+
+   QuotaCounter (new -- how /v1/stats reports each bound):
+      { "used": <uint64>, "limit": <uint64>? }
+
+   Event / Message / LeaseRequest / CommitRequest (changed -- one added
+   OPTIONAL field each):
+      { ...existing ACP/1 fields..., "sub_scope": <string>? }
+
+   WhoAmI (new -- response to GET /v1/whoami):
+      { "agent": <string>, "role": <string>, "scope": Scope? }
+
+   Stats (changed):
+      { ...existing counters as QuotaCounter where a quota is set...,
+        "subscopes": { <name>: {counters} }?,   ; OPTIONAL
+        "protocol": "acp/1",
+        "capabilities": [<string>] }
+
+   Health (changed):
+      { ...existing fields..., "protocol": "acp/1",
+        "capabilities": [<string>] }   ; includes "tenancy" when enforced
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: malformed scope or quota; invalid path_prefix or
+        sub_scope name (Section 10.7).
+   403  Forbidden: a write whose resource name is outside the grant's
+        path_prefix; any mutate on a read_only token; an op whose actor
+        would differ from a pinned actor; a non-admin attempting
+        /v1/admin/agents or /v1/admin/quota.
+   429  Too Many Requests: a TRANSIENT quota exceeded -- concurrent
+        max_leases, per-send max_mail_fanout, or max_groups; carries
+        Retry-After (ACP/1 Section 5.4).
+   507  Insufficient Storage: a PERSISTENT quota exceeded -- max_events
+        (retained) or max_blob_bytes (stored).  Persists until state is
+        freed by compaction (ACP/1 Section 8.5) or blob GC; MUST NOT be
+        retried blindly.  This status is introduced by this extension;
+        base ACP/1 does not use 507.
+
+   PROPOSED (Section 4.8, pending approval): a blob or collaborative-
+   document read outside a token's read_prefix returns the SAME
+   response as a genuinely missing resource (404 for blobs; the
+   empty-document 200 for CRDT docs) -- never a distinguishable
+   error -- and a read-scoped GET /v1/manifest is a FILTERED 200.
+
+   All other status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt): 401 auth, 409 version conflict, 423 leased, etc.
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Mint a project-scoped writer and prove the bound.
+
+      Mint (CLI or admin API):
+         coordd -mkagent pod-42a -role writer \
+                -path-prefix projects/42/ -sub-scope 42
+         POST /v1/admin/agents
+            { "agent":"pod-42a", "role":"writer",
+              "scope": { "path_prefix":["projects/42/"], "sub_scope":"42" } }
+         -> { "token": "acp_..." }
+
+      In-scope write succeeds; out-of-scope write is refused:
+         PUT manifest projects/42/design.md   -> 200
+         PUT manifest projects/99/secret.md   -> 403
+            { "error":"path 'projects/99/secret.md' outside grant prefix
+              'projects/42/'" }
+
+   C.2.  A read-only observer.
+
+      coordd -mkagent watcher -role writer -read-only
+         GET  /v1/events?follow=true         -> 200 (streams)
+         POST /v1/events { "action":"note" } -> 403
+            { "error":"read_only token may not append" }
+
+   C.3.  Set and hit a per-space quota.
+
+      PUT /v1/admin/quota
+         { "space":"acme", "max_blob_bytes":1073741824,
+           "max_events":1000000 }
+      An over-limit blob PUT:
+         PUT /v1/blobs (bytes that would exceed) -> 507
+            { "error":"space blob quota exceeded",
+              "used":1073741820, "limit":1073741824 }
+      Observe headroom:
+         GET /v1/stats ->
+            { "events":{"used":812004,"limit":1000000},
+              "blob_bytes":{"used":1073741820,"limit":1073741824},
+              "leases":{"used":7,"limit":64},
+              "capabilities":["channels","groups","tenancy"] }
+
+   C.4.  Capability check before RELYING on a scope (the fail-open rule).
+
+      GET /v1/healthz
+      -> { "ok":true, "protocol":"acp/1",
+           "capabilities":["channels","groups"] }      ; no "tenancy"
+      The minter sees no "tenancy": it MUST NOT rely on the scoped token as
+      a security control (the daemon would ignore the scope), and keeps
+      enforcing least privilege broker-side until the daemon advertises
+      "tenancy".
+
+   C.5.  Self-introspection.
+
+      GET /v1/whoami
+      -> { "agent":"pod-42a", "role":"writer",
+           "scope":{"path_prefix":["projects/42/"],"sub_scope":"42"} }
+      A well-behaved client reads its own scope and avoids issuing writes
+      it knows will 403.
+
+   C.6.  PROPOSED (Section 4.8): a read-scoped browser token.
+
+      coordd -mkagent pod-42w -role writer \
+             -path-prefix projects/42/ -read-prefix projects/42/
+
+      GET /v1/manifest
+      -> 200, only projects/42/** entries (a filtered slice; no 403)
+
+      GET /v1/blobs/<hash referenced only by projects/99/...>
+      -> 404 (byte-identical to a missing blob; no oracle)
+
+      GET /v1/crdt/json/doc?doc=projects/42/board  -> 200 (the doc)
+      GET /v1/crdt/json/doc?doc=projects/99/board  -> 200 {} (as if
+         nonexistent)
+
+      GET /v1/events?follow=true
+      -> 200, the FULL space stream -- events are NOT read-scoped in
+         v1 (Section 4.8.4); the minter must not mistake read_prefix
+         for confinement.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal was contributed by a downstream ACP consumer
+   for the protocol owner's review.  It accompanies the ACP/1
+   specification (rfc/acp-1.txt) and the reference implementation
+   distributed at https://github.com/ab0t-com/acp .

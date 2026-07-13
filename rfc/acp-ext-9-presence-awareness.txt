@@ -1,0 +1,626 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-9                                      ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+        ACP Extension Proposal 9: Presence and Awareness (Ephemeral
+                       Per-Actor State with TTL Expiry)
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: AWARENESS -- a per-space, per-actor,
+   EPHEMERAL state store ("pod-b's cursor is on node ARR right now",
+   "pod-a is typing", "who is live on this board") with TTL-based
+   expiry, a snapshot read, and a live delta stream.
+
+   ACP/1's event log (Section 8 of ACP/1) is append-only, durable, and
+   totally ordered -- exactly right for facts, and exactly wrong for
+   awareness.  Awareness data is high-frequency, per-actor,
+   self-superseding, and worthless once stale: recording every cursor
+   move as a durable event bloats the one log every agent replays and
+   creates compaction work for state nobody will ever read back.  ACP/1
+   does ship a COARSE presence primitive (the heartbeat/roster of
+   POST /v1/agents/beat and GET /v1/agents); this extension is its
+   fine-grained, real-time, self-expiring generalization.
+
+   The extension adds one resource, /v1/awareness: POST sets the
+   caller's own awareness state (with a TTL), GET returns a snapshot of
+   all live entries, and GET with follow=true streams awareness deltas
+   (join, update, leave/expire).  Awareness entries are NEVER written
+   to the durable event log, never replicated through the consensus
+   log, and never carried by a snapshot: they are a deliberately
+   BEST-EFFORT, lossy-on-crash tier beside ACP/1's durable one.  The
+   feature is negotiated by a new capability string, "awareness".  None
+   of this changes the wire version "acp/1": the endpoints are new, a
+   daemon that does not implement this extension answers them 404, and
+   a daemon or client that does not implement this extension
+   interoperates unchanged with one that does.
+
+Status of This Memo
+
+   This is a PROPOSAL, not yet part of the normative ACP/1
+   specification (rfc/acp-1.txt).  It is published for review by
+   implementers and for the protocol owner's approval.  The extension
+   number EXT-9 is PROVISIONAL; the protocol owner assigns final
+   numbers on acceptance.  If accepted, its endpoints and types fold
+   into a future "acp/1.1" capability set; the base protocol version
+   string remains "acp/1" and the feature is advertised via Section 5.
+   Distribution is unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  The Awareness Store
+   5.  Capability Negotiation and Backward Compatibility
+   6.  Wire API Additions
+   7.  Determinism and High Availability
+   8.  Security Considerations
+   9.  Rollout Plan
+   10. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/1 gives a space exactly one shared-state mechanism with delivery
+   guarantees: the per-space, append-only, totally-ordered event log
+   (ACP/1 Section 8), from which every agent derives durable shared
+   state.  Alongside it, ACP/1 offers a COARSE presence facility:
+   agents POST /v1/agents/beat periodically and read the roster from
+   GET /v1/agents ("which agents have been seen recently, on which
+   host, with what status").
+
+   Between those two lies a gap that every live multi-editor surface
+   falls into.  A collaborative board backed by the structured CRDT of
+   ACP/EXT-5, a co-edited text document (ACP/1 Section 12), or simply
+   "who is looking at this workspace right now" all need AWARENESS:
+   which actors are live, where their cursors and selections are, what
+   they are doing this second.  Three concrete problems motivate this
+   extension:
+
+   1.1.  Awareness abuses the durable log.
+
+      The only in-protocol way to tell peers "my cursor moved" today is
+      to append an event.  Cursor movement is emitted many times per
+      second per actor, is superseded by the next movement, and has NO
+      value after a few seconds -- yet every such event would be
+      fsync'd, sequenced, replicated, replayed by every follower, and
+      chased by compaction (ACP/1 Section 8.5) forever after.  The log
+      is monotone and durable BY DESIGN; awareness is the one class of
+      state that design actively harms.
+
+   1.2.  Hand-rolled presence out of band.
+
+      Absent a protocol primitive, consumers build their own: a
+      downstream engine that adopted ACP was found to have implemented
+      its own homegrown presence subsystem beside it.  Every such
+      side-build re-solves expiry, fan-out, and join/leave edges, and
+      none of it interoperates.
+
+   1.3.  The existing heartbeat is too coarse.
+
+      POST /v1/agents/beat carries (harness, host, status) at a
+      many-second cadence -- a ROSTER, not awareness.  It cannot say
+      "cursor on node n7 of doc boards/q3", cannot expire promptly
+      enough for an editing surface, and has no delta stream a renderer
+      can follow.  The shape is right (per-actor, self-superseding,
+      server-timestamped); the granularity, payload, and delivery are
+      not.
+
+   This extension closes the gap with the smallest additive surface: a
+   per-space awareness store -- actor -> {state, expiry} -- written by
+   its owner only, expiring on a short TTL, readable as a snapshot, and
+   streamable as deltas.  It is the first inhabitant of an explicitly
+   EPHEMERAL tier beside ACP/1's durable one, and it is deliberately
+   kept OUT of the event log, out of the replicated state machine, and
+   out of snapshots.
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, space, event, and presence definitions of ACP/1 without
+   restating them; section references of the form "ACP/1 Section N"
+   point into rfc/acp-1.txt, and "EXT-N Section M" into the
+   corresponding extension memo.
+
+   AWARENESS ENTRY:  The single ephemeral record the store holds for
+      one actor in one space: { actor, state, ttl, expires, updated }.
+      An actor has AT MOST one entry per space; a new write replaces
+      the previous entry wholesale.
+
+   AWARENESS STATE:  The client-supplied JSON object inside an entry
+      (cursor position, selection, status, display name, ...).  The
+      protocol treats it as opaque, bounded-size JSON.
+
+   TTL:  The entry's time-to-live.  An entry not refreshed within its
+      TTL EXPIRES: it disappears from snapshots and produces a "leave"
+      delta, exactly as if the actor had departed.
+
+   EPHEMERAL TIER:  State that is intentionally NOT durable, NOT
+      totally ordered, and NOT replicated through the consensus log;
+      lost on daemon restart and re-established by clients' next
+      writes.  Awareness is the first protocol feature in this tier.
+
+   DELTA:  One change notification on the awareness stream: an actor
+      joined (first write), updated (subsequent write), or left
+      (explicit clear or TTL expiry).
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Ephemeral means ephemeral (the invariant).
+
+      Awareness entries MUST NOT be written to the event log, MUST NOT
+      be assigned seq values, MUST NOT be carried by log compaction
+      snapshots or cluster snapshots, and MUST NOT be replicated as
+      state-machine commands (Section 7).  An implementation MUST keep
+      the awareness store in volatile memory (or equivalent); its loss
+      on restart is CORRECT behavior, repaired by clients' next
+      heartbeats.  This is the load-bearing invariant of the extension:
+      the moment awareness leaks into the durable log, this extension
+      has failed at its one job.
+
+   3.2.  Per-actor last-writer-wins, no merge.
+
+      An actor writes ONLY its own entry (the authority derives the
+      actor from the token, ACP/1 Section 5.2, and ignores any
+      client-supplied identity).  Because each entry has exactly one
+      writer, there is nothing to merge: the newest write by that actor
+      replaces its previous entry wholesale.  Awareness is a keyed
+      register per actor, not a CRDT.
+
+   3.3.  Best-effort delivery, honestly stated.
+
+      Awareness is advisory display state.  Delivery is best-effort:
+      a delta MAY be lost on daemon restart, leader change, or stream
+      reconnect, and the protocol's repair mechanism is simply the next
+      heartbeat (a full re-send of the actor's state).  Clients MUST
+      treat awareness as lossy and MUST NOT build correctness-bearing
+      logic (locking, ordering, claiming) on it -- ACP/1 leases
+      (Section 10) and the event log exist for that.  A reconnecting
+      follower re-primes from the snapshot read (Section 4.3).
+
+   3.4.  Additive and negotiated, never breaking.
+
+      All endpoints are NEW paths under /v1/awareness; no existing
+      endpoint or type changes.  A daemon that does not implement this
+      extension answers them 404, and clients discover support via the
+      capability list (Section 5).  The protocol version string stays
+      "acp/1".  The existing coarse heartbeat/roster (POST
+      /v1/agents/beat, GET /v1/agents) is UNCHANGED and remains the
+      right tool for "is this agent alive"; awareness neither replaces
+      nor deprecates it.
+
+   3.5.  Non-goals.
+
+      This extension does NOT add: durable presence history ("who was
+      here yesterday" -- append an event if that is wanted); awareness
+      ACROSS spaces (the space remains the boundary, ACP/1 Section 7);
+      guaranteed or ordered delivery of awareness deltas; a general
+      gossip/relay fabric (a future extension MAY generalize the
+      ephemeral tier; Section 10); server-side interpretation of the
+      state object (cursor schemas are a client concern -- the protocol
+      carries opaque JSON); or awareness-derived authorization of any
+      kind.
+
+4.  The Awareness Store
+
+   4.1.  The store.
+
+      Per space, the authority keeps a volatile map
+
+         actor -> AwarenessEntry { actor, state, ttl, expires, updated }
+
+      keyed by the authenticated actor id.  The map is bounded by the
+      number of live agents in the space; entries leave it by explicit
+      clear or TTL expiry.  The store is per-space: awareness MUST
+      never be visible across spaces (ACP/1 Section 7).
+
+   4.2.  Setting awareness: POST /v1/awareness.
+
+      Request body:
+
+         { "state": <object>, "ttl_sec": <int>? }
+
+      The authority MUST set the entry's actor to the authenticated
+      identity (never from a client-supplied field, ACP/1 Section 5.2)
+      and MUST replace that actor's previous entry wholesale (no
+      server-side merging of state objects).  "updated" and "expires"
+      are stamped from the serving node's clock.
+
+      ttl_sec is OPTIONAL; the RECOMMENDED default is 30 seconds.  A
+      daemon SHOULD enforce a maximum TTL (RECOMMENDED 300 seconds) and
+      MUST reject a non-positive or over-maximum ttl_sec with 400.  A
+      daemon MUST bound the encoded size of "state" (RECOMMENDED
+      maximum 16 KiB) and reject an oversized state with 400; awareness
+      is display state, not a data channel.
+
+      A write with "state": null (or an empty object and ttl_sec 0)
+      is an EXPLICIT LEAVE: the authority MUST drop the actor's entry
+      and emit a "leave" delta.  Clients SHOULD send an explicit leave
+      on orderly shutdown rather than letting the TTL lapse.
+
+      The response is the stored entry (Appendix A).  Awareness writes
+      MUST count against the sender's rate limit (ACP/1 Section 5.4);
+      clients SHOULD throttle to a few writes per second and coalesce
+      rapid cursor movement client-side.
+
+   4.3.  Snapshot: GET /v1/awareness.
+
+      Returns the live entries of the caller's space:
+
+         { "entries": [ AwarenessEntry, ... ] }
+
+      An entry whose expiry has passed MUST NOT appear.  The snapshot
+      is the re-priming read: a client that (re)connects fetches it
+      once, then follows deltas (Section 4.4).  Reading awareness
+      requires only the "reader" role (ACP/1 Section 5.3).
+
+   4.4.  Live deltas: GET /v1/awareness?follow=true.
+
+      A streaming response (application/x-ndjson, one JSON object per
+      line, matching the event-follow transport of ACP/1 Section 8.4)
+      of awareness deltas:
+
+         { "type": "join"|"update"|"leave", "entry": AwarenessEntry }
+
+      "join" is emitted when an actor with no live entry writes one;
+      "update" when an existing entry is replaced; "leave" when an
+      entry is explicitly cleared OR expires (the "entry" of a leave
+      MAY carry only the actor id).  The stream SHOULD begin with a
+      synthetic "join" for every currently-live entry, so a follower
+      needs no separate snapshot request; clients MUST nonetheless
+      tolerate receiving deltas for actors they have not seen join
+      (best-effort delivery, Section 3.3).
+
+      Deltas carry NO seq and NO ordering guarantee beyond per-actor
+      write order as observed by the serving node.  There is no replay
+      cursor: on reconnect a client simply re-primes (Section 4.3 or
+      the synthetic joins) and continues.
+
+   4.5.  TTL expiry.
+
+      The authority MUST expire an entry no later than a bounded
+      interval after its "expires" instant (a periodic sweep with a
+      RECOMMENDED period of at most 5 seconds is sufficient) and MUST
+      emit a "leave" delta on expiry.  Expiry uses the serving node's
+      own clock; because awareness is not replicated state, modest
+      cross-node skew is acceptable (Section 7).  Clients keep their
+      entry alive by re-POSTing state at an interval comfortably below
+      the TTL (RECOMMENDED: TTL/3).
+
+   4.6.  Relationship to the ACP/1 heartbeat.
+
+      POST /v1/agents/beat answers "which agents exist and are alive"
+      at roster granularity; /v1/awareness answers "what is each live
+      actor doing right now" at editing granularity.  A daemon MAY
+      internally refresh an agent's roster liveness when it receives an
+      awareness write from it, but MUST NOT do the converse (a beat
+      does not create or refresh an awareness entry -- the beat carries
+      no state).
+
+   4.7.  Backward compatibility.
+
+      A daemon that does not implement this extension answers every
+      /v1/awareness request 404.  A conformant client MUST check for
+      the "awareness" capability (Section 5) before use, and when it is
+      absent MUST degrade explicitly (no cursors shown) rather than
+      polling a 404 endpoint.  Nothing else in ACP/1 changes.
+
+5.  Capability Negotiation and Backward Compatibility
+
+   This extension adds a capability string to the ACP/1 introspection
+   endpoints, per the shared convention of EXT-1 Section 7:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain:
+
+         "protocol": "acp/1",
+         "capabilities": [ "awareness", ... ]
+
+      A daemon advertising "awareness" SHOULD also advertise its
+      bounds so clients can size and pace their writes:
+
+         "limits": { "awareness_max_state_bytes": 16384,
+                     "awareness_default_ttl_sec": 30,
+                     "awareness_max_ttl_sec": 300 }
+
+   A daemon MUST advertise "awareness" only when it implements all of
+   Section 4 (set, snapshot, follow stream, TTL expiry with leave
+   deltas).  A client MUST treat the ABSENCE of "awareness" as "not
+   supported" and disable its awareness features explicitly.
+
+6.  Wire API Additions
+
+   Summary (full detail in Section 4; types in Appendix A):
+
+      New:
+         POST /v1/awareness             ; set/replace my entry (writer
+                                        ;   or reader -- see Section 8.2)
+         GET  /v1/awareness             ; snapshot of live entries
+         GET  /v1/awareness?follow=true ; NDJSON delta stream
+
+      Modified:
+         GET /v1/healthz, /v1/stats     + "awareness" capability and
+                                          OPTIONAL "limits" hints
+
+   All endpoints follow ACP/1 Section 6 conventions: JSON bodies, the
+   standard headers (X-ACP-Agent, X-ACP-Protocol, X-ACP-Space), bearer
+   auth (ACP/1 Section 5), and the standard error model (Appendix B of
+   ACP/1 plus Appendix B here).  The follow stream uses
+   application/x-ndjson exactly like the event stream (ACP/1
+   Section 8.4).  Idempotency-Key is NOT meaningful here (a re-sent
+   awareness write is naturally idempotent -- it re-asserts the same
+   state) and MAY be ignored on these endpoints.
+
+7.  Determinism and High Availability
+
+   ACP/1 Section 17 requires the replicated state machine to be
+   deterministic: applying the same ordered command stream MUST yield
+   byte-identical state on every node.  Awareness satisfies this by
+   staying OUT of the state machine entirely:
+
+      o  Awareness writes MUST NOT be proposed as consensus commands,
+         MUST NOT appear in the replicated log, and awareness state
+         MUST NOT be included in snapshots.  This is forced by the data
+         itself: awareness is high-churn (it would flood the log) and
+         expires by wall clock (which the deterministic apply path
+         forbids, ACP/1 Section 17).
+
+      o  In a cluster, the RECOMMENDED v1 topology is LEADER-SERVED
+         awareness: clients' awareness writes are forwarded to the
+         leader exactly like other writes, the leader holds the one
+         authoritative volatile map and serves the snapshot and delta
+         streams; a follower receiving an awareness request MAY proxy
+         it to the leader (or redirect, per the deployment's existing
+         write-forwarding convention).  This gives every editor one
+         consistent view at the cost of leader fan-out -- acceptable at
+         the tens-of-editors scale this extension targets.  A relay or
+         gossip tier that spreads awareness fan-out across nodes is an
+         explicit non-goal here and a candidate future extension
+         (Section 10).
+
+      o  On leader change or daemon restart the awareness map MAY be
+         lost wholesale.  This is specified, correct behavior: clients
+         re-send state on their next heartbeat (Section 4.5) and the
+         map rebuilds within one TTL.  Implementations MUST NOT attempt
+         to "recover" awareness from any durable record, because none
+         may exist (Section 3.1).
+
+      o  TTL expiry runs against the serving node's own clock.  Since
+         awareness is never replicated state, per-node expiry cannot
+         diverge replicated state; a few hundred milliseconds of skew
+         in when a cursor disappears is invisible to users.
+
+   The durable subsystems of ACP/1 are untouched: nothing in this
+   extension reads or writes the event log, manifest, mailbox, lease
+   table, or CRDT stores.
+
+8.  Security Considerations
+
+   8.1.  Identity and spoofing.
+
+      The authority MUST set an entry's actor from the authenticated
+      token (ACP/1 Section 5.2) and MUST ignore any actor-like field
+      inside "state" for identity purposes.  An actor can therefore
+      only ever write, refresh, or clear ITS OWN entry; there is no
+      operation that mutates another actor's awareness.
+
+   8.2.  Visibility and roles.
+
+      Awareness is space-scoped: any principal that can read the space
+      can see who is present and their state objects -- the same
+      posture as the ACP/1 roster (GET /v1/agents) and consistent with
+      "the space is the boundary" (ACP/1 Section 7).  Deployments for
+      which presence itself is sensitive MUST use separate spaces.
+      Reading awareness requires "reader"; writing awareness SHOULD be
+      permitted to "reader" as well (it mutates no durable state and a
+      read-only observer legitimately has a cursor), but a daemon MAY
+      restrict writes to "writer" and above.  A scoped token (EXT-7)
+      MAY additionally be barred from awareness writes by its scope.
+
+   8.3.  Flooding and amplification.
+
+      Awareness is the highest-frequency write surface in ACP.  A
+      daemon MUST charge awareness writes against the sender's rate
+      limit (ACP/1 Section 5.4), MUST bound the state size
+      (Section 4.2), and SHOULD bound the per-space entry count (one
+      per live actor is the natural bound).  The delta stream SHOULD
+      coalesce bursts per actor (delivering the newest state rather
+      than every intermediate) when a consumer falls behind; dropping
+      superseded intermediates is always safe (Section 3.2).
+
+   8.4.  No durable record -- by design and as a privacy property.
+
+      Because awareness never touches the log, it leaves NO audit
+      trail: an actor's cursor history is not reconstructable after the
+      fact.  This is intentional (it is display state), and it is also
+      the reason awareness MUST NOT be used to carry anything that
+      needs auditing -- decisions, claims, or content belong in the
+      event log where they are attributable and replayable.
+
+   8.5.  State content.
+
+      The state object is opaque, client-authored JSON re-displayed to
+      other clients.  Consumers MUST treat it as untrusted data (no
+      markup interpretation, bounded rendering), exactly as they treat
+      event context objects (ACP/1 Section 19).
+
+9.  Rollout Plan
+
+   This is a single, self-contained feature and ships as one phase:
+
+      Phase 1 -- "awareness".  The volatile per-space store; POST set
+         with TTL and size bounds; GET snapshot; NDJSON follow stream
+         with join/update/leave deltas and synthetic joins; periodic
+         expiry sweep; leader-served in cluster mode; the "awareness"
+         capability and limits hints.
+
+   The phase is additive and reversible: a daemon may drop the
+   capability without breaking ACP/1 peers (clients degrade to no
+   cursors; the durable protocol is untouched).  The natural first
+   consumer is a browser/editor SDK; implementations SHOULD land the
+   two together so the feature ships with a real user.
+
+10. Open Questions
+
+   o  Scaling the fan-out.  Leader-served awareness bottlenecks at the
+      leader for very large spaces.  A relay/gossip tier -- nodes
+      exchanging awareness peer-to-peer, eventually consistent -- would
+      generalize the ephemeral tier; it is deliberately out of scope
+      here and would be its own proposal.
+
+   o  Scoping awareness to a document or channel.  A space with many
+      concurrently-edited docs may want "awareness for doc X" rather
+      than the whole space (the EXT-1 channel-filter grammar is the
+      obvious shape: ?channel=...).  This proposal keeps v1 space-wide
+      and defers the filter; the state object can carry a "doc" field
+      that clients filter on client-side meanwhile.
+
+   o  Follower-served reads.  Whether followers may serve snapshot/
+      follow from a locally-relayed copy (weaker consistency, better
+      spread) instead of proxying to the leader.
+
+   o  A server-suggested heartbeat interval in the limits block, so
+      pacing is negotiated rather than convention.
+
+   o  Whether an explicit leave should be its own verb
+      (DELETE /v1/awareness) rather than the null-state write of
+      Section 4.2.  This proposal keeps the surface to one POST.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   AwarenessSet (new -- the POST /v1/awareness body):
+      { "state":   <object> | null,   ; null = explicit leave
+        "ttl_sec": <int>? }           ; default 30, bounded by daemon
+
+   AwarenessEntry (new -- one live entry; the POST response and the
+   snapshot/stream element):
+      { "actor":   <string>,          ; token-derived, never client-set
+        "state":   <object>,
+        "ttl_sec": <int>,
+        "updated": <rfc3339>,
+        "expires": <rfc3339> }
+
+   AwarenessSnapshot (new -- GET /v1/awareness response):
+      { "entries": [ AwarenessEntry, ... ] }
+
+   AwarenessDelta (new -- one NDJSON line of the follow stream):
+      { "type": "join" | "update" | "leave",
+        "entry": AwarenessEntry }     ; a "leave" MAY carry actor only
+
+   Health/Stats (changed -- shared "capabilities" plus OPTIONAL limits
+   hints):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [<string>],   ; includes "awareness"
+        "limits": { "awareness_max_state_bytes": <int>,
+                    "awareness_default_ttl_sec": <int>,
+                    "awareness_max_ttl_sec": <int> }? }
+
+   No durable ACP/1 type changes.  Awareness entries never appear in
+   Event, snapshot, or any replicated structure.
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: "state" missing (and not an explicit leave), not
+        a JSON object, or exceeding the size bound; ttl_sec
+        non-positive or above the daemon maximum.
+   401  Unauthorized: missing or invalid bearer token (ACP/1).
+   403  Forbidden: the caller's role does not permit awareness writes
+        under the daemon's policy (Section 8.2), or a scoped token
+        (EXT-7) is barred from awareness.
+   404  Not found: the daemon does not implement this extension
+        (Section 4.7).
+   429  Too Many Requests: awareness write rate exceeds the sender's
+        budget (Section 8.3); see Retry-After.
+
+   A successful set returns 200 with the stored AwarenessEntry.  All
+   other status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Capability check.
+
+      GET /v1/healthz
+      -> { "status": "ok", "protocol": "acp/1",
+           "capabilities": ["awareness"],
+           "limits": { "awareness_max_state_bytes": 16384,
+                       "awareness_default_ttl_sec": 30 } }
+
+   C.2.  Set my cursor.
+
+      POST /v1/awareness
+      Authorization: Bearer <tok>
+      { "state": { "doc": "boards/q3", "cursor": { "node": "n7" },
+                   "status": "editing" },
+        "ttl_sec": 30 }
+
+      < 200 OK
+      < { "actor": "pod-b", "state": { "doc": "boards/q3",
+      <     "cursor": { "node": "n7" }, "status": "editing" },
+      <   "ttl_sec": 30, "updated": "2026-07-13T10:00:00Z",
+      <   "expires": "2026-07-13T10:00:30Z" }
+
+      The actor is derived from the token; a client-supplied actor
+      would be ignored.
+
+   C.3.  Follow the deltas.
+
+      GET /v1/awareness?follow=true
+      < {"type":"join","entry":{"actor":"pod-a", ...}}   ; synthetic
+      < {"type":"join","entry":{"actor":"pod-b", ...}}   ; synthetic
+      < {"type":"update","entry":{"actor":"pod-b",
+          "state":{"cursor":{"node":"n9"}}, ...}}
+      < {"type":"leave","entry":{"actor":"pod-a"}}       ; TTL expired
+
+      The two synthetic joins prime the follower; no separate snapshot
+      request is needed.
+
+   C.4.  Explicit leave on shutdown.
+
+      POST /v1/awareness
+      { "state": null }
+      < 200 OK
+      Peers receive {"type":"leave","entry":{"actor":"pod-b"}}
+      immediately instead of waiting out the TTL.
+
+   C.5.  Daemon restart (nothing to recover).
+
+      The daemon restarts; the awareness map is empty; the durable log
+      is untouched.  Each client's next heartbeat re-creates its entry
+      ("join" deltas fire) and the board's cursors reappear within one
+      heartbeat interval.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .

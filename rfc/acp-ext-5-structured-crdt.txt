@@ -1,0 +1,920 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-5                                      ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+        ACP Extension Proposal 5: Structured (JSON-Graph) CRDT
+                               Document
+
+
+   [ Editor's note: the extension NUMBER "5" in "ACP/EXT-5" is
+     PROVISIONAL.  The protocol owner assigns the final ACP/EXT number
+     on acceptance; until then treat the number as a placeholder. ]
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: a STRUCTURED CRDT DOCUMENT -- a
+   conflict-free replicated data type whose value is a JSON structure
+   (a node-graph of objects, arrays, and scalars), rather than a flat
+   sequence of characters.
+
+   ACP/1 Section 12 already defines a collaborative document type, but
+   it is a SEQUENCE (text) CRDT: its value is an ordered run of
+   characters.  Consumers building live STRUCTURED shared state -- a
+   JSON node-graph, a dashboard or board model, a form model, a
+   liquid-UI document -- have two poor choices today: marshal their
+   JSON into the text CRDT and diff/merge it as a string (structurally
+   lossy: two agents editing disjoint fields collide as overlapping
+   character runs), or roll their own CRDT entirely outside ACP,
+   forfeiting the authority's ordering, durability, and determinism.
+
+   This extension adds a CRDT over a JSON structure, built from three
+   well-understood pieces:
+
+     (1) an OR-MAP (observed-remove map) for JSON objects,
+     (2) an LWW-REGISTER (last-writer-wins, leader-stamped timestamps)
+         for scalar leaf values, and
+     (3) a LIST/SEQUENCE CRDT for JSON arrays, reusing the element-id
+         integration rule of ACP/1 Section 12.
+
+   Mutations are four commuting operations -- {set, del, list-ins,
+   list-del} -- addressed by JSON path or by stable node id.  Two new
+   endpoints, POST /v1/crdt/json/ops and GET /v1/crdt/json/doc, push
+   operations and materialize the JSON.  The epoch/compaction model of
+   Section 12 is reused unchanged.  The feature is negotiated by a new
+   capability string, "crdtjson".
+
+   None of this changes the wire version "acp/1": the endpoints are
+   NEW and every field is OPTIONAL, so a daemon that does not implement
+   the extension returns 404 and a client detects this via the
+   capability list and falls back.  The structured CRDT COEXISTS with
+   the text CRDT of Section 12; it does not replace it.
+
+Status of This Memo
+
+   ACCEPTED by the protocol owner and IMPLEMENTED in the reference
+   implementation on 2026-07-13, as PROTOCOL (server-materialized, not a
+   consumer library), under the final extension number EXT-5 and the
+   capability string "crdtjson".  The type coexists with the text CRDT
+   of ACP/1 Section 12 (choose text for prose/code, JSON for structured
+   state -- dashboards, forms, config, the liquid-UI document model).
+   Owner refinements adopted (GOVERNING over the body where they differ):
+
+     1. LWW ordering.  A register's winner is the op with the greatest
+        (leader-stamped Now, then actor id, then op id) -- "last arrival
+        at the LEADER", not a client wall clock (which is untrusted and
+        would break FSM determinism).  This replaces the memo's {l,w}
+        timestamp; the leader stamps all three fields before Raft propose.
+
+     2. Deterministic materialization is a MUST: GET /v1/crdt/json/doc
+        marshals objects with SORTED keys, arrays in list order,
+        tombstones hidden -- so every replica returns byte-identical
+        bytes (verified across daemons and across a leader failover).
+
+     3. v1 sync is FULL REPLAY (GET .../ops?from=N, cursored, like the
+        text CRDT); state-vector delta sync is a later optimization.
+
+     4. root_kind is NOT implemented: a document's root is always a MAP
+        (the common case).  Array/scalar roots are deferred; a daemon
+        advertises "crdtjson" for the map-rooted type.
+
+     5. An unknown document reads as {} with 200 (matching the text
+        CRDT's empty-doc precedent), not 404.
+
+     6. Convergence was made the acceptance gate and fuzzed: the fuzzer
+        found and fixed a real order-sensitivity in cross-key
+        observed-remove before release (regression-pinned).  Determinism
+        and convergence hold across shuffled/duplicated delivery, epoch
+        compaction, and a live 3-node leader failover.
+
+   The base protocol version string remains "acp/1".  Distribution is
+   unlimited.
+
+   This proposal carries a load-bearing OPEN QUESTION (Section 11): it
+   is not yet settled whether a structured CRDT belongs in ACP CORE at
+   all, or whether it should live in a CONSUMER LIBRARY layered on the
+   existing op-log.  Section 11 presents both honestly and recommends a
+   criterion for the owner to decide; the rest of this document
+   specifies the CORE variant so that the choice is concrete.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  The Structured CRDT Model
+   5.  Operations
+   6.  Capability Negotiation and Backward Compatibility
+   7.  Wire API Additions
+   8.  Determinism and High Availability
+   9.  Security Considerations
+   10. Rollout Plan
+   11. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/1 gives collaborating agents a shared filesystem (Section 11),
+   a directed mailbox (Section 9), a totally-ordered event log
+   (Section 8), and ONE kind of live collaborative object: the text
+   CRDT of Section 12, whose value is a sequence of characters that
+   converges when many agents type into the same document.
+
+   That is the right primitive for prose.  It is the WRONG primitive
+   for structured state -- a JSON object graph that several agents (or
+   several pods, or an agent and a human UI) mutate field-by-field.
+   Three concrete problems motivate this extension:
+
+   1.1.  Structured state has no lossless CRDT.
+
+      An agent that wants shared structured state today must serialize
+      it to JSON text and drive it through the Section 12 sequence
+      CRDT.  The sequence CRDT knows only characters: two agents that
+      edit DISJOINT fields (agent A sets {"status":"green"}, agent B
+      appends {"owner":"claudeB"}) produce overlapping, reordered
+      character runs whose merged text is frequently not valid JSON,
+      and whose "conflict" is an artifact of serialization, not a real
+      semantic conflict.  The Section 12 convergence guarantee holds at
+      the character level but says nothing useful at the JSON level.
+
+   1.2.  The alternative is a bespoke CRDT outside ACP.
+
+      To avoid 1.1, a consumer rolls its own JSON CRDT in the client
+      and uses ACP only as a dumb pipe.  This forfeits exactly what
+      ACP/1 provides: the authority's total order (Section 8), durable
+      persistence, the leader-stamped determinism required of a Raft
+      cluster (Section 17), and server-side compaction (Section 12.5).
+      Every consumer then re-implements merge code, and any divergence
+      between implementations silently corrupts shared state.
+
+   1.3.  Live structured surfaces have no server-materialized read.
+
+      A dashboard, a board, or a liquid-UI renderer wants to GET the
+      CURRENT JSON without shipping merge code -- especially an
+      untrusted or thin reader (a browser, a spectator view; the same
+      driver as ACP/EXT-3 blob capability URLs).  A raw op-log stream
+      cannot be rendered without a full CRDT client.  The text CRDT
+      already exposes a materialized read (GET /v1/crdt/doc, Section
+      12.4); structured state has no equivalent.
+
+   Together these gaps mean ACP can converge PROSE but not STRUCTURE.
+   This extension closes the gap with the smallest additive surface
+   that preserves ACP/1's invariants: one space, one total order
+   (Section 8), leader-stamped determinism (Section 17), and the
+   epoch-barrier compaction model (Section 12.5) -- while coexisting
+   with, and never replacing, the text CRDT.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, space, event, CRDT, determinism, and versioning definitions
+   of ACP/1 without restating them; section references of the form
+   "ACP/1 Section N" point into rfc/acp-1.txt.
+
+   STRUCTURED DOCUMENT (JSON DOC):  A named CRDT whose materialized
+      value is a JSON value.  Distinct from a TEXT DOCUMENT (ACP/1
+      Section 12), whose value is a string.
+
+   NODE:  One vertex of the structured document's internal graph.  Each
+      node is a MAP, a LIST, or a REGISTER (Section 4).
+
+   NID (node id):  A globally unique, leader-fixed identifier for a
+      node, of the same shape as a Section 12 element id:
+      (clock, replica).  The root node has the reserved nid
+      {"c":0,"r":"_"}.
+
+   OR-MAP:  An observed-remove map (JSON object): keys bind to child
+      nids; concurrent add-wins over remove of an unobserved binding.
+
+   LWW-REGISTER:  A last-writer-wins register (JSON scalar leaf):
+      concurrent writes are resolved by a leader-stamped timestamp,
+      ties broken by replica id.
+
+   LIST CRDT:  A sequence CRDT for JSON arrays whose elements are child
+      nids, using the origin-based integration rule of ACP/1 Section
+      12.1 (RGA/YATA-class).
+
+   PATH:  A client-side convenience address (an ordered list of object
+      keys and array positions) that the AUTHORITY resolves to a
+      canonical nid at submit time (Section 5.4).
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Coexist with the text CRDT; do not replace it.
+
+      The structured CRDT (this document) and the text CRDT (ACP/1
+      Section 12) are COMPLEMENTARY, not competing.  A REGISTER is
+      last-writer-wins for its WHOLE scalar value: correct for a
+      number, an enum, a short label, a status field; WRONG for prose
+      two agents type into concurrently, where LWW would silently drop
+      one writer's paragraph.  For a concurrently-edited prose field, a
+      consumer SHOULD keep a Section 12 text document and reference it
+      by name from a REGISTER value (e.g. {"body":"crdt:doc:notes"}).
+      The two primitives share the epoch model but are otherwise
+      independent stores; neither wraps the other.
+
+   3.2.  One space, one total order (preserved).
+
+      Structured-CRDT operations are appended to the authority's
+      per-space, totally-ordered op stream exactly as text-CRDT ops are
+      (ACP/1 Section 8, Section 12.3).  Because operations COMMUTE
+      (Section 4), the pull cursor "from" is the only synchronization
+      state a client needs, identical to Section 12.4.
+
+   3.3.  Additive and negotiated, never breaking.
+
+      Every change is a NEW endpoint or an OPTIONAL field.  An ACP/1
+      client that ignores this extension behaves exactly as today; a
+      daemon without the extension returns 404 for the new endpoints
+      and silently ignores unknown OPTIONAL fields, and clients detect
+      this via the capability list (Section 6).  The protocol version
+      string stays "acp/1".
+
+   3.4.  Determinism by leader stamping.
+
+      All values that must agree across replicas -- node ids, LWW
+      timestamps, OR-Map add tags, and the nids a path resolves to --
+      are FIXED BY THE LEADER and carried in the replicated op, per
+      ACP/1 Section 17.  Replicas apply identical ops and converge to
+      byte-identical JSON.  Clients MUST NOT supply final ids/tags/
+      timestamps; the authority overwrites any it receives.
+
+   3.5.  Reuse the existing durability and compaction shapes.
+
+      Structured documents reuse the Section 12.5 epoch barrier: a push
+      whose epoch is behind is rejected with 409, the client resyncs
+      from the snapshot, and tombstone/tag garbage collection is
+      therefore safe.  This keeps structured docs in the same durable
+      shape as text docs.
+
+   3.6.  Non-goals.
+
+      This extension does NOT add: (a) a replacement for the text CRDT
+      (Section 3.1); (b) SCHEMA VALIDATION of the JSON -- the authority
+      does not know or enforce any shape, types, or required fields
+      (Section 9.1); (c) queries, indexes, or partial reads by
+      selector; (d) subtree MOVE as a first-class operation (Section
+      11); (e) numeric COUNTER CRDTs (a REGISTER is LWW, not additive;
+      Section 11); (f) per-node access control -- the space remains the
+      only isolation boundary (ACP/1 Section 7).  These MAY be future
+      extensions.
+
+
+4.  The Structured CRDT Model
+
+   A structured document is a rooted graph of NODES.  There are exactly
+   three node kinds, one per JSON container/leaf class:
+
+   4.1.  MAP (JSON object).
+
+      A MAP is an OR-Map from string keys to child nids.  Each binding
+      (key -> child) carries a unique, leader-minted TAG.  Semantics
+      are ADD-WINS: a "del" of a key removes only the bindings whose
+      tags the deleting op OBSERVED; a concurrent "set" that introduces
+      a NEW binding (new tag) for the same key survives the delete.  If,
+      after applying all ops, a key has more than one live binding
+      (concurrent sets to the same key), the winner is chosen
+      deterministically by the LWW rule of Section 4.3 applied to the
+      bindings' stamped timestamps -- so a MAP key materializes to at
+      most one child.
+
+   4.2.  LIST (JSON array).
+
+      A LIST is a sequence CRDT whose ELEMENTS are child nids, using
+      the origin-based integration rule of ACP/1 Section 12.1: an
+      insert records the element id it follows ("origin_left"; the list
+      head is the zero id), a delete tombstones an element by id, and
+      integration compares origin positions first, then element id.
+      This is the SAME convergent rule as the text CRDT, lifted from
+      characters to nodes.  Element ids are leader-fixed.
+
+   4.3.  REGISTER (JSON scalar leaf).
+
+      A REGISTER holds one JSON scalar: string, number, boolean, or
+      null.  It is a last-writer-wins register.  Each write carries a
+      leader-stamped timestamp ts = (lamport, wall) and the writing
+      replica id.  Concurrent writes are ordered by ts, with ties
+      broken by lexicographic replica id; the greatest wins.  Because
+      ts is leader-assigned and monotonic within the op stream, every
+      replica selects the same winner.
+
+   4.4.  Nodes, ids, and the root.
+
+      Every node has a stable nid = (clock, replica) of the same shape
+      as a Section 12 element id, fixed by the leader when the node is
+      created.  A node's identity is independent of its position: a node
+      keeps its nid when re-keyed or reordered, which is what makes
+      subtree-stable references possible.  The ROOT node has the
+      reserved nid {"c":0,"r":"_"} and is a MAP by default; a document
+      MAY be created with a LIST root (Section 5.5).
+
+   4.5.  Materialization.
+
+      The materialized JSON is produced by walking from the root:
+      a MAP becomes a JSON object of its live keys (LWW winner per
+      key), a LIST becomes a JSON array of its live elements in list
+      order, and a REGISTER becomes its current scalar.  A node
+      reachable by no live binding is not materialized (but its ops are
+      retained until compaction).  Materialization is a pure function
+      of the applied op set and is therefore identical on every
+      replica.
+
+   4.6.  Commutativity and idempotency.
+
+      As in ACP/1 Section 12.1, all operations MUST be COMMUTATIVE and
+      IDEMPOTENT: applying the same set of operations in any order, any
+      number of times, yields the same document.  OR-Map add/remove
+      commute via observed tags; LWW writes commute via total order on
+      (ts, replica); list ins/del commute via the origin rule.  This is
+      what lets the pull cursor "from" be the only sync state.
+
+
+5.  Operations
+
+   5.1.  The four operations.
+
+      A structured-CRDT op has a type "t" in {set, del, lins, ldel}:
+
+         set   Create or overwrite a value at a location.  Writes a
+               scalar (creating/updating a REGISTER) or attaches a
+               container subtree (a MAP or LIST literal, expanded by
+               the authority into nodes; Section 5.3).
+
+         del   Remove a MAP key (OR-Map remove by observed tags,
+               Section 4.1).  Removing an array element uses ldel.
+
+         lins  Insert one new element node into a LIST after a given
+               element id (origin_left), per Section 4.2.  The inserted
+               value MAY itself be a scalar or a container subtree.
+
+         ldel  Tombstone a LIST element by its element id.
+
+   5.2.  Addressing: path or node id.
+
+      An op addresses its target in one of two forms:
+
+         o  PATH form: "path": an ordered array of segments (object
+            keys as strings, array positions as integers) rooted at the
+            document root.  Convenient for clients; resolved by the
+            authority (Section 5.4).
+
+         o  NID form (canonical): "target" (the parent node's nid) plus
+            "key" (for MAP set/del) or "index_origin"/"elem" (for
+            lins/ldel).  This is the form actually stored and
+            replicated.
+
+      A client MAY submit either; the wire-stored op is always NID
+      form.
+
+   5.3.  Container literals.
+
+      A "set" or "lins" whose "value" is a JSON object or array is a
+      CONTAINER LITERAL: the authority creates a MAP or LIST node,
+      mints an nid for it and for every descendant node, and emits the
+      corresponding child ops, all with leader-fixed ids/tags/ts.  This
+      lets a client attach a whole subtree in one request.  A daemon
+      MUST bound literal depth and node count (Section 9.2).
+
+   5.4.  Path resolution and determinism.
+
+      PATH form is a CLIENT CONVENIENCE only.  A path is inherently
+      ambiguous under concurrency (an intermediate key may have been
+      re-bound to a different node on another replica).  Therefore the
+      LEADER resolves each path to canonical nids AT SUBMIT TIME
+      against ALREADY-COMMITTED state, stamps the resolved nids (and
+      any newly minted nids/tags/ts) into the op, and only then
+      replicates the NID-form op.  Followers apply the NID form and
+      never re-resolve a path.  This is exactly ACP/1 Section 17's
+      "inputs fixed by the leader, carried in the command" rule.  A
+      path that cannot be resolved (a missing intermediate) is handled
+      per Section 5.6.
+
+   5.5.  Push.
+
+      POST /v1/crdt/json/ops {doc, ops, epoch?, root_kind?} appends the
+      operations durably and returns {doc, total, epoch}, where total
+      is the document's operation count.  root_kind ("map"|"list") is
+      honored only when the document is first created.  If "epoch" is
+      present and does not match the document's current epoch, the
+      authority MUST respond 409 (the document was compacted; the
+      client MUST resync, Section 5.8), identical to ACP/1 Section 12.3.
+      The authority SHOULD also append a "crdt.op" event (context
+      noting doc and kind="json") so watchers notice activity.  The
+      stored ops are in canonical NID form (Section 5.4).
+
+   5.6.  Resolution failures.
+
+      If a submitted PATH cannot be resolved against committed state
+      (an intermediate key or index is absent or tombstoned), the
+      authority MUST either (a) auto-create missing intermediate MAP
+      nodes when "create_intermediate": true is set on the request, or
+      (b) otherwise reject the op with 409 and the current materialized
+      value in "current", so the client can rebase.  NID-form ops that
+      reference an unknown "target" nid MUST be rejected with 400.
+
+   5.7.  Pull and materialization.
+
+      GET /v1/crdt/json/ops?doc=<name>&from=<index> returns
+      {doc, ops, total, epoch}: operations with index >= from, in
+      canonical NID form.  Because operations commute, "from" is the
+      only synchronization state a client needs (ACP/1 Section 12.4).
+      GET /v1/crdt/json/doc?doc=<name> returns the
+      authority-materialized value {doc, json, total, epoch} (Section
+      4.5).  GET /v1/crdt/json/list returns [{name, ops, size}].
+
+   5.8.  Compaction and the epoch barrier.
+
+      The authority MAY compact a structured document's op log by
+      replacing it with a minimal set of ops that reproduces the
+      current materialized JSON (tombstones and superseded LWW writes
+      and unobserved OR-Map tags garbage-collected, live nodes
+      re-anchored), PRESERVING live node ids.  Compaction MUST
+      increment the document's epoch and MUST reject a push whose epoch
+      is behind (Section 5.5), exactly as ACP/1 Section 12.5.  The
+      client then resyncs from the snapshot before pushing again, so it
+      can never reference a collected node.
+
+
+6.  Capability Negotiation and Backward Compatibility
+
+   Because all additions are new endpoints and OPTIONAL fields, clients
+   need a way to discover whether a given daemon supports the
+   structured CRDT.  This extension adds a capability string to the
+   existing introspection endpoints:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain:
+
+         "protocol": "acp/1",
+         "capabilities": [ ..., "crdtjson", ... ]
+
+   A client MUST treat the ABSENCE of "crdtjson" as "not supported":
+   the /v1/crdt/json/* endpoints return 404, and the client MUST fall
+   back (e.g., to a text-CRDT-serialized representation per ACP/1
+   Section 12, or to a consumer-library approach per Section 11).  A
+   daemon MUST advertise "crdtjson" only when it fully implements
+   Sections 4, 5, and 8 of this document.  This capability array is the
+   same one introduced by ACP/EXT-1 Section 7; capability strings from
+   different extensions coexist in one list.
+
+
+7.  Wire API Additions
+
+   Summary (full detail in Sections 4-5; types in Appendix A):
+
+      Modified:
+         GET  /v1/healthz, /v1/stats + "capabilities" includes
+                                       "crdtjson"
+
+      New:
+         POST /v1/crdt/json/ops     push ops -> {doc,total,epoch} | 409
+         GET  /v1/crdt/json/ops?doc=&from= -> {doc,ops,total,epoch}
+         GET  /v1/crdt/json/doc?doc= -> {doc,json,total,epoch}
+         GET  /v1/crdt/json/list    -> [{name,ops,size}]
+
+   All new endpoints follow ACP/1 Section 6 conventions: JSON bodies,
+   the standard headers (X-ACP-Agent, X-ACP-Protocol, X-ACP-Space),
+   bearer auth (Section 5), and the standard error model (Appendix B of
+   ACP/1 plus Appendix B here).  They live in the existing /v1/crdt
+   namespace, parallel to the text-CRDT endpoints, so tooling and
+   routing that already handle /v1/crdt need only add the /json
+   sub-tree.  Read endpoints require the "reader" role or higher; push
+   requires "writer" or higher (ACP/1 Section 5.3), matching the text
+   CRDT.
+
+
+8.  Determinism and High Availability
+
+   ACP/1 Section 17 requires the replicated state machine to be
+   deterministic: applying the same ordered command stream MUST yield
+   byte-identical state on every node.  This extension preserves that:
+
+      o  Structured-CRDT pushes are replicated as LOGICAL ops in the
+         Raft log.  Every replica applies the SAME op sequence to reach
+         identical document state.
+
+      o  Every non-deterministic input is fixed by the leader and
+         carried in the op (Section 3.4): node ids (nid), LWW
+         timestamps (ts = lamport+wall), OR-Map add tags, and the nids
+         that a PATH resolves to (Section 5.4).  The leader resolves
+         paths against ALREADY-COMMITTED state before replication;
+         followers apply only NID-form ops and never re-resolve, so no
+         follower reads wall-clock or re-walks uncommitted state while
+         APPLYING a command.
+
+      o  Container-literal expansion (Section 5.3) is performed by the
+         leader, which mints all descendant ids/tags/ts and replicates
+         the fully-expanded op set; followers do not re-expand.
+
+      o  Compaction (Section 5.8) flows through the replicated log,
+         driven by the leader, exactly as text-CRDT compaction does
+         (ACP/1 Sections 12.5, 17).
+
+   Reads (GET .../ops, .../doc, .../list) are served from committed
+   state and require no special handling beyond ACP/1's leader/follower
+   read rules (Section 14.2): a follower read MAY be slightly stale;
+   clients needing linearizable reads target the leader.  Because
+   materialization (Section 4.5) is a pure function of the applied op
+   set, any node that has applied the same ops materializes the same
+   JSON.  Conformance SHOULD be verified by the Section 17 method:
+   apply an identical op stream to independent state machines and
+   compare the materialized JSON byte-for-byte.
+
+
+9.  Security Considerations
+
+   9.1.  No schema validation -- treat materialized JSON as untrusted.
+
+      The authority does not validate the SHAPE of the JSON (Section
+      3.6): any writer in a space can set any key to any value.
+      Consumers MUST treat the materialized JSON as untrusted data --
+      validate it against their own schema, and never interpolate
+      string values into markup, shells, or queries without escaping.
+      A structured document is a shared mutable surface, not a
+      trust boundary.
+
+   9.2.  Structural amplification.
+
+      A single request can create many durable nodes: a deep container
+      literal (Section 5.3), a long run of list-ins, or a deeply nested
+      path.  To prevent storage-exhaustion abuse (cf. the fan-out cap
+      in ACP/EXT-1 Section 10.2), a daemon:
+
+         o  MUST bound container-literal DEPTH and total NODE COUNT per
+            request, returning 400 when exceeded.
+         o  SHOULD bound per-document node count and op-log length, and
+            SHOULD count the EXPANDED node count against the writer's
+            rate limit (ACP/1 Section 5.4), not count the request as
+            one.
+         o  SHOULD bound PATH depth to cap resolution cost (Section
+            5.4).
+
+   9.3.  Materialization cost.
+
+      GET /v1/crdt/json/doc walks the whole tree.  For large documents
+      this is O(nodes) per read; a daemon SHOULD bound document size
+      and MAY rate-limit materialized reads.  Op-log reads
+      (GET .../ops?from=) are the cheap, incremental path and SHOULD be
+      preferred by live subscribers.
+
+   9.4.  Determinism and spoofing.
+
+      As in ACP/1 Section 5.2, the authority MUST set actor/originator
+      fields from the authenticated identity and MUST NOT trust
+      client-supplied final ids, tags, or timestamps: the leader
+      overwrites nid/tag/ts on every op (Section 3.4).  A client that
+      supplies these values cannot thereby force divergence or
+      impersonate another replica.
+
+   9.5.  Epoch barrier safety.
+
+      The epoch barrier (Section 5.8) prevents a client from
+      referencing a garbage-collected node after compaction: a stale
+      push is rejected with 409 and the client resyncs, exactly as the
+      text-CRDT barrier (ACP/1 Section 12.5).
+
+   9.6.  Isolation.
+
+      Confidentiality is the space boundary only (ACP/1 Section 7).
+      There is no per-node ACL (Section 3.6): any reader of a space
+      reads every structured document in it.  Confidential separation
+      requires a separate space.
+
+
+10. Rollout Plan
+
+   The feature is a single negotiated capability, "crdtjson", and
+   SHOULD ship in two additive phases so the CORE-vs-library decision
+   (Section 11) can be deferred without wasted work:
+
+      Phase 1 -- WIRE FORMAT + CONSUMER LIBRARY.  Freeze the op wire
+         format (Appendix A) and ship a reference CLIENT-SIDE library
+         that implements the OR-Map / LWW / list merge and drives ops
+         through the EXISTING transport (the Section 12 op endpoints or
+         plain events).  No protocol change, no new capability yet.
+         This delivers structured convergence immediately and validates
+         the model against real consumers (boards, forms, liquid-UI).
+
+      Phase 2 -- CORE (only if the Section 11 criterion is met).  Add
+         the native /v1/crdt/json/* endpoints, server-side
+         materialization, leader-stamped determinism, and
+         epoch-compaction, and advertise "crdtjson".  Because the wire
+         ops are byte-compatible with Phase 1, a Phase-1 consumer
+         upgrades by pointing at the new endpoints; nothing else
+         changes.
+
+   Each phase is additive and reversible: a daemon can drop the
+   "crdtjson" capability without breaking ACP/1 or text-CRDT peers, and
+   Phase-1 consumers keep working with no core support at all.
+
+
+11. Open Questions
+
+   11.1.  CRITICAL: does this belong in ACP CORE or in a CONSUMER
+          LIBRARY layered on the existing op-log?
+
+      This is the load-bearing decision and is NOT settled.  Both
+      options are viable; each is presented honestly below, followed by
+      a recommended CRITERION for the owner.
+
+      OPTION A -- CORE (specified in this document).  The authority
+      implements the JSON CRDT natively: new endpoints, a new store,
+      server-side materialization, leader-stamped ids/tags/ts, and
+      server-side compaction.
+         + Thin/untrusted readers (browsers, dashboards, spectator
+           views, liquid-UI) GET the materialized JSON with NO merge
+           code -- the same driver as ACP/EXT-3 (blob capability URLs).
+         + Determinism is clean: the leader stamps ts/nids/tags per
+           ACP/1 Section 17; there is one authoritative convergence.
+         + The server can COMPACT and enforce quotas on structured
+           docs (Section 5.8, Section 9.2).
+         + Multiple independent harness implementations interoperate
+           without sharing one SDK version.
+         - A real new subsystem: store, endpoints, tests, and a larger
+           server attack/maintenance surface.
+         - The authority now understands a richer data model than "an
+           opaque totally-ordered op stream", which is a philosophical
+           step away from ACP/1's minimalism.
+
+      OPTION B -- CONSUMER LIBRARY on the existing op-log.  The
+      authority stays dumb: it only totally-orders opaque ops (via the
+      Section 8 event log or the Section 12 op transport).  All JSON
+      CRDT semantics live in a client SDK.
+         + ZERO protocol change; ships today; strictly additive.
+         + Keeps the authority minimal.
+         - No server-side materialized read (Section 1.3): every
+           consumer, including a browser, must run the full merge code.
+         - Every consumer must ship IDENTICAL merge logic; a version
+           skew between two implementations silently corrupts shared
+           state (exactly problem 1.2).
+         - No leader-stamped ts: clients need a deterministic tiebreak
+           not tied to a leader clock (feasible with Lamport+replica,
+           but it forfeits the "authority is the single truth"
+           convenience of ACP/1).
+         - No server-side compaction of the JSON structure: the op-log
+           grows unbounded per document unless consumers coordinate
+           compaction, which the server cannot validate or enforce.
+
+      RECOMMENDED CRITERION (for the owner to decide).  Adopt CORE
+      (Option A) if ANY of the following holds:
+         (a) untrusted or thin consumers must READ the materialized
+             JSON without running merge code (the dashboard / board /
+             browser / liquid-UI case); OR
+         (b) server-side compaction or quotas on structured documents
+             are required to bound storage; OR
+         (c) multiple independent harness implementations must
+             interoperate and cannot be pinned to one SDK version.
+      Otherwise PREFER the consumer library (Option B): it is strictly
+      additive with no protocol change and can be PROMOTED to core
+      later without breaking peers, because Phase 1 (Section 10) freezes
+      a byte-compatible op format shared by both.  The hybrid rollout
+      in Section 10 is designed precisely to de-risk this choice: the
+      wire ops are defined once (Appendix A) so a library today and a
+      core tomorrow speak the same ops.
+
+   11.2.  Relationship to the text CRDT (coexist, do not replace).
+
+      Section 3.1 fixes the policy: structured and text CRDTs coexist.
+      An open refinement is whether the two should share ONE epoch/
+      compaction store and ONE /v1/crdt namespace (this document places
+      the JSON endpoints under /v1/crdt/json and reuses the epoch
+      model but keeps a DISTINCT store), and whether a REGISTER value
+      referencing a text doc (Section 3.1) should be a first-class
+      typed reference the authority understands, or -- as specified --
+      an opaque string convention the consumer resolves.  The
+      conservative choice (opaque convention, distinct store) is
+      specified; a typed cross-reference is deferred.
+
+   11.3.  Subtree MOVE.
+
+      Moving a subtree from one location to another is not a first-
+      class op (Section 3.6): a naive concurrent move can duplicate a
+      subtree or create a cycle.  Deferred pending a convergent move
+      design (e.g., a last-writer-wins parent register per node).
+
+   11.4.  Numeric COUNTERS.
+
+      A REGISTER is last-writer-wins, so two concurrent increments of a
+      "count" field lose one increment.  Fields that need additive
+      merge (a like count, a tally) want a COUNTER CRDT (PN-counter),
+      which is a separate node kind.  Deferred to a possible future
+      extension.
+
+   11.5.  Path race semantics.
+
+      Section 5.6 offers create-intermediate-or-409 for a path whose
+      intermediate is absent.  Whether the default SHOULD be to auto-
+      create or to reject is an open ergonomics question; this document
+      defaults to REJECT (safer) with an explicit opt-in flag.
+
+   11.6.  Tag/tombstone GC interplay with epoch compaction.
+
+      OR-Map add tags and list tombstones accumulate.  Compaction
+      (Section 5.8) collects them behind the epoch barrier, but the
+      exact retention policy (how long before a document with churn is
+      eligible) is left to the implementation and MAY warrant a tunable,
+      as with the text-CRDT compaction grace.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   Nid (node id -- same shape as an ACP/1 Section 12 element id):
+      { "c": <uint64>, "r": <string> }         ; (clock, replica)
+
+   Ts (LWW timestamp -- leader-stamped):
+      { "l": <uint64>, "w": <rfc3339> }         ; (lamport, wall hint)
+
+   JsonOp (new -- the four structured-CRDT operations):
+      { "t": "set"|"del"|"lins"|"ldel",
+
+        ; --- addressing: EITHER path (client convenience) OR nid form
+        "path": [ <string|int> ]?,   ; segments from root; leader
+                                     ;   resolves to nid form
+        "target": Nid?,              ; canonical parent node id
+        "key": <string>?,            ; MAP set/del: the object key
+        "index_origin": Nid?,        ; lins: element id to insert after
+                                     ;   (list head = {"c":0,"r":"_"})
+        "elem": Nid?,                ; ldel: element id to tombstone
+
+        ; --- payload
+        "value": <json>?,            ; set/lins: scalar OR container
+                                     ;   literal (expanded, Section 5.3)
+
+        ; --- leader-stamped (client MUST NOT set final values; the
+        ;     authority overwrites them, Section 3.4)
+        "nid": Nid?,                 ; id minted for a created node
+        "ts": Ts?,                   ; LWW stamp for a REGISTER write /
+                                     ;   MAP binding
+        "tag": <string>? }           ; OR-Map add tag for a MAP binding
+
+   JsonPushRequest (new -- body of POST /v1/crdt/json/ops):
+      { "doc": <string>,
+        "ops": [ JsonOp ],
+        "epoch": <uint64>?,          ; optimistic; 409 on mismatch
+        "root_kind": "map"|"list"?,  ; honored only on first create
+        "create_intermediate": <bool>? }  ; Section 5.6
+
+   JsonPushResult (new -- response):
+      { "doc": <string>, "total": <uint64>, "epoch": <uint64> }
+
+   JsonOpsResult (new -- response to GET .../json/ops):
+      { "doc": <string>, "ops": [ JsonOp ],   ; canonical NID form
+        "total": <uint64>, "epoch": <uint64> }
+
+   JsonDocResult (new -- response to GET .../json/doc):
+      { "doc": <string>, "json": <json>,      ; materialized value
+        "total": <uint64>, "epoch": <uint64> }
+
+   JsonDocInfo (new -- element of GET .../json/list):
+      { "name": <string>, "ops": <uint64>, "size": <int64> }
+
+   Health/Stats (changed -- capability advertised):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [ ..., "crdtjson", ... ] }
+
+   NOTE: JsonOp deliberately mirrors the ACP/1 Section 12 Op shape
+   (t / id / origin / value) so that a consumer library and a future
+   core implementation (Section 11.1) share byte-compatible ops.
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: NID-form op references an unknown "target" nid;
+        container literal exceeds the configured depth or node-count
+        bound; path exceeds the configured depth bound; malformed
+        JsonOp.
+   403  Forbidden: role insufficient (push requires "writer"+; read
+        requires "reader"+).
+   404  Not found: /v1/crdt/json/* endpoint on a daemon that does not
+        advertise "crdtjson"; unknown document on a read.
+   409  Conflict: epoch changed (document was compacted -- resync,
+        Section 5.8); OR an unresolvable PATH intermediate with
+        create_intermediate not set (Section 5.6).  The body's
+        "current" carries the current epoch or materialized value.
+   429  Too Many Requests: expanded node count exceeds the writer's
+        rate budget (Section 9.2); see Retry-After.
+
+   All other status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Two agents edit DISJOINT paths -> converge (the 1.1 case).
+
+      Start: document "board" materializes {} (empty MAP root).
+
+      Agent A sets a status field (path form):
+         > POST /v1/crdt/json/ops
+         > X-ACP-Agent: claudeA
+         > { "doc":"board",
+         >   "ops":[ {"t":"set","path":["status"],"value":"green"} ] }
+         < 200 { "doc":"board","total":1,"epoch":0 }
+         (leader resolves path -> target=root, key="status";
+          mints a REGISTER nid, tag, and ts, stores NID-form op.)
+
+      Concurrently agent B sets a different field:
+         > POST /v1/crdt/json/ops
+         > X-ACP-Agent: codexB
+         > { "doc":"board",
+         >   "ops":[ {"t":"set","path":["owner"],"value":"codexB"} ] }
+         < 200 { "doc":"board","total":2,"epoch":0 }
+
+      Either agent materializes the converged JSON:
+         > GET /v1/crdt/json/doc?doc=board
+         < 200 { "doc":"board",
+         <       "json":{"status":"green","owner":"codexB"},
+         <       "total":2,"epoch":0 }
+
+      Disjoint keys do NOT conflict -- unlike the text-CRDT
+      serialization, where the two writes would be overlapping
+      character runs (Section 1.1).
+
+   C.2.  Conflicting REGISTER write -> LWW (Section 4.3).
+
+      Both agents write the SAME key concurrently:
+         A: {"t":"set","path":["status"],"value":"green"}
+         B: {"t":"set","path":["status"],"value":"red"}
+
+      The leader stamps each write with a monotonic ts.  Say B's op is
+      ordered after A's (higher lamport), so B wins:
+         > GET /v1/crdt/json/doc?doc=board
+         < 200 { "doc":"board","json":{"status":"red",...},... }
+
+      EVERY replica selects "red" because ts is leader-assigned and
+      totally ordered, with replica id as the tiebreak (Section 8).
+      No data is silently interleaved; the loser is simply superseded.
+
+   C.3.  Append to an array (list CRDT).
+
+      > POST /v1/crdt/json/ops
+      > { "doc":"board",
+      >   "ops":[ {"t":"set","path":["tags"],"value":[]},
+      >           {"t":"lins","path":["tags"],
+      >            "index_origin":{"c":0,"r":"_"},"value":"urgent"} ] }
+      < 200 { "doc":"board","total":4,"epoch":0 }
+      -> json.tags == ["urgent"]
+      Two agents inserting after the same origin converge by the
+      element-id rule of ACP/1 Section 12.1, lifted to nodes.
+
+   C.4.  Attach a subtree in one op (container literal).
+
+      > POST /v1/crdt/json/ops
+      > { "doc":"board",
+      >   "ops":[ {"t":"set","path":["ci"],
+      >            "value":{"job":"lint","state":"failed",
+      >                     "runs":[4126,4127]}} ] }
+      < 200 { "doc":"board","total":... ,"epoch":0 }
+      The authority expands the literal into a MAP node, two REGISTERs,
+      a LIST, and two element REGISTERs, all with leader-minted ids
+      (Section 5.3), bounded by the depth/node-count caps (Section 9.2).
+
+   C.5.  Capability check before use.
+
+      > GET /v1/healthz
+      < 200 { "status":"ok","protocol":"acp/1",
+      <       "capabilities":["channels","crdtjson"] }
+      A client that does not see "crdtjson" falls back (Section 6): it
+      either uses a text-CRDT-serialized representation (ACP/1 Section
+      12) or the consumer-library path (Section 11.1).
+
+   C.6.  Resync across a compaction boundary (epoch barrier).
+
+      > POST /v1/crdt/json/ops {"doc":"board","ops":[...],"epoch":0}
+      < 409 {"error":"epoch changed - resync the doc","current":1}
+      (client re-pulls GET .../json/ops?doc=board&from=0 at epoch 1,
+       re-derives its intended ops against the snapshot, re-pushes) --
+      identical in spirit to the text-CRDT barrier (ACP/1 Section 12.5,
+      Appendix C.4).
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .

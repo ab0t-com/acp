@@ -1,0 +1,871 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-2                                      ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+; NOTE: the extension NUMBER "EXT-2" is PROVISIONAL.  The protocol owner
+; assigns the final number on acceptance; until then treat "ACP/EXT-2"
+; here as a placeholder identifier for this proposal.
+
+
+         ACP Extension Proposal 2: Task Board and Claim Protocol
+                    (Exactly-Once Work Handoff)
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: a durable TASK BOARD of WORK ITEMS,
+   each claimable by EXACTLY ONE agent at a time through a TTL-bounded,
+   fencing-token CLAIM built directly on the ACP/1 lease model
+   (Section 10 of ACP/1).  A work item moves through a small lifecycle
+   -- open, claimed, submitted, done -- with claim, renew, release,
+   automatic reclaim of an expired claim, and a holder-only submit.
+
+   This is the "message queues with consumer groups / exactly-once work
+   handoff" item that ACP Extension Proposal 1 (acp-ext-1, Section 3.5)
+   explicitly DEFERRED to a separate future extension, and that ticket
+   T19 records as an open N-agent primitive.  Where acp-ext-1 gave ACP
+   pub/sub ergonomics, this proposal gives ACP a work-distribution
+   primitive: N agents pulling from a shared backlog with no two agents
+   ever doing the same unit of work.
+
+   None of this changes the wire version "acp/1": every addition is a
+   NEW endpoint or an OPTIONAL field, negotiated by a capability probe.
+   A daemon or client that does not implement this extension
+   interoperates unchanged with one that does.
+
+Status of This Memo
+
+   This is a PROPOSAL, not yet part of the normative ACP/1 specification
+   (rfc/acp-1.txt).  It is published for review by implementers and for
+   the protocol owner's approval.  If accepted, its endpoints and types
+   fold into a future "acp/1.1" capability set; the base protocol version
+   string remains "acp/1" and the feature is advertised via Section 7.
+   Distribution is unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  The Task Board and Work Items
+   5.  The Claim Lifecycle (Exactly-Once Handoff)
+   6.  Idempotency, Fencing, and Reclaim
+   7.  Capability Negotiation and Backward Compatibility
+   8.  Wire API Additions
+   9.  Determinism and High Availability
+   10. Security Considerations
+   11. Rollout Plan
+   12. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/1 gives agents a shared filesystem, a totally-ordered event log
+   (Section 8 of ACP/1), a directed mailbox (Section 9), and
+   fencing-token leases for mutual exclusion (Section 10).  acp-ext-1
+   added channels, groups, and one-to-many mail, making N-agent
+   COMMUNICATION ergonomic.
+
+   None of these, alone, answer the question at the heart of multi-agent
+   WORK: "here is a backlog of independent units of work; let N agents
+   drain it, and guarantee that no unit is done twice and no unit is lost
+   if the agent doing it crashes."  Today an operator can approximate
+   this by hand -- post work as events or mail, and take a lease named
+   after each unit before starting it -- but the pieces are unbundled and
+   each integrator re-invents the glue.  acp-ext-1 Section 3.5 named this
+   gap precisely and pushed it to "the separate 'task board / claim
+   protocol' item in T19".  This document is that item.
+
+   Four concrete problems motivate this extension:
+
+   1.1.  No durable unit of work.
+
+      The event log records that something HAPPENED; the mailbox
+      records that something was SAID to someone.  Neither is a durable,
+      queryable, mutable-status OBJECT that means "this work needs
+      doing, and here is its current state".  An agent looking for work
+      must reconstruct a backlog from log/mail traffic and hope its view
+      is current.  There is no "GET me the claimable work".
+
+   1.2.  No exactly-once handoff.
+
+      Leases (ACP/1 Section 10) give mutual exclusion on a named
+      resource, but a lease is not tied to a unit of work with a
+      lifecycle: nothing records that the work was CLAIMED, that it was
+      SUBMITTED, or that it is DONE, and nothing stops a second agent
+      from starting the same conceptual task under a differently-named
+      lease.  N agents polling a shared backlog need a single primitive
+      whose CLAIM step is a compare-and-set that exactly one caller wins.
+
+   1.3.  No crash recovery for in-flight work.
+
+      If the agent holding a unit of work crashes, its lease eventually
+      expires (ACP/1 Section 10.4) -- but there is no work-item whose
+      status returns to "claimable" so another agent can take over.  The
+      unit is silently stranded.  A work-handoff primitive MUST return an
+      expired-claim item to the pool automatically.
+
+   1.4.  No spoof-proof holder enforcement.
+
+      "Only the agent that claimed this may submit it" and "no agent may
+      grant a claim to itself over a live holder" are authorization
+      rules that today live only in convention.  They need to be
+      enforced by the authority off the authenticated identity and a
+      fencing token, exactly as ACP/1 enforces lease ownership
+      (Section 10.1) and mailbox ack (Section 9.3).
+
+   This extension closes all four with the smallest additive surface
+   that REUSES the ACP/1 lease as its exclusion mechanism rather than
+   re-implementing one: a work item's claim IS an ACP/1-style
+   fencing-token lease over the work item's identity, plus a durable
+   lifecycle around it.  The design is generalized from a battle-tested
+   reference claim/lease implementation (Section 3.4) but is specified
+   here for ANY N-agent work handoff -- a build queue, a review queue, a
+   crawl frontier, a batch of migrations -- not for any one application.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, space, event, mailbox, and lease definitions of ACP/1 without
+   restating them; section references of the form "ACP/1 Section N" point
+   into rfc/acp-1.txt.  It also builds on acp-ext-1 (channels/groups/
+   pub/sub) where noted, but does not require it.
+
+   TASK BOARD:  The per-space collection of work items.  Like every
+      ACP subsystem it is scoped to a space (ACP/1 Section 7) and shares
+      nothing across spaces.
+
+   WORK ITEM (or TASK):  A durable, addressable unit of work with a
+      status, an optional payload, and at most one live claim.  It is the
+      unit of ownership and of exactly-once handoff.
+
+   CLAIM:  An exclusive, TTL-bounded hold on a work item by one agent,
+      carrying a fencing TOKEN (ACP/1 Section 10.1).  A claim is a lease
+      whose named resource is the work item's identity.
+
+   HOLDER:  The single agent whose live claim currently owns a work
+      item.  Only the holder may renew, release, or submit it.
+
+   CLAIMABLE:  The property of a work item that a claim would succeed on
+      now: it is "open", OR it is "claimed" but its claim has EXPIRED (a
+      crashed holder not yet reclaimed).  A live-claimed item is NOT
+      claimable.
+
+   RECLAIM:  The authority-driven return of an expired-claim item to the
+      claimable pool (status back to "open", claim cleared), so a crashed
+      holder's work is not stranded.
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Build on leases; do not re-implement them.
+
+      A claim is an ACP/1 fencing-token lease (Section 10) over the work
+      item's identity.  The authority mints a strictly increasing
+      fencing token on each fresh grant, preserves it on a holder's
+      renew, and rejects any operation presenting a token lower than the
+      item's current token.  This proposal adds the WORK-ITEM lifecycle
+      and the exactly-once handoff SEMANTICS ON TOP of the lease; it does
+      not define a new locking mechanism.  An implementation SHOULD lease
+      on a canonical key derived from the item id (e.g.,
+      "task:<space>:<id>") so the task-claim path and any direct lease on
+      the same key contend for the SAME lock and cannot diverge.
+
+   3.2.  Additive and negotiated, never breaking.
+
+      Every change is a NEW endpoint or an OPTIONAL field.  An ACP/1
+      client that ignores this extension behaves exactly as today; a
+      daemon without the extension returns 404 for the new endpoints and
+      silently ignores unknown OPTIONAL fields, and clients detect this
+      via the capability list (Section 7).  The protocol version string
+      stays "acp/1".
+
+   3.3.  Exactly-once CLAIM, at-least-once WORK.
+
+      The exactly-once guarantee this proposal makes is precise: at any
+      instant AT MOST ONE agent holds a live claim on a work item, and a
+      submit is accepted from AT MOST ONE holder per claim generation
+      (the fencing token).  It does NOT promise that the side effects of
+      the WORK happen exactly once in the world -- an agent may crash
+      after acting but before submitting, and the item is then reclaimed
+      and re-worked.  Work SHOULD therefore be idempotent or
+      transactionally tied to its submit.  This is the same honest
+      guarantee any lease-based queue makes; Section 6 states it
+      normatively.
+
+   3.4.  Reuse the existing durability shapes.
+
+      Work items and their claims are persisted with the same
+      append-only op-log + replay-on-startup model ACP/1 uses for the
+      mailbox (Section 9) and that acp-ext-1 uses for groups.  This keeps
+      the task board in the same durable, auditable shape as the rest of
+      ACP.  The lifecycle, claim fields, and holder-only enforcement are
+      generalized from a battle-tested reference implementation (a
+      claim/lease core: Claim{holder, token, claimed_at, expires_at}; a
+      claimable set; ClaimItem / RenewClaim / SubmitClaim-holder-only /
+      ReleaseClaim / ReclaimExpiredClaims; and a canonical idempotent
+      claim key).  Names and application specifics are dropped here: the
+      primitive is a generic task board.
+
+   3.5.  Non-goals.
+
+      This extension does NOT: re-implement leases (it builds on ACP/1
+      Section 10); add cross-space work handoff (a work item lives in
+      exactly one space, ACP/1 Section 7); add scheduling, priority
+      queues, dependencies between items, or fair-share dispatch beyond
+      the single OPTIONAL "priority" hint and claim-order note in
+      Section 4.4 (these MAY be future extensions); add per-item access
+      control lists beyond the ACP/1 role model (Section 5.4 here); or
+      guarantee exactly-once WORLD side effects (Section 3.3).  It also
+      does not define worker pools, heartbleed-style presence, or
+      automatic re-dispatch: reclaim returns an item to the pool, and a
+      worker pulls it again by the same claim path.
+
+
+4.  The Task Board and Work Items
+
+   4.1.  Work item object.
+
+      A WorkItem is space-scoped state (full JSON in Appendix A):
+
+         { "id": <string>, "status": <string>, "title": <string>?,
+           "payload": <object>?, "priority": <int>?,
+           "creator": <agent-id>, "claim": <Claim>?,
+           "result": <object>?, "created_at": <rfc3339>,
+           "updated_at": <rfc3339> }
+
+      "id" is authority-assigned on create and is unique within the
+      space; clients MUST NOT supply it (a supplied id is ignored).
+      "status" is one of the lifecycle values in Section 5.1.  "payload"
+      is opaque application data describing the work (an object; a daemon
+      MAY bound its size).  "claim" is present only while the item is
+      claimed (Section 5.2).  "result" is opaque data attached at submit.
+      "creator" is set by the authority from the authenticated identity
+      and MUST NOT be taken from the client.
+
+   4.2.  Creating work items.
+
+      POST /v1/tasks with { "title"?, "payload"?, "priority"? } creates
+      one work item in status "open" and returns it.  Requires the
+      "writer" role or higher (ACP/1 Section 5.3).  Idempotency-Key is
+      honored (ACP/1 Section 6.4): a retried create with the same key
+      MUST return the original item and MUST NOT create a duplicate.
+      Creation SHOULD append a "task.created" event (acp-ext-1 channel
+      "_tasks" RECOMMENDED where channels are supported) so watchers
+      learn of new work without polling.
+
+   4.3.  Listing and reading.
+
+      GET /v1/tasks returns work items in the space, newest first.  Two
+      OPTIONAL query parameters filter the list:
+
+         status=<value>    ; only items in this status
+         claimable=1       ; only items a claim would succeed on now
+                           ; (open OR expired-claim), see Section 5.3
+
+      GET /v1/tasks/{id} returns one work item (404 if unknown).  Reads
+      require the "reader" role or higher.  A worker's find-work loop is
+      "GET /v1/tasks?claimable=1" then "POST /v1/tasks/{id}/claim".
+
+   4.4.  Priority and ordering (informative, minimal).
+
+      "priority" is an OPTIONAL integer hint (higher = more urgent,
+      default 0).  A daemon MAY order the claimable list by (priority
+      desc, created_at asc) so a naive worker that claims the first
+      claimable item gets a sensible one; this is a convenience, not a
+      scheduling guarantee, and no fairness, starvation-freedom, or
+      strict-priority semantics are promised here (see Non-Goals, 3.5,
+      and Open Questions, Section 12).
+
+
+5.  The Claim Lifecycle (Exactly-Once Handoff)
+
+   5.1.  Status values.
+
+      A work item is always in exactly one status:
+
+         open       - claimable; no live claim.
+         claimed    - a live claim holds it; the holder is working.
+         submitted  - the holder handed back a result; awaits
+                      acceptance/close (an application or operator step).
+         done       - closed; terminal for normal completion.
+         cancelled  - withdrawn by an authorized caller; terminal.
+
+      Legal transitions (the authority MUST reject any other):
+
+         open       -> claimed     (claim succeeds)
+         claimed    -> claimed     (renew by holder; same generation)
+         claimed    -> open        (release by holder, OR reclaim of an
+                                    expired claim)
+         claimed    -> submitted   (holder submits a result)
+         submitted  -> done        (accepted/closed)
+         submitted  -> open        (rejected; returned to the pool)
+         open       -> cancelled   (withdrawn)
+         submitted  -> cancelled   (withdrawn)
+
+      "done" and "cancelled" are terminal.  A "submitted" item is NOT
+      reclaimed on claim expiry (Section 6.3): its work is already
+      delivered and it awaits an acceptance step regardless of the lease.
+
+   5.2.  Claim object.
+
+      A Claim mirrors the ACP/1 lease grant onto the work item so the
+      item's own bytes carry who owns it and until when (full JSON in
+      Appendix A):
+
+         { "holder": <agent-id>, "token": <uint64>,
+           "claimed_at": <rfc3339>, "expires_at": <rfc3339> }
+
+      "holder" is the owning agent (authenticated identity, never
+      client-supplied).  "token" is the ACP/1 fencing token
+      (Section 10.1) minted on the fresh grant.  A claim is LIVE while
+      now < expires_at; at or after expires_at it is EXPIRED and the item
+      is reclaimable (Section 6.3).  An absent claim means the item is
+      unclaimed.
+
+   5.3.  Claim.
+
+      POST /v1/tasks/{id}/claim with { "ttl_sec"? } attempts to take the
+      item.  ttl_sec defaults to 300 when not positive (matching ACP/1
+      Section 10.2).  The authority MUST:
+
+         1. Reject with 404 if the item is unknown.
+         2. If the item is "claimed" by a DIFFERENT agent with a LIVE
+            claim, reject with 409 and return the current claim in
+            "current" (ACP/1 Section 6.3), exactly as a lease conflict.
+         3. If the caller ALREADY holds a live claim on the item, treat
+            the request as idempotent: refresh the expiry window,
+            preserve the fencing token, and return 200 with the item.
+            (This mirrors ACP/1's "already holds a live lease, it is
+            renewed and the token preserved", Section 10.2.)
+         4. Otherwise the item is claimable -- "open", or "claimed" with
+            an EXPIRED claim.  The authority MUST first (logically)
+            return an expired-claim item to "open", then mint a NEW
+            fencing token via the lease layer, set status "claimed", set
+            "claim" to { holder = caller, token, claimed_at = now,
+            expires_at = now + ttl }, and return 200 with the item.
+
+      Exactly one concurrent caller can win step 4 for a given item,
+      because the underlying lease acquire is the single serialization
+      point (ACP/1 Section 10): the other callers observe a live claim
+      and get 409.  This is the exactly-once CLAIM guarantee.  Claiming
+      requires the "writer" role or higher.
+
+   5.4.  Renew.
+
+      POST /v1/tasks/{id}/renew with { "token", "ttl_sec"? } extends a
+      live claim the caller holds (the worker heartbeat).  It succeeds
+      ONLY for the current live holder presenting the MATCHING fencing
+      token; otherwise 409 (matching ACP/1 Section 10.3 renew).  On
+      success the authority sets expires_at = now + ttl, preserves the
+      token, and returns the item.  A renew of an already-expired or
+      reclaimed claim MUST fail with 409 so a slow holder learns it lost
+      the item rather than resurrecting a stale claim.
+
+   5.5.  Release.
+
+      POST /v1/tasks/{id}/release with { "token" } hands a claimed item
+      back to "open" before its TTL (an explicit early hand-back).  It is
+      holder-only and token-matched: a non-holder or a token mismatch
+      MUST yield 409.  On success the authority clears "claim" and sets
+      status "open" so another agent may claim it immediately.
+
+   5.6.  Submit.
+
+      POST /v1/tasks/{id}/submit with { "token", "result"? } records the
+      holder's completion of the work.  It is HOLDER-ONLY and
+      token-matched: the caller MUST be the current claim holder
+      presenting the matching fencing token, else 409 (a live claim held
+      by someone else) or 403 as detailed in Appendix B; a submit on an
+      item with no live claim by the caller MUST NOT succeed.  On success
+      the authority stores "result", sets status "submitted", and returns
+      the item.  A repeat submit by the same holder with the same token
+      is idempotent (returns the submitted item unchanged).  Submitting
+      does NOT by itself set "done": acceptance ("submitted" -> "done")
+      or rejection ("submitted" -> "open") is a separate authorized
+      step (Section 5.7), keeping "the work was handed back" distinct
+      from "the work was accepted" (external acceptance, never
+      self-assertion by the worker).
+
+   5.7.  Close (accept / reject / cancel).
+
+      POST /v1/tasks/{id}/close with { "outcome", "note"? } moves a
+      "submitted" item to "done" (outcome "accept") or back to "open"
+      (outcome "reject"), or withdraws an "open"/"submitted" item to
+      "cancelled" (outcome "cancel").  Close requires the item's creator
+      OR the "admin" role (Section 5.4-analog: creators close their own
+      work, admins may close any).  A worker (mere holder) MUST NOT
+      accept its own submission.  Close SHOULD append a "task.closed"
+      event.
+
+   5.8.  Events.
+
+      Lifecycle transitions SHOULD append events with actions
+      "task.created", "task.claimed", "task.renewed" (MAY be omitted to
+      reduce noise), "task.released", "task.reclaimed", "task.submitted",
+      and "task.closed" (channel "_tasks" RECOMMENDED where channels are
+      supported, acp-ext-1) so watchers and dashboards learn of board
+      activity without polling.  A "task.reclaimed" event lets peers
+      learn a crashed holder's item is claimable again, analogous to the
+      ACP/1 "lease.expired" event (Section 10.4).
+
+
+6.  Idempotency, Fencing, and Reclaim
+
+   6.1.  Idempotency keys on create.
+
+      POST /v1/tasks honors Idempotency-Key (ACP/1 Section 6.4): a
+      retried create returns the original item and never creates a
+      duplicate.  This lets a producer safely retry after a network
+      failure without flooding the board.  Claim/renew/release/submit
+      are made naturally idempotent by the fencing token and holder
+      identity (a repeated claim by the live holder refreshes; a repeated
+      submit by the same token is a no-op success), so an Idempotency-Key
+      on those is OPTIONAL.
+
+   6.2.  Fencing token: the exactly-once spine.
+
+      Every fresh claim mints a strictly increasing fencing token for
+      the item (ACP/1 Section 10.1).  Renew, release, and submit MUST
+      present a token, and the authority MUST reject any presented token
+      that is not equal to the item's current token (a lower token is a
+      stale ex-holder; a mismatched token is not the holder).  This
+      defeats the "expired claim, but the old holder is still running"
+      hazard: after reclaim and a new grant, the item's token has
+      advanced, so the crashed-and-revived old holder's submit carries a
+      lower token and is rejected -- it cannot clobber the new holder's
+      work.  The new holder always carries the highest token and wins.
+
+   6.3.  Reclaim of expired claims.
+
+      The authority MUST return a "claimed" item whose claim has EXPIRED
+      to "open" (clearing "claim"), so a crashed holder's work re-enters
+      the claimable pool with no manual cleanup.  Reclaim MAY be driven
+      lazily (evaluated at the next claim/list touching the item) and/or
+      by a periodic sweep; in a cluster the sweep MUST flow through the
+      replicated log driven by the leader (Section 9).  A "submitted",
+      "done", or "cancelled" item is NEVER reclaimed on expiry -- a
+      submitted item has already delivered its result and awaits
+      acceptance regardless of the claim.  Reclaim SHOULD append a
+      "task.reclaimed" event.
+
+   6.4.  The claimable predicate.
+
+      An item is CLAIMABLE now iff it is "open", OR it is "claimed" with
+      a non-live (expired) claim.  GET /v1/tasks?claimable=1 returns
+      exactly this set, so a worker's find-work never returns a
+      live-claimed item and two workers scanning concurrently do not
+      both see the same item as free after one of them claims it (the
+      claim itself is the serialization point, Section 5.3).
+
+
+7.  Capability Negotiation and Backward Compatibility
+
+   Because all additions are OPTIONAL, clients need a way to discover
+   whether a given daemon supports the task board.  Consistent with
+   acp-ext-1 Section 7, this extension advertises a capability string on
+   the existing introspection endpoints:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain (or extend)
+      the capability list:
+
+         "protocol": "acp/1",
+         "capabilities": [ "taskboard", ... ]
+
+   A client MUST treat the ABSENCE of "taskboard" as "not supported":
+   it MUST NOT call the new endpoints (they return 404) and SHOULD fall
+   back to an ACP/1-only work pattern (e.g., a hand-rolled lease named
+   per unit of work plus event/mail signalling).  A daemon MUST advertise
+   "taskboard" only when it fully implements Sections 4-6.  The single
+   capability string defined by this document is "taskboard" (the whole
+   task-board + claim lifecycle is one negotiated unit).
+
+   A daemon without this extension also ignores the OPTIONAL "priority"
+   and "payload" fields it does not understand, per ACP/1 Section 18
+   (receivers ignore unknown fields); but since the endpoints themselves
+   are absent, a conformant client gates on the capability first.
+
+
+8.  Wire API Additions
+
+   Summary (full detail in Sections 4-6; types in Appendix A):
+
+      Modified:
+         GET  /v1/healthz, /v1/stats + "capabilities" includes
+                                       "taskboard"; /v1/stats MAY add
+                                       task counters (open/claimed/...)
+
+      New:
+         POST   /v1/tasks                 create -> WorkItem
+         GET    /v1/tasks                 list (?status=, ?claimable=1)
+                                          -> [WorkItem]
+         GET    /v1/tasks/{id}            read -> WorkItem | 404
+         POST   /v1/tasks/{id}/claim      {ttl_sec?} -> WorkItem | 409
+         POST   /v1/tasks/{id}/renew      {token,ttl_sec?} -> WorkItem|409
+         POST   /v1/tasks/{id}/release    {token} -> WorkItem | 409
+         POST   /v1/tasks/{id}/submit     {token,result?} -> WorkItem|409
+         POST   /v1/tasks/{id}/close      {outcome,note?} -> WorkItem|403
+
+   All new endpoints follow ACP/1 Section 6 conventions: JSON bodies, the
+   standard headers (X-ACP-Agent, X-ACP-Protocol, X-ACP-Space), bearer
+   auth (Section 5), and the standard error model (Appendix B of ACP/1
+   plus Appendix B here).  All operate within the X-ACP-Space space and
+   share nothing across spaces.
+
+
+9.  Determinism and High Availability
+
+   ACP/1 Section 17 requires the replicated state machine to be
+   deterministic: applying the same ordered command stream MUST yield
+   byte-identical state on every node.  This extension preserves that:
+
+      o  Work-item ids, the "claimed_at"/"expires_at"/"created_at"/
+         "updated_at" timestamps, and the fencing TOKEN MUST be assigned
+         by the LEADER and carried in the replicated command, NOT
+         generated independently per node (consistent with ACP/1's
+         leader-stamps-Now and leader-mints-token rules, Sections 10.1
+         and 17).  Every replica then applies the SAME logical op
+         (create / claim / renew / release / submit / close / reclaim)
+         and reaches identical board state.
+
+      o  The claim decision is a LOGICAL op in the Raft log: "agent X
+         claims item I with token T, expires at E".  The
+         claimable-vs-conflict decision (open/expired => grant;
+         live-held-by-other => 409) is evaluated by the leader BEFORE
+         appending the grant command, and the grant either commits or
+         does not; replicas do not re-decide, they apply.  This is what
+         makes the exactly-once claim safe across a leader change: a
+         committed claim is not lost (ACP/1 Section 14.1) and an
+         uncommitted one never took effect.
+
+      o  Reclaim of expired claims is background state mutation and so
+         MUST flow through the replicated log driven by the leader
+         (ACP/1 Section 17), using leader-stamped "now"; a follower MUST
+         NOT reclaim locally.  Equivalently, an implementation MAY reclaim
+         LAZILY at the next command that touches the item (the claim
+         command observes the expired claim and supersedes it), which is
+         inherently deterministic because it rides an existing op.
+
+   Board reads (list, get) are served from committed state and follow
+   ACP/1's leader/follower read rules (Section 14.2): a follower read MAY
+   be slightly stale, so a worker that needs the freshest claimable set
+   before a claim SHOULD target the leader, and in all cases the claim
+   command itself is the authoritative arbiter.
+
+
+10. Security Considerations
+
+   10.1.  One holder, enforced by the authority.
+
+      At most one agent holds a live claim on a work item at any instant.
+      The authority MUST enforce this off the underlying lease
+      (Section 5.3) and MUST reject a claim over a live holder with 409.
+      Renew, release, and submit MUST be accepted only from the current
+      holder presenting the matching fencing token (Sections 5.4-5.6).
+      This is the security-critical invariant of the extension.
+
+   10.2.  No self-grant, no spoofed actor.
+
+      As in ACP/1 (Section 5.2), the authority MUST set "holder",
+      "creator", and any actor field on stored items and events from the
+      AUTHENTICATED identity, never from client-supplied values.  An
+      agent cannot claim an item "as" another agent, cannot grant itself
+      a claim over a live holder, and (in per-agent mode) cannot
+      impersonate via X-ACP-Agent.  A worker cannot accept its own
+      submission: close is gated to the creator or admin (Section 5.7),
+      keeping "handed back" separate from "accepted".
+
+   10.3.  Stale-holder safety (fencing).
+
+      The fencing token (Section 6.2) makes a revived crashed holder
+      harmless: its token is below the item's current token after any
+      reclaim + re-grant, so its renew/release/submit are rejected.
+      Implementers MUST NOT accept an operation on a token lower than the
+      item's current token, and MUST NOT let a submit from a stale holder
+      overwrite a newer holder's result.
+
+   10.4.  Authorization by role.
+
+      Creating and claiming work require "writer" or higher; reads
+      require "reader" or higher; closing (accept/reject/cancel) requires
+      the item's creator or "admin" (ACP/1 Section 5.3).  A "reader" MAY
+      observe the board but MUST NOT claim or mutate it.
+
+   10.5.  Fan-out / abuse and resource bounds.
+
+      A task board is a write amplifier if abused (mass item creation,
+      claim churn).  A daemon SHOULD bound the number of open items per
+      space and the payload/result size, count creates and claims against
+      the per-agent rate limit (ACP/1 Section 5.4), and return 400/429
+      when limits are exceeded.  A very short ttl_sec combined with rapid
+      renew is legitimate (a tight heartbeat) but SHOULD also be rate
+      limited.
+
+   10.6.  Input safety and name/id opacity.
+
+      Item ids are authority-assigned; a client-supplied id is ignored
+      (Section 4.1), preventing id-collision attacks.  "payload" and
+      "result" are opaque application data echoed back in reads and
+      events; consumers MUST treat them as data, not markup, and the
+      authority MUST validate any string fields it interprets (e.g.,
+      "outcome" is one of accept/reject/cancel) to avoid injection into
+      logs or dashboards.
+
+   10.7.  Confidentiality boundary.
+
+      The task board is space-scoped and is NOT an access-control
+      partition within a space: any agent that can read a space can list
+      its board (subject to role).  Confidential separation of work
+      requires a separate SPACE (ACP/1 Section 7), which shares nothing.
+
+
+11. Rollout Plan
+
+   The extension is a single negotiated unit ("taskboard") but SHOULD be
+   built and validated in stages, each independently testable:
+
+      Phase 1 -- board + create/read.  Add the WorkItem type, the durable
+         op-log store (mirroring the mailbox/groups shape), POST/GET
+         /v1/tasks and GET /v1/tasks/{id}, and the "taskboard" capability
+         flag advertised only once claim is also present.  Highest
+         value-to-effort groundwork; no exclusivity yet.
+
+      Phase 2 -- the claim lifecycle.  Add claim/renew/release on the
+         ACP/1 lease layer (fencing token, canonical key), the claimable
+         predicate and ?claimable=1 filter, and expiry reclaim.  This is
+         the exactly-once handoff core.
+
+      Phase 3 -- submit + close + events.  Add holder-only submit,
+         creator/admin close (accept/reject/cancel), and the "task.*"
+         lifecycle events (channel "_tasks" where acp-ext-1 is present).
+         Advertise "taskboard" only when Phases 1-3 are complete.
+
+   Each phase is additive and reversible (a daemon can drop the
+   capability without breaking ACP/1 or acp-ext-1 peers).
+   Reference-implementation work maps to ticket T19 (N-agent
+   ergonomics); the claim/lease core generalizes an existing, tested
+   claim/lease implementation (Section 3.4).
+
+
+12. Open Questions
+
+   o  Priority and scheduling.  This proposal specifies only a minimal
+      "priority" hint and a suggested claim ordering (Section 4.4).  A
+      real priority queue, fair-share across workers, starvation
+      avoidance, or per-item dependencies MAY be a future extension.
+
+   o  Consumer groups.  acp-ext-1 and T19 mention "consumer groups".
+      This proposal deliberately models a single shared board with
+      per-item exclusive claims rather than partitioned consumer groups;
+      a future revision MAY add named queues / consumer groups on top of
+      the same claim primitive.
+
+   o  Lease-key unification.  Whether the item claim SHOULD be visible in
+      GET /v1/lease as an ordinary lease (one lock namespace) or kept
+      internal to the board (two views of one lock) -- Section 3.1
+      recommends a shared key; the exact surfacing is an implementation
+      choice worth ratifying.
+
+   o  Automatic re-dispatch.  On reclaim, should the authority proactively
+      notify/assign a new worker, or only return the item to the pool for
+      pull (as specified)?  Pull is simpler and specified here; push MAY
+      be layered later using acp-ext-1 group mail.
+
+   o  Retention/compaction of terminal items.  Done/cancelled items
+      accumulate; a compaction policy analogous to ACP/1 Section 8.5
+      (event log) and 12.5 (documents) is left open.
+
+   o  Result acceptance rubric.  Close is a human/operator or
+      application decision here; whether to standardize an automated
+      acceptance gate (an external check on "result") is out of scope.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   WorkItem (new):
+      { "id": <string>,               ; authority-assigned, unique/space
+        "status": <string>,           ; open|claimed|submitted|done|
+                                      ;   cancelled (Section 5.1)
+        "title": <string>?,
+        "payload": <object>?,         ; opaque work description
+        "priority": <int>?,           ; higher = more urgent, default 0
+        "creator": <string>,          ; authenticated identity
+        "claim": <Claim>?,            ; present only while claimed
+        "result": <object>?,          ; opaque, attached at submit
+        "created_at": <rfc3339>,
+        "updated_at": <rfc3339> }
+
+   Claim (new -- the on-item mirror of an ACP/1 lease grant):
+      { "holder": <string>,           ; owning agent id
+        "token": <uint64>,            ; ACP/1 fencing token (Section 10.1)
+        "claimed_at": <rfc3339>,
+        "expires_at": <rfc3339> }     ; LIVE while now < expires_at
+
+   ClaimRequest (new -- body of POST .../claim):
+      { "ttl_sec": <int>? }           ; default 300 when not positive
+
+   RenewRequest (new -- body of POST .../renew):
+      { "token": <uint64>, "ttl_sec": <int>? }
+
+   ReleaseRequest (new -- body of POST .../release):
+      { "token": <uint64> }
+
+   SubmitRequest (new -- body of POST .../submit):
+      { "token": <uint64>, "result": <object>? }
+
+   CloseRequest (new -- body of POST .../close):
+      { "outcome": <string>,          ; "accept"|"reject"|"cancel"
+        "note": <string>? }
+
+   Health/Stats (changed -- capability list, per acp-ext-1 Section 7):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [ ..., "taskboard" ] }
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: missing/invalid body; unknown "outcome" on close;
+        client-supplied fields the authority forbids; item count or
+        payload/result size exceeds the configured maximum.
+   401  Unauthorized: missing or invalid bearer token (ACP/1).
+   403  Forbidden: role insufficient (e.g., "reader" attempting create/
+        claim/submit); a non-creator, non-admin attempting close; a
+        holder attempting to accept its own submission.
+   404  Not found: unknown work item on GET/claim/renew/release/submit/
+        close; any new endpoint on a daemon without the "taskboard"
+        capability.
+   409  Conflict: claim attempted while another agent holds a LIVE claim
+        (the current claim is in "current"); renew/release/submit with a
+        token that is not the item's current token or by a non-holder; a
+        transition illegal for the item's current status.  The body's
+        "current" carries the conflicting claim/state (ACP/1 Section 6.3).
+   429  Too Many Requests: create/claim/renew rate exceeded; see
+        Retry-After.
+
+   All other status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Claim -> work -> submit -> close (the happy path).
+
+      Producer posts work:
+         > POST /v1/tasks
+         > Authorization: Bearer <tok>; X-ACP-Agent: planner
+         > { "title": "lint module X",
+         >   "payload": {"repo": "acme/x", "cmd": "make lint"} }
+         < 200 { "id": "t_7f3a", "status": "open", "creator": "planner",
+         <       "priority": 0, "created_at": "...", "updated_at": "..." }
+
+      Worker finds and claims work:
+         > GET /v1/tasks?claimable=1
+         < 200 [ { "id": "t_7f3a", "status": "open", ... } ]
+
+         > POST /v1/tasks/t_7f3a/claim { "ttl_sec": 600 }
+         < 200 { "id": "t_7f3a", "status": "claimed",
+         <       "claim": { "holder": "workerA", "token": 12,
+         <                  "claimed_at": "...", "expires_at": "..." },
+         <       ... }
+
+      Worker heartbeats while working (optional):
+         > POST /v1/tasks/t_7f3a/renew { "token": 12, "ttl_sec": 600 }
+         < 200 { ... "claim": { "token": 12, "expires_at": "<later>" } }
+
+      A DIFFERENT agent trying to claim meanwhile:
+         > POST /v1/tasks/t_7f3a/claim
+         < 409 { "error": "task held by workerA",
+         <       "current": { "holder": "workerA", "token": 12, ... } }
+
+      Worker submits its result (holder-only, token-matched):
+         > POST /v1/tasks/t_7f3a/submit
+         >   { "token": 12, "result": {"exit": 0, "log": "blob://..."} }
+         < 200 { "id": "t_7f3a", "status": "submitted",
+         <       "result": {"exit": 0, ...}, ... }
+
+      Producer accepts it (worker cannot accept its own work):
+         > POST /v1/tasks/t_7f3a/close { "outcome": "accept" }
+         < 200 { "id": "t_7f3a", "status": "done", ... }
+
+   C.2.  Crash -> expiry -> reclaim -> take-over by another agent.
+
+      workerA claims t_9c1 (token 20, ttl 300) and then CRASHES without
+      renewing.  After expires_at passes, the item is claimable again.
+
+      workerB scans and claims it:
+         > GET /v1/tasks?claimable=1
+         < 200 [ { "id": "t_9c1", "status": "claimed",   ; expired claim
+         <         "claim": { "holder":"workerA","token":20,
+         <                    "expires_at":"<past>" } } ]
+
+         > POST /v1/tasks/t_9c1/claim { "ttl_sec": 300 }
+         < 200 { "id": "t_9c1", "status": "claimed",
+         <       "claim": { "holder": "workerB", "token": 21,   ; NEW tok
+         <                  "expires_at": "<future>" }, ... }
+      (The authority reclaimed the expired claim -- SHOULD emit a
+       "task.reclaimed" event -- and minted a fresh, higher fencing
+       token 21.)
+
+      workerA revives and tries to submit its stale work:
+         > POST /v1/tasks/t_9c1/submit { "token": 20, "result": {...} }
+         < 409 { "error": "stale token; task now held by workerB",
+         <       "current": { "holder": "workerB", "token": 21, ... } }
+      Its lower token 20 loses; it cannot clobber workerB's take-over.
+      This is the exactly-once handoff guarantee under crash.
+
+   C.3.  Capability check before using the task board.
+
+      > GET /v1/healthz
+      < 200 { "status": "ok", "protocol": "acp/1",
+      <       "capabilities": ["channels","groups","groupmail",
+      <                        "taskboard"] }
+      A client that does NOT see "taskboard" MUST NOT call /v1/tasks
+      (it would 404) and falls back to an ACP/1-only pattern: a lease
+      named per unit of work plus event/mail signalling.
+
+   C.4.  Idempotent create under retry.
+
+      > POST /v1/tasks
+      > Idempotency-Key: mk-2026-07-02-batch-0001
+      > { "title": "migrate shard 1", "payload": {"shard": 1} }
+      < 200 { "id": "t_aa01", "status": "open", ... }
+
+      (network hiccup; producer retries the SAME key)
+      > POST /v1/tasks
+      > Idempotency-Key: mk-2026-07-02-batch-0001
+      > { "title": "migrate shard 1", "payload": {"shard": 1} }
+      < 200 X-ACP-Idempotent-Replay: true
+      <     { "id": "t_aa01", "status": "open", ... }   ; SAME item
+      No duplicate work item is created.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and ACP Extension Proposal 1 (acp-ext-1), and the
+   reference implementation distributed at
+   https://github.com/ab0t-com/acp .

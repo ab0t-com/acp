@@ -1,0 +1,778 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-3                                      ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+          ACP Extension Proposal 3: Blob Capability URLs (Signed,
+                     Short-Lived, Tokenless Blob Reads)
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: a BLOB CAPABILITY URL -- a short-lived,
+   TOKENLESS, cryptographically signed URL that grants read access to
+   the bytes of exactly ONE blob for a bounded time.
+
+   ACP/1 blob download (Section 11.1 of ACP/1) is bearer-authenticated:
+   GET /v1/blobs/<hash> requires an Authorization header carrying an
+   agent's token.  That is correct for agent-to-authority traffic, but
+   it forces any UNTRUSTED reader -- a web browser, a thin client, or a
+   Liquid-UI external-reference renderer resolving a "blob://" ref --
+   either to be handed a long-lived agent bearer token (a serious
+   secret) or to route every byte through a trusted proxy that holds the
+   token.  Neither is acceptable for embedding blob content in a
+   human-facing surface.
+
+   This extension adds:
+
+     (1) MINT -- POST /v1/blobs/{hash}/url {ttl_sec} -> {url, expires},
+         an authenticated request that returns an HMAC-signed,
+         hash-scoped, expiring URL; and
+
+     (2) FETCH -- an UNAUTHENTICATED GET path that validates the
+         signature, expiry, and hash and then streams the blob bytes,
+         or fails closed (403 on a bad signature, 410 on an expired
+         one).
+
+   The feature is negotiated by a new capability string, "bloburl".
+   None of this changes the wire version "acp/1": the mint endpoint and
+   the tokenless fetch path are NEW, and a daemon that does not
+   implement them returns 404.  A daemon or client that does not
+   implement this extension interoperates unchanged with one that does.
+
+Status of This Memo
+
+   This is a PROPOSAL, not yet part of the normative ACP/1 specification
+   (rfc/acp-1.txt).  It is published for review by implementers and for
+   the protocol owner's approval.  If accepted, its endpoint and types
+   fold into a future "acp/1.1" capability set; the base protocol
+   version string remains "acp/1" and the feature is advertised via
+   Section 7.  Distribution is unlimited.
+
+
+Status of This Memo (owner amendment, 2026-07-12)
+
+   ACCEPTED by the protocol owner and IMPLEMENTED in the reference
+   implementation on 2026-07-12, with the final extension number EXT-3
+   and capability string "bloburl" (advertised only when at least one
+   signing key is loaded via -cap-key-file).  The implementation adopts
+   the following owner refinements; where they differ from the body of
+   this memo, THESE GOVERN and the body is to be reconciled on the next
+   revision:
+
+     1. Fetch endpoint.  The minted URL points at
+        GET /v1/cap/blob/{hash} with query parameters sp (the signed
+        space), e (expiry, unix seconds), k (key id, REQUIRED), and s
+        (the signature).  Each parameter MUST appear exactly once; a
+        missing or repeated parameter yields 400.  "/v1/cap/" is the
+        ONLY unauthenticated path prefix besides /v1/healthz and MUST be
+        matched on the normalized (dot-segment-free) path.
+
+     2. Signature encoding.  s is the LOWERCASE HEXADECIMAL encoding of
+        the HMAC-SHA256 MAC; the authority compares against the
+        canonical encoding (constant-time), so re-encoded variants of a
+        valid MAC fail.
+
+     3. Canonical input.  The MAC input is
+        "acp-blobcap-v1" || 0x00 || space || 0x00 || hash || 0x00 || exp
+        (version folded into the domain-separation prefix; NUL cannot
+        occur in any legal field).  exp is MAC'd as the raw decimal
+        string received, so non-canonical encodings of the same instant
+        fail.
+
+     4. Validation order.  parse -> expiry (410) -> signature (403) ->
+        existence (404).  Expiry precedes the signature because e is
+        caller-supplied plaintext (an early 410 leaks nothing and spares
+        an HMAC); EXISTENCE remains strictly after the signature (no
+        existence oracle for an unsigned request).
+
+     5. Mint precondition.  The blob MUST exist AND be referenced by the
+        space manifest at mint time (else 400) -- no URLs for orphaned /
+        about-to-GC bytes or hashes learned out of band.  On a follower
+        this check MAY be evaluated against follower-local state
+        (best-effort, may lag the leader).
+
+     6. TTL floor.  ttl_sec below 10 clamps UP to 10; default 300 when
+        omitted; upper clamp -cap-max-ttl (default 900).
+
+     7. Audit.  A mint appends ONE event "blob.capurl.minted"
+        {actor = minter, entity = hash, context {expires, key_id}};
+        individual fetches are NOT evented.  Readers MAY mint (minting
+        delegates only read access the minter already holds).
+
+   Distribution is unlimited.
+
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Minting a Capability URL
+   5.  The Tokenless Fetch Path
+   6.  Signature Construction and Key Management
+   7.  Capability Negotiation and Backward Compatibility
+   8.  Wire API Additions
+   9.  Determinism and High Availability
+   10. Security Considerations
+   11. Rollout Plan
+   12. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/1's shared filesystem (Section 11 of ACP/1) stores file contents
+   as immutable, content-addressed blobs: POST /v1/blobs uploads bytes
+   and returns {hash, size}, and GET /v1/blobs/<hash> returns the bytes.
+   Like almost every ACP/1 endpoint, blob download is gated by a bearer
+   token (Section 5.1 of ACP/1): the caller MUST present
+   "Authorization: Bearer <token>", and the token identifies an agent
+   with a role (Section 5.3 of ACP/1).
+
+   This is exactly right when the reader is an AGENT.  It breaks down
+   when the reader is UNTRUSTED and cannot be given an agent token.
+   Three concrete problems motivate this extension; each is a case the
+   N-agent ergonomics work (ticket T19) surfaced once agents began
+   presenting artifacts to humans:
+
+   1.1.  A browser cannot hold an agent bearer token.
+
+      To show a blob (an image, a PDF, a generated report, a chart) in a
+      human-facing page, something must fetch GET /v1/blobs/<hash> with
+      the agent token.  Embedding that token in a browser -- in a URL,
+      in JavaScript, or in a cookie -- leaks a credential that can read
+      and (with a writer role) mutate the entire space.  There is today
+      no way to say "let this one page load this one blob, briefly,
+      without my token."
+
+   1.2.  A thin / external client should not proxy every byte.
+
+      The alternative today is a trusted server-side proxy that holds
+      the agent token and re-streams blob bytes to the untrusted client.
+      That proxy is an extra hop, an extra deployment, a bandwidth
+      amplifier, and a new place for the token to leak.  For large blobs
+      it doubles egress.  A signed, direct-to-authority URL removes the
+      proxy from the data path entirely.
+
+   1.3.  Liquid-UI external references have nowhere to point.
+
+      A Liquid-UI surface presents long or binary content by REFERENCE
+      (a "blob://<hash>" external ref) rather than inlining it, and a
+      renderer resolves that ref to actual bytes at display time.  When
+      the renderer runs in an untrusted context (a browser, a preview
+      pane, a third-party viewer), it needs a URL it can GET directly.
+      An agent bearer URL is unusable there; a capability URL is exactly
+      the missing primitive.  (This use case MOTIVATES the feature but
+      does not scope it: the capability URL defined here is GENERAL and
+      serves any thin or browser client, not only Liquid-UI.)
+
+   Together these gaps mean ACP can STORE content that agents want to
+   SHOW to humans, but has no safe way to let a human's untrusted client
+   read a single object.  This extension closes that gap with the
+   smallest additive surface: mint a signed, hash-scoped, expiring URL,
+   and validate it on a tokenless read path.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, space, blob, and manifest definitions of ACP/1 without
+   restating them; section references of the form "ACP/1 Section N"
+   point into rfc/acp-1.txt.
+
+   CAPABILITY URL:  A URL whose possession is itself the authorization
+      to perform the single action it encodes.  Here: read one blob's
+      bytes, from one space, until an expiry, as attested by an
+      embedded signature.  It carries no bearer token.
+
+   MINT:  The authenticated act of producing a capability URL for a
+      given blob hash (Section 4).
+
+   SIGNING KEY:  A secret, operator-configured symmetric key, shared
+      identically across all authority nodes, used to compute and verify
+      the capability signature (Section 6).
+
+   SIGNATURE:  The keyed MAC over the canonical string binding the URL
+      to a space, a blob hash, and an expiry (Section 6).
+
+   FAIL CLOSED:  On any validation failure the authority MUST refuse and
+      MUST NOT stream bytes.
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  A capability URL grants exactly one narrow power.
+
+      The signature binds the URL to ONE space and ONE blob hash for a
+      bounded time.  It authorizes reading that blob's bytes and nothing
+      else: no listing, no manifest read, no other blob, no write.  The
+      grant is as small as the task in Section 1 requires.
+
+   3.2.  Content addressing makes the grant tamper-evident.
+
+      Blobs are addressed by the SHA-256 of their plaintext (ACP/1
+      Section 11.1).  The hash is part of the signed string, so a holder
+      cannot repoint a valid signature at a different blob, and the
+      bytes returned are exactly the bytes whose hash the caller asked
+      for.  The content-addressed model does the integrity work for us.
+
+   3.3.  Additive and negotiated, never breaking.
+
+      The mint endpoint and the tokenless fetch path are NEW.  A daemon
+      without the extension returns 404 for both and is otherwise
+      unaffected; it continues to serve bearer-authenticated
+      GET /v1/blobs/<hash> exactly as ACP/1 specifies.  Clients detect
+      support via the capability list (Section 7) and fall back to
+      fetching bytes themselves with their bearer token.  The protocol
+      version string stays "acp/1".  Unknown OPTIONAL fields are ignored
+      per ACP/1 Section 18.
+
+   3.4.  The signing key is out-of-band configuration, not state.
+
+      The signing key is operator configuration provisioned identically
+      to every node, exactly like a TLS key.  It is never part of the
+      replicated state machine, never returned by any endpoint, and
+      never carried in the event log.  This keeps minting a pure read
+      and keeps validation node-local (Section 9).
+
+   3.5.  Short by default; expiry is the primary control.
+
+      Because there is no per-URL revocation list in this cut
+      (Section 3.6), the TTL is the main way to bound exposure.  The
+      default TTL is short and the maximum is operator-configured.  A
+      capability URL is a bearer secret for its one blob (Section 10.1);
+      short lifetime keeps the blast radius of a leaked URL small.
+
+   3.6.  Non-goals.
+
+      This extension does NOT add: a write or PUT capability URL (no
+      tokenless upload in this cut); directory, manifest, or multi-blob
+      capability URLs (each URL is one hash); a per-URL revocation or
+      deny list (short TTL and, if needed, key rotation are the
+      mitigations); capability URLs for events, mail, leases, or CRDT
+      documents; or any change to the bearer-authenticated blob paths of
+      ACP/1.  These MAY be future extensions.
+
+
+4.  Minting a Capability URL
+
+   4.1.  Request.
+
+      POST /v1/blobs/{hash}/url
+
+         { "ttl_sec": <int>? }
+
+      The request is AUTHENTICATED exactly as any ACP/1 write-shaped
+      request: it MUST carry a valid bearer token (ACP/1 Section 5.1),
+      and it operates within the space named by X-ACP-Space (ACP/1
+      Section 7).  {hash} is the SHA-256 hex of the target blob.
+
+   4.2.  Authorization.
+
+      Minting a READ capability requires the "reader" role or higher
+      (ACP/1 Section 5.3): any identity permitted to read the blob
+      directly is permitted to mint a URL for it.  A daemon MAY be
+      configured to require "writer" for minting if an operator wants a
+      tighter policy; it MUST NOT allow minting below "reader".
+
+   4.3.  TTL.
+
+      "ttl_sec" is the requested lifetime in seconds.  If absent or not
+      positive, the authority MUST apply a short configured default
+      (RECOMMENDED default 300).  The authority MUST clamp ttl_sec to a
+      configured maximum (RECOMMENDED maximum 3600) and MAY return 400
+      if a caller requests more; clamping is RECOMMENDED over rejection.
+
+   4.4.  Blob existence.
+
+      The authority SHOULD verify the blob exists before minting and
+      SHOULD return 404 if it does not, so a caller learns early.  (This
+      existence check is a convenience for the AUTHENTICATED minter; the
+      tokenless fetch path performs its OWN existence check only AFTER
+      signature validation -- Section 5.3 -- to avoid an existence
+      oracle for unauthenticated callers.)
+
+   4.5.  Response.
+
+      200 OK with a BlobUrl object:
+
+         { "url": <string>, "expires": <rfc3339>, "hash": <string>,
+           "ttl_sec": <int> }
+
+      "url" is the capability URL to GET (Section 5).  It is RECOMMENDED
+      that "url" be an ABSOLUTE URL (scheme + authority host + path +
+      query) so an untrusted client can use it verbatim; a daemon that
+      cannot know its external host MAY return a root-relative URL
+      ("/v1/...") and leave host resolution to the caller.  "expires" is
+      the absolute expiry time; "ttl_sec" is the effective (post-clamp)
+      lifetime.
+
+   4.6.  Minting is a read.
+
+      Minting mutates NO authority state (it computes a MAC over static
+      inputs) and therefore is not a replicated write (Section 9).  A
+      daemon MAY, as a separate OPTIONAL step, append a
+      "blob.url.minted" audit event (Section 9); doing so is the only
+      part of minting that touches state and, if done, MUST follow the
+      leader-stamped rule of ACP/1 Section 17.
+
+
+5.  The Tokenless Fetch Path
+
+   5.1.  Shape.
+
+      The minted URL points at a NEW, UNAUTHENTICATED path:
+
+         GET /v1/blobs/{hash}/get?exp=<unix-seconds>&sig=<b64url>
+
+      This path MUST NOT require an Authorization header.  It is the
+      ONLY blob path in ACP that does not; the bearer-authenticated
+      GET /v1/blobs/{hash} of ACP/1 Section 11.1 is unchanged and
+      remains the path agents use.  The distinct trailing "/get" segment
+      keeps the tokenless path from colliding with the authenticated
+      one.
+
+   5.2.  Query parameters.
+
+         exp   REQUIRED.  Expiry as unix seconds; the same value bound
+               into the signature (Section 6).
+         sig   REQUIRED.  base64url(no padding) of the MAC over the
+               canonical string (Section 6).
+         kid   OPTIONAL.  Key identifier for rotation (Section 6.3); if
+               absent the authority assumes the current default key.
+
+   5.3.  Validation order (fail closed).
+
+      On a fetch the authority MUST, IN THIS ORDER:
+
+         1. Parse {hash} from the path and exp/sig(/kid) from the query;
+            a missing or malformed exp or sig MUST yield 400.
+         2. Recompute the expected signature over the canonical string
+            for (space, hash, exp) using the key selected by kid
+            (Section 6) and compare it to "sig" in CONSTANT TIME.  A
+            mismatch (or unknown kid) MUST yield 403 and MUST NOT reveal
+            whether the blob exists.
+         3. Check expiry: if exp <= now, the authority MUST yield 410
+            (Gone).  Expiry is checked AFTER the signature so that only a
+            holder of a validly signed URL can distinguish "expired"
+            from "forged".
+         4. Only now check blob existence: if the blob is absent, yield
+            404.
+         5. Stream the bytes as application/octet-stream (ACP/1
+            Section 4.2), identically to the authenticated GET.
+
+      Validating the signature BEFORE existence (step 2 before step 4)
+      is normative: it denies an unauthenticated caller any oracle for
+      probing which hashes exist in a space (Section 10.4).
+
+   5.4.  Space binding.
+
+      The space is part of the signed string (Section 6), NOT taken from
+      an X-ACP-Space header on the tokenless GET (an untrusted client
+      MUST NOT be able to move a signature to another space).  The
+      authority MUST serve the bytes from the space that was bound at
+      mint time and MUST ignore any X-ACP-Space header on this path.
+
+   5.5.  Bytes are plaintext.
+
+      If the authority encrypts blobs at rest (ACP/1 Section 19), the
+      tokenless path returns DECRYPTED plaintext bytes, exactly as the
+      authenticated GET does; the blob hash remains the plaintext
+      SHA-256 (ACP/1 Section 11.1).  Range requests, if supported by the
+      authenticated path, MAY be supported here identically.
+
+
+6.  Signature Construction and Key Management
+
+   6.1.  Canonical string.
+
+      The signature covers a canonical, unambiguous string binding the
+      grant to its scope.  The authority MUST compute:
+
+         input = "acp-bloburl" LF
+                 "v1"          LF        ; scheme version of THIS string
+                 <space>       LF        ; the target space name
+                 <hash>        LF        ; lowercase hex SHA-256
+                 <exp>                   ; unix seconds, decimal ASCII
+
+      where LF is a single 0x0A.  The domain-separation prefix
+      "acp-bloburl" and the "v1" line ensure a signature for this
+      purpose can never be confused with any other MAC the operator's
+      key might produce, and allow the string layout to evolve later.
+
+   6.2.  MAC.
+
+      The signature is:
+
+         sig = base64url_nopad( HMAC-SHA256( signing_key, input ) )
+
+      HMAC-SHA256 is REQUIRED for interoperability.  The authority MUST
+      compare the supplied "sig" to the recomputed value in CONSTANT
+      time (ACP/1 Section 5.1 already requires constant-time token
+      comparison; the same discipline applies here).
+
+   6.3.  Keys and rotation.
+
+      The signing key is symmetric, high-entropy (>= 256 bits
+      RECOMMENDED), and provisioned by the operator identically to every
+      node (Section 9).  To rotate without invalidating outstanding
+      short-lived URLs, an authority MAY maintain a small set of keys
+      each named by a "kid":
+
+         o  Newly minted URLs carry the CURRENT kid and are signed with
+            the current key.
+         o  On fetch, the authority selects the key by the URL's kid and
+            validates against THAT key only.
+         o  A retired key MAY be kept valid for validation for a short
+            grace window (>= the maximum TTL) so already-minted URLs
+            keep working, then removed.
+
+      An authority that supports only a single key MAY omit kid entirely
+      and treat its absence as "the one key".
+
+   6.4.  Key compromise.
+
+      Because the key alone lets an attacker forge a URL for ANY blob in
+      ANY space, the signing key is as sensitive as the authority's
+      bearer tokens.  On suspected compromise the operator MUST rotate
+      (retire the key, install a new one); retiring a key IMMEDIATELY
+      invalidates every URL signed with it (Section 10.5).
+
+
+7.  Capability Negotiation and Backward Compatibility
+
+   Because the addition is OPTIONAL, clients discover support via the
+   capability list introduced by ACP/EXT-1 Section 7:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain (or extend):
+
+         "protocol": "acp/1",
+         "capabilities": [ ..., "bloburl", ... ]
+
+   A client MUST treat the ABSENCE of "bloburl" as "not supported" and
+   fall back to ACP/1 behavior: fetch the blob itself with its bearer
+   token (ACP/1 Section 11.1) and, if it must present the bytes to an
+   untrusted reader, proxy them under its own trust boundary.  A daemon
+   MUST advertise "bloburl" only when it fully implements Sections 4-6.
+   Clients MUST NOT POST /v1/blobs/{hash}/url to a daemon that does not
+   advertise "bloburl"; on an unaware daemon that endpoint 404s
+   (Section 3.3).  The capability string defined by this document is
+   "bloburl".
+
+
+8.  Wire API Additions
+
+   Summary (full detail in Sections 4-6; types in Appendix A):
+
+      Modified:
+         GET /v1/healthz, /v1/stats + "bloburl" in "capabilities"
+
+      New:
+         POST /v1/blobs/{hash}/url          {ttl_sec?} -> BlobUrl
+         GET  /v1/blobs/{hash}/get?exp=&sig=&kid=   -> bytes (NO AUTH)
+
+   The mint endpoint (POST .../url) follows ACP/1 Section 6 conventions:
+   JSON body, the standard headers (X-ACP-Agent, X-ACP-Protocol,
+   X-ACP-Space), bearer auth (ACP/1 Section 5), and the standard error
+   model (Appendix B of ACP/1 plus Appendix B here).  The fetch endpoint
+   (GET .../get) is deliberately the SOLE exception to bearer auth
+   (alongside GET /v1/healthz): it authorizes by signature, returns
+   application/octet-stream, and MUST ignore X-ACP-Space (Section 5.4).
+
+
+9.  Determinism and High Availability
+
+   ACP/1 Section 17 requires a clustered authority's replicated state
+   machine to be deterministic.  This extension preserves that, and in
+   fact touches replication only minimally:
+
+      o  MINTING is a READ.  Computing HMAC-SHA256 over static inputs
+         mutates no state, so it is NOT a replicated write and needs no
+         Raft round trip.  Any node -- leader or follower -- can mint,
+         because the signing key is shared configuration, not state.
+
+      o  VALIDATION is node-local.  The tokenless fetch recomputes the
+         MAC from the URL and the shared key and streams committed blob
+         bytes; any node validates and serves identically.  No leader
+         involvement is required for reads (ACP/1 Section 14.2).
+
+      o  The SIGNING KEY (and any kid set) is cluster-shared operator
+         configuration provisioned identically to every node, exactly
+         like the TLS material of ACP/1 Section 4.1.  It never enters the
+         Raft log, so it cannot introduce divergence.
+
+      o  If a daemon chooses to append the OPTIONAL "blob.url.minted"
+         audit event (Section 4.6), that -- and only that -- is a
+         replicated write, and it MUST follow ACP/1 Section 17: the
+         event's id, timestamp, and any generated fields are stamped by
+         the LEADER and carried in the command, so every replica applies
+         the same logical op and reaches byte-identical state.
+
+   Because minting and validation are both node-local pure computations
+   over shared config, capability URLs work uniformly under single-node
+   and Raft deployments and survive leader changes (a URL minted before
+   a failover is still valid on the new leader and on every follower).
+
+
+10. Security Considerations
+
+   10.1.  A capability URL IS a bearer secret for one blob.
+
+      This is the most important caveat.  Anyone who obtains the URL --
+      from a browser history, a proxy log, a referrer header, a
+      screenshot, a chat paste -- can fetch that one blob's bytes until
+      it expires.  The URL is unauthenticated by design; possession is
+      the authorization.  Operators and clients MUST treat a capability
+      URL as sensitive: send it only over TLS (ACP/1 Section 4.1), keep
+      TTLs short (Section 4.3), and prefer delivering it to the intended
+      reader out of band rather than logging it.  It is narrower than a
+      bearer token (one blob, time-boxed, read-only) but it is still a
+      secret.
+
+   10.2.  Scope minimization.
+
+      The signature binds space + hash + expiry (Section 6.1), so a URL
+      grants read of ONE blob in ONE space until ONE deadline.  It
+      permits no listing, no enumeration, no manifest read, no other
+      blob, and no write (Section 3.1).  A holder cannot repoint it: the
+      hash is content-addressed and signed (Section 3.2), and the space
+      cannot be overridden by a header (Section 5.4).
+
+   10.3.  Short TTL and clamping.
+
+      The default TTL is short (RECOMMENDED 300 s) and the maximum is
+      operator-configured and clamped at mint (Section 4.3).  Because
+      there is no revocation list in this cut, TTL is the primary bound
+      on a leaked URL's usefulness; operators SHOULD set the maximum no
+      larger than their exposure tolerance.
+
+   10.4.  No existence oracle; constant-time compare.
+
+      The fetch path validates the signature in CONSTANT time
+      (Section 6.2) and checks it BEFORE checking blob existence
+      (Section 5.3), so an unauthenticated caller with a bad or absent
+      signature always gets 403 and can neither brute-force the MAC via
+      timing nor probe which hashes exist.  A blob hash is already a
+      non-secret 256-bit value, but the signature -- not knowledge of
+      the hash -- is what authorizes the read.
+
+   10.5.  Key management and rotation.
+
+      The signing key can forge a URL for any blob in any space; it is
+      as sensitive as a bearer token and MUST be stored and provisioned
+      accordingly (Section 6.4).  Rotation via kid (Section 6.3) lets
+      operators retire keys; retiring a key immediately invalidates all
+      URLs signed with it, which is the closest thing to bulk revocation
+      this cut provides.
+
+   10.6.  Rate limiting and abuse.
+
+      The tokenless path is a public endpoint.  Although forging an
+      HMAC-SHA256 signature is infeasible, the authority SHOULD
+      rate-limit the fetch path (e.g., per client IP) to blunt
+      brute-force probing and denial-of-service, signaling with 429 and
+      Retry-After (ACP/1 Section 5.4).  Minting is bearer-authenticated
+      and SHOULD be counted against the minter's normal rate budget.
+
+   10.7.  No amplification of authority.
+
+      A minted URL never grants MORE than the minter had: minting
+      requires "reader"+ on the space (Section 4.2), and the URL only
+      reads.  It cannot be used to write, to escalate role, or to reach
+      another space.
+
+   10.8.  Unchanged ACP/1 guarantees.
+
+      Bearer auth on every other endpoint (ACP/1 Section 5), tenant
+      isolation between spaces (ACP/1 Section 7), path validation (ACP/1
+      Section 11.4), and encryption at rest (ACP/1 Section 19) are all
+      unaffected; this extension adds one narrowly scoped, read-only
+      public door and nothing else.
+
+
+11. Rollout Plan
+
+   The feature is a single capability and ships as one increment,
+   independently negotiated:
+
+      Phase 1 -- "bloburl".  Add the operator signing-key configuration,
+         the POST /v1/blobs/{hash}/url mint endpoint, the tokenless
+         GET /v1/blobs/{hash}/get validation-and-stream path, and the
+         "bloburl" capability flag on /v1/healthz and /v1/stats.
+
+      Phase 1a (OPTIONAL) -- kid-based key rotation (Section 6.3) and
+         the "blob.url.minted" audit event (Section 4.6).  A daemon MAY
+         ship Phase 1 with a single key and no audit event and still
+         advertise "bloburl".
+
+   The change is additive and reversible: a daemon can drop the
+   capability (stop advertising "bloburl", 404 the two paths) without
+   breaking ACP/1 peers.  Reference-implementation work maps to ticket
+   T19 (making ACP ergonomic for human-facing, N-agent use).
+
+
+12. Open Questions
+
+   o  Per-URL revocation.  Should there be an explicit revoke (a small
+      deny list keyed by a mint nonce) for the case where a short TTL is
+      not short enough?  Deferred; TTL and key rotation cover the first
+      cut.
+
+   o  Write / upload capability URLs.  A signed one-shot PUT (bounded by
+      hash and size) would let an untrusted client upload directly.
+      Deliberately out of scope here (Section 3.6); it needs its own
+      abuse analysis.
+
+   o  Manifest / multi-blob capability URLs.  A single URL granting read
+      of a path or a small set of blobs (e.g., an entire rendered
+      report) would reduce round trips for Liquid-UI.  Deferred.
+
+   o  Content-Disposition / content-type hints.  Should the mint request
+      carry a filename or MIME type to echo on the fetch response for
+      nicer browser rendering?  A candidate OPTIONAL field.
+
+   o  Signed cookies vs query signatures, to keep the signature out of
+      URLs (and thus out of logs/referrers) for browser embedding.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   BlobUrlRequest (new -- body of POST /v1/blobs/{hash}/url):
+      { "ttl_sec": <int>? }        ; requested lifetime; clamped
+
+   BlobUrl (new -- response to a mint):
+      { "url": <string>,           ; capability URL to GET
+        "expires": <rfc3339>,      ; absolute expiry
+        "hash": <string>,          ; the bound blob hash (hex sha256)
+        "ttl_sec": <int> }         ; effective (post-clamp) lifetime
+
+   Capability-URL query parameters (new -- on GET .../get):
+      exp  <unix-seconds>          ; REQUIRED; signed expiry
+      sig  <base64url-nopad>       ; REQUIRED; HMAC-SHA256 (Section 6)
+      kid  <string>                ; OPTIONAL; signing-key identifier
+
+   Event "blob.url.minted" (new, OPTIONAL audit event -- an ACP/1 Event
+   per ACP/1 Appendix A):
+      { ...ACP/1 Event fields...,
+        "action": "blob.url.minted",
+        "entity": <hash>,
+        "context": { "ttl_sec": <int>, "expires": <rfc3339> } }
+      NOTE: the context MUST NOT include the signature or the URL.
+
+   Health/Stats (changed -- per ACP/EXT-1 Section 7):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [ ..., "bloburl" ] }
+
+
+Appendix B.  New Error Conditions
+
+   On POST /v1/blobs/{hash}/url (mint):
+   400  Bad request: malformed hash; ttl_sec above the configured
+        maximum where the daemon rejects rather than clamps.
+   401  Unauthorized: missing or invalid bearer token (ACP/1 5.1).
+   403  Forbidden: role below the minting threshold (Section 4.2).
+   404  Not found: unknown blob (Section 4.4); or this endpoint on a
+        daemon that does not advertise "bloburl".
+
+   On GET /v1/blobs/{hash}/get (tokenless fetch):
+   400  Bad request: missing or malformed exp or sig.
+   403  Forbidden: signature does not validate, or unknown kid; returned
+        WITHOUT revealing whether the blob exists (Section 5.3).
+   404  Not found: signature valid and unexpired but the blob is absent;
+        or this path on a daemon that does not advertise "bloburl".
+   410  Gone: signature valid but exp has passed (Section 5.3).
+   429  Too Many Requests: fetch-path rate limit exceeded (Section 10.6);
+        see Retry-After.
+
+   All other status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Mint a capability URL, then fetch it.
+
+      Mint (authenticated, in space "projX"):
+         > POST /v1/blobs/9f2c...e1/url
+         > Authorization: Bearer <tok>
+         > X-ACP-Agent: claudeA
+         > X-ACP-Space: projX
+         > { "ttl_sec": 300 }
+
+         < 200 OK
+         < { "url": "https://coordd.example:8443/v1/blobs/9f2c...e1/get"
+         <          "?exp=1782000300&sig=Qm9ndXNTaWdFeGFtcGxl&kid=k2",
+         <   "expires": "2026-07-02T12:05:00Z",
+         <   "hash": "9f2c...e1", "ttl_sec": 300 }
+
+      Fetch (NO Authorization header -- e.g., a browser <img> src):
+         > GET /v1/blobs/9f2c...e1/get?exp=1782000300&sig=Qm9n...bGU&kid=k2
+
+         < 200 OK
+         < Content-Type: application/octet-stream
+         < <blob bytes>
+
+   C.2.  Expired URL -> 410.
+
+      The same URL requested after "expires":
+         > GET /v1/blobs/9f2c...e1/get?exp=1782000300&sig=Qm9n...bGU&kid=k2
+         < 410 Gone
+         < { "error": "capability url expired" }
+      The client re-mints (C.1) to obtain a fresh URL.
+
+   C.3.  Forged or tampered signature -> 403 (no existence leak).
+
+      Any request whose sig does not validate -- a guessed signature, a
+      hash swapped in the path, or a bumped exp -- fails identically,
+      whether or not the blob exists:
+         > GET /v1/blobs/deadbeef.../get?exp=1782000300&sig=bm90cmVhbA
+         < 403 Forbidden
+         < { "error": "invalid capability signature" }
+
+   C.4.  Capability check before minting.
+
+      GET /v1/healthz
+      -> { "status": "ok", "protocol": "acp/1",
+           "capabilities": ["bloburl"] }
+      A client that does not see "bloburl" does NOT call the mint
+      endpoint; it fetches GET /v1/blobs/<hash> with its bearer token
+      and proxies the bytes under its own trust boundary instead.
+
+   C.5.  Liquid-UI external ref resolution.
+
+      A Liquid-UI surface carries an external ref "blob://9f2c...e1".
+      The trusted pod that authored the surface mints a capability URL
+      (C.1) and hands the untrusted renderer the resulting "url"; the
+      renderer GETs it directly with no token and no proxy.  When the
+      URL expires mid-view, the renderer requests a fresh mint from the
+      pod (which holds the bearer token) and retries.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .

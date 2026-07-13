@@ -1,0 +1,608 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-11                                     ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+        ACP Extension Proposal 11: Per-Actor Undo/Redo for the
+                  Structured CRDT (Server-Computed Inverses)
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: PER-ACTOR UNDO/REDO on the structured
+   (JSON) CRDT of ACP/EXT-5 -- POST /v1/crdt/json/undo reverts the
+   calling actor's most recent not-yet-undone change to a document,
+   and POST /v1/crdt/json/redo re-applies it.
+
+   Undo on a CRDT is a notoriously subtle correctness problem.  A user
+   editing a shared board expects Ctrl-Z to revert THEIR last change --
+   not the whole board, and not a peer's concurrent edit -- and on a
+   convergent replicated type that means generating a COMPENSATING
+   operation that inverts the target operation's effect as the document
+   stands NOW, in the presence of concurrent writes.  Getting this
+   wrong silently diverges replicas or resurrects deleted state; it is
+   exactly the class of mechanism that belongs in the protocol
+   authority (which holds the full op log and the materialized
+   document) rather than being re-risked by every consumer.
+
+   In this extension the authority computes the inverse and applies it
+   as ORDINARY EXT-5 operations: an undo produces normal, leader-
+   stamped, replicated crdtjson ops that converge like any other write.
+   No new operation type crosses the wire.  What undo adds is a small
+   piece of per-(document, actor) bookkeeping -- the UNDO CURSOR --
+   which is replicated state so undo behaves identically across leader
+   failover, and a BOUNDED WINDOW: an operation older than the
+   document's compaction horizon (EXT-5 epoch) can no longer be
+   inverted and is refused.  The feature is negotiated by a new
+   capability string, "crdtjson-undo".  None of this changes the wire
+   version "acp/1"; a daemon that does not implement this extension
+   answers the new endpoints 404 and interoperates unchanged.
+
+Status of This Memo
+
+   This is a PROPOSAL, not yet part of the normative ACP/1
+   specification (rfc/acp-1.txt).  It is published for review by
+   implementers and for the protocol owner's approval.  The extension
+   number EXT-11 is PROVISIONAL; the protocol owner assigns final
+   numbers on acceptance.  It builds on ACP/EXT-5 (structured CRDT),
+   which is ACCEPTED and IMPLEMENTED; this proposal is NOT implemented.
+   If accepted, its endpoints and types fold into a future "acp/1.1"
+   capability set; the base protocol version string remains "acp/1"
+   and the feature is advertised via Section 5.  Distribution is
+   unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Per-Actor Undo and Redo
+   5.  Capability Negotiation and Backward Compatibility
+   6.  Wire API Additions
+   7.  Determinism and High Availability
+   8.  Security Considerations
+   9.  Rollout Plan
+   10. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/EXT-5 gives a space server-materialized structured documents:
+   convergent JSON trees mutated by four operation types (set, del,
+   lins, ldel), leader-stamped and totally ordered through the
+   replicated log.  Concurrent disjoint edits merge; every replica
+   materializes byte-identical JSON.  What EXT-5 does not give an
+   editing surface is the single most-expected editing affordance:
+   undo.  Three concrete problems motivate this extension:
+
+   1.1.  Undo on a CRDT is not "remove my op from the log".
+
+      The log is append-only and already replicated; an op cannot be
+      retracted.  The only way to undo is to APPEND a compensating op
+      that reverses the target's effect.  Computing that inverse is
+      easy for some cases and subtle for others: undoing a register
+      set when a peer has CONCURRENTLY set the same register raises
+      "revert to what?"; undoing a delete must restore the deleted
+      subtree's VALUE, not merely re-bind a key; undoing a list insert
+      must tombstone exactly the inserted element.  Each consumer that
+      hand-rolls this re-risks a convergence bug the protocol was
+      built to prevent.
+
+   1.2.  Only the authority has the data to do it right.
+
+      A correct inverse depends on the full op history and the current
+      committed state (which binding tags are live, which element ids
+      exist, what value a register held absent the undone op).  Clients
+      hold neither -- EXT-5 deliberately ships no merge code client-
+      side; the daemon materializes.  The daemon already holds the
+      per-document op log and materialized state; it is the one place
+      an inverse can be computed once, correctly, for every consumer.
+
+   1.3.  Undo must be PER-ACTOR to match user intent.
+
+      On a shared board, Ctrl-Z must revert the caller's own last edit
+      and leave peers' interleaved edits alone.  That requires per-
+      (document, actor) bookkeeping of which of the actor's changes
+      stand undone -- state that must survive leader failover, or a
+      user's undo history silently resets mid-session.
+
+   This extension adds exactly that: two endpoints (undo, redo), a
+   server-side inverse generator whose OUTPUT is ordinary EXT-5 ops,
+   and a small replicated undo cursor per (document, actor).
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in
+   this document are to be interpreted as described in BCP 14
+   [RFC2119] [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, and space definitions of ACP/1, and the structured-CRDT
+   definitions of ACP/EXT-5 (document, op, nid, element id, binding
+   tag, LWW stamp, epoch, materialization), without restating them.
+   "EXT-5 Section N" points into acp-ext-5-structured-crdt.txt.
+
+   OP GROUP:  The unit of undo: all canonical ops that one accepted
+      client push (one POST /v1/crdt/json/ops request) produced for
+      one actor on one document.  One user gesture typically maps to
+      one push, so one undo reverts one gesture.
+
+   COMPENSATING OPS (INVERSE):  Ordinary EXT-5 ops, computed by the
+      authority, whose application reverses the observable effect of
+      an op group under the semantic of Section 4.2.
+
+   UNDO CURSOR:  The replicated per-(document, actor) record of that
+      actor's op-group history positions: which trailing groups stand
+      undone (and can be redone).
+
+   UNDO WINDOW:  The range of an actor's op groups still invertible:
+      those wholly at or after the document's current compaction
+      horizon (the EXT-5 epoch barrier).
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Undo is data, not mechanism (the invariant).
+
+      An undo NEVER retracts, rewrites, or reorders the op log.  The
+      compensating ops are appended, leader-stamped, and replicated
+      exactly like client-authored ops; a replica applying the log
+      cannot even distinguish them except by an informative marker.
+      Convergence therefore follows from EXT-5's existing guarantees
+      -- there is no second replication path to get wrong.
+
+   3.2.  Per-actor scope.
+
+      Undo reverts the CALLER's own op groups only.  There is no
+      operation to undo another actor's edit (that is an edit war, not
+      undo; a writer wanting to change a peer's work simply edits).
+      This scoping falls out of authentication: the target group is
+      selected from the groups attributed to the authenticated actor.
+
+   3.3.  The undo semantic: "the document without my op group".
+
+      Undoing group G restores each register, binding, and list
+      element G touched to the state it would have had if G had never
+      been applied -- computed against the CURRENT document, so
+      concurrent edits by peers are preserved, not reverted.
+      Concretely (Section 4.2): a set is undone by re-materializing
+      the register from the live op set MINUS G and re-asserting that
+      value; an add is undone by deleting what it added; a delete is
+      undone by re-creating what it removed, with its value.  Where G
+      and a peer's later op both wrote the same register, the peer's
+      value already wins under LWW and the undo of G MUST leave it
+      winning (undo of a superseded op is a no-op on that register).
+
+   3.4.  Additive and negotiated, never breaking.
+
+      Two NEW endpoints; no existing endpoint, op type, or stored
+      format changes.  A daemon without the extension answers 404;
+      clients discover support via the capability list (Section 5).
+      The wire version stays "acp/1".
+
+   3.5.  Non-goals.
+
+      This extension does NOT add: GLOBAL undo (revert the document's
+      last change regardless of author); SELECTIVE undo of an
+      arbitrary historical group (only the stack top is undoable --
+      linear undo, the editor convention); time-travel/checkpoint
+      restore (snapshot the materialized doc for that); undo for the
+      TEXT CRDT of ACP/1 Section 12 (a future revision MAY extend it;
+      the text type's inverse rules differ); client-side inverse
+      computation; or transactional undo across documents.  These MAY
+      be future extensions.
+
+4.  Per-Actor Undo and Redo
+
+   4.1.  The undo stack model.
+
+      Per (document, actor) the authority maintains a logical stack of
+      that actor's op groups in commit order, with a cursor separating
+      DONE groups from UNDONE groups:
+
+         groups:  G1  G2  G3 | G4  G5      (| = cursor)
+                  done ......   undone ...
+
+      POST .../undo inverts the newest DONE group (G3) and moves the
+      cursor left; POST .../redo re-applies the oldest UNDONE group
+      (G4 -- i.e., the most recently undone) and moves it right.  A
+      NEW op group pushed by the actor MUST clear that actor's undone
+      tail (G4, G5 become unreachable -- standard linear-undo
+      behavior) and becomes the new stack top.
+
+      Only op groups the actor authored through POST /v1/crdt/json/ops
+      enter its stack.  Compensating ops generated by undo/redo do NOT
+      form new groups (they move the cursor instead); a compaction
+      snapshot (EXT-5 Section 5.8) contributes no groups.
+
+   4.2.  Inverse computation (normative rules).
+
+      For each op in the target group, in reverse order, the authority
+      computes compensating ops against the CURRENT committed document
+      state:
+
+      o  set that created a map binding (key -> new node): compensate
+         with a del of that binding's tag.  Under EXT-5's observed-
+         remove semantics, deleting the specific tag leaves any
+         CONCURRENT binding of the same key alive -- peers' writes
+         survive.  If the binding is no longer live (a peer already
+         deleted or superseded it), the compensation for that op is
+         EMPTY (nothing to revert).
+
+      o  set that wrote a register in place: re-materialize the
+         register's LWW winner from the live op set EXCLUDING the
+         undone op; compensate with an in-place set re-asserting that
+         value (or, when no prior value exists, a del of the register's
+         binding).  If the undone op is not the current winner (a peer
+         overwrote it), the compensation is EMPTY: the peer's value
+         stands, per Section 3.3.
+
+      o  del of a map key: compensate by re-binding the key to the
+         deleted child, restoring the child subtree's materialized
+         value as of the deletion (a fresh set with a new tag carrying
+         the reconstructed value).  If a peer has since re-bound the
+         key, LWW applies to the restored binding like any concurrent
+         write.
+
+      o  lins (list insert): compensate with an ldel of the inserted
+         element id.
+
+      o  ldel (list delete): compensate with a lins re-inserting the
+         element's child value at the same origin (a new element id;
+         list identity is not preserved across delete/undelete, order
+         position is, by origin).
+
+      All compensating ops are canonicalized, leader-stamped, and
+      applied through the normal EXT-5 propose path as ONE atomic
+      group.  The authority MUST compute inverses from committed state
+      only, on the leader, immediately before propose (Section 7).
+
+      Redo re-applies the undone group by the same mechanism: the
+      authority computes ops that re-assert the group's effect against
+      current state (equivalently: the inverse of the compensating
+      group, by the same rules).
+
+   4.3.  POST /v1/crdt/json/undo.
+
+      Request body:
+
+         { "doc": <string> }
+
+      The authority identifies the caller's newest done op group for
+      the document, computes the compensating ops (Section 4.2),
+      applies them, advances the undo cursor, and responds:
+
+         { "undone": true, "group": <opaque id>,
+           "ops_applied": <int>, "total": <int>, "epoch": <int> }
+
+      with total/epoch as in EXT-5's push response.  If the actor has
+      no done group for the document, the authority MUST respond 409
+      ("nothing to undo") and change nothing.  If the target group
+      lies below the compaction horizon (Section 4.5), the authority
+      MUST respond 410 and change nothing.  A compensation that is
+      entirely EMPTY (every touched item superseded by peers) still
+      succeeds -- it advances the cursor with "ops_applied": 0.
+
+   4.4.  POST /v1/crdt/json/redo.
+
+      Request body and response mirror Section 4.3 ("redone": true).
+      If the actor has no undone group (the cursor is at the top, or
+      the undone tail was cleared by a new push, Section 4.1), the
+      authority MUST respond 409 ("nothing to redo").
+
+   4.5.  The bounded window (compaction).
+
+      EXT-5 compaction (Section 5.8 of EXT-5) garbage-collects
+      superseded ops behind the epoch barrier.  An op group whose ops
+      have been compacted away can no longer be precisely inverted --
+      the information is gone by design.  The authority MUST refuse to
+      undo such a group with 410 (Gone) and SHOULD drop unreachable
+      stack entries at compaction time.  Undo is therefore a BOUNDED-
+      WINDOW guarantee, exactly like idempotency-key retention: recent
+      changes are undoable; ancient history is not.  Operators size
+      the window by their compaction policy; daemons SHOULD advertise
+      the effective bound (Section 5).
+
+   4.6.  Backward compatibility.
+
+      A daemon that does not implement this extension answers both
+      endpoints 404.  A conformant client MUST check for the
+      "crdtjson-undo" capability (Section 5) and, absent it, disable
+      or client-side-emulate undo EXPLICITLY (an emulation that
+      re-asserts old values cannot honor Section 3.3's concurrent-edit
+      semantics and SHOULD be labeled best-effort).  EXT-5 documents,
+      ops, and endpoints are unchanged for all peers.
+
+5.  Capability Negotiation and Backward Compatibility
+
+   This extension adds a capability string to the ACP/1 introspection
+   endpoints, per the shared convention of EXT-1 Section 7:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain:
+
+         "protocol": "acp/1",
+         "capabilities": [ "crdtjson-undo", ... ]
+
+   A daemon MUST advertise "crdtjson-undo" only when it implements all
+   of Section 4 (inverse rules, replicated cursor, atomic compensating
+   groups, the 409/410 refusals) and MUST also advertise "crdtjson"
+   (EXT-5) -- undo without the underlying type is meaningless.  A
+   daemon SHOULD advertise its undo depth bound, e.g.:
+
+         "limits": { "crdtjson_undo_depth": 100 }
+
+   A client MUST treat the ABSENCE of "crdtjson-undo" as "not
+   supported" (Section 4.6).
+
+6.  Wire API Additions
+
+   Summary (full detail in Section 4; types in Appendix A):
+
+      New:
+         POST /v1/crdt/json/undo    ; invert my newest done op group
+         POST /v1/crdt/json/redo    ; re-apply my newest undone group
+
+      Modified:
+         GET /v1/healthz, /v1/stats + "crdtjson-undo" capability and
+                                      OPTIONAL "limits" hint
+         POST /v1/crdt/json/ops     ; unchanged on the wire; internally
+                                      each accepted push forms an op
+                                      group and clears the caller's
+                                      undone tail (Section 4.1)
+
+   Both new endpoints follow ACP/1 Section 6 conventions: JSON bodies,
+   the standard headers, bearer auth, and the standard error model
+   (Appendix B of ACP/1 plus Appendix B here).  Idempotency-Key
+   (ACP/1 Section 6.4) SHOULD be honored: a replayed undo MUST NOT
+   move the cursor twice.  Compensating ops travel inside the existing
+   replicated op stream; no new op type is introduced on the wire.
+
+7.  Determinism and High Availability
+
+   ACP/1 Section 17 requires the replicated state machine to be
+   deterministic.  This extension preserves that:
+
+      o  Inverse COMPUTATION happens on the LEADER, pre-propose,
+         reading only committed replicated state (the document's op
+         log and materialization).  The resulting compensating ops are
+         fully stamped (now, actor, op ids) by the leader and carried
+         in the proposed command, exactly like EXT-5's canonicalize-
+         then-propose path.  Followers apply the received ops; they
+         never re-derive an inverse, so replicas cannot diverge on
+         "what the inverse was".
+
+      o  The UNDO CURSOR is REPLICATED FSM STATE.  Cursor movements
+         are part of the applied command (the undo/redo command
+         carries the group id and the compensating ops; each accepted
+         push command implicitly clears the actor's undone tail), and
+         cursors are carried by snapshots.  This mirrors the
+         replicated idempotency-state pattern: bookkeeping that
+         changes observable behavior after failover must itself be
+         replicated, or a new leader would disagree with the old one
+         about what "undo" does next.
+
+      o  One undo (or redo) is ONE command: its compensating ops and
+         cursor movement commit atomically, so no replica ever
+         observes a half-undone group, and a leader change mid-undo
+         either commits the whole command or none of it.
+
+      o  Compaction interaction is deterministic because the epoch
+         barrier is already replicated state (EXT-5): every replica
+         agrees which groups are beyond the window, so a 410 refusal
+         is identical everywhere.
+
+8.  Security Considerations
+
+   8.1.  Scope of authority.
+
+      Undo mutates a document, so it is a WRITE: "reader" MUST be
+      refused (403).  The target group is selected from the
+      AUTHENTICATED actor's own groups (ACP/1 Section 5.2); there is
+      no parameter that names another actor, so cross-actor undo is
+      not expressible on the wire.  A scoped token (EXT-7) MUST pass
+      the same scope checks for the compensating writes as for direct
+      writes to the document.
+
+   8.2.  Attribution.
+
+      Compensating ops are stamped with the UNDOING actor (they are
+      that actor's writes) and SHOULD carry an informative marker
+      (e.g., a context field naming the undone group) so the audit
+      trail distinguishes "B undid their edit" from "B edited".  The
+      undone actor's original ops remain in the log untouched --
+      history is never rewritten (Section 3.1).
+
+   8.3.  Resource use and abuse.
+
+      Undo/redo requests MUST count against the sender's rate limit
+      (ACP/1 Section 5.4).  Inverse computation is O(touched state)
+      with a re-materialization step; a daemon SHOULD bound the per-
+      actor stack depth (RECOMMENDED 100 groups) and MAY bound the
+      size of a single compensating group.  Undo/redo ping-pong spam
+      is rate-limited like any write loop.
+
+   8.4.  Interaction with validation.
+
+      If per-document schema validation (the companion proposal
+      EXT-12) is configured, compensating groups MUST be validated
+      like any write: an undo whose result would violate the schema is
+      refused 422 and the cursor does not move.  By construction this
+      is rare (the pre-group state was once valid), but a schema
+      registered AFTER the group was applied can make an undo target
+      state invalid; refusing is the conservative, deterministic
+      choice.
+
+9.  Rollout Plan
+
+   This is a single feature but with an explicit correctness gate:
+
+      Phase 1 -- "crdtjson-undo".  Op-group tracking on the push path;
+         the replicated per-(document, actor) cursor; leader-side
+         inverse generation for all EXT-5 op types; the undo and redo
+         endpoints; 409/410 refusals; the capability and depth limit.
+
+      Gate -- the acceptance property test.  Implementation MUST NOT
+         advertise the capability until a property/fuzz suite proves,
+         under adversarial interleavings of concurrent edits: (a)
+         apply-then-undo restores the Section 3.3 semantic ("document
+         without my group", peers' edits intact), (b) undo/redo
+         round-trips are stable, and (c) all replicas converge
+         byte-identically -- the same bar EXT-5 itself met.
+
+   The phase is additive and reversible: a daemon may drop the
+   capability without breaking peers (documents remain valid; only
+   the undo affordance disappears).
+
+10. Open Questions
+
+   o  Concurrent undo of OVERLAPPING edits by two actors (A undoes a
+      set while B undoes the del that removed it).  Per-actor scoping
+      plus normal-op convergence keeps replicas identical, but the
+      RESULTING state can surprise users; whether to specify
+      tie-breaking UX guidance or leave it to LWW is open.
+
+   o  Client-chosen grouping: an explicit group boundary marker on
+      POST /v1/crdt/json/ops (several pushes = one gesture), versus
+      the one-push-one-group rule of Section 2.
+
+   o  Undo depth/retention: a per-document configuration versus the
+      daemon-wide bound of Section 8.3, and whether the undone tail
+      should survive longer than linear-undo convention allows
+      (undo-tree semantics are explicitly NOT proposed).
+
+   o  Extending undo to the TEXT CRDT (ACP/1 Section 12): the RGA
+      inverse rules (re-insert at tombstone origin) differ enough to
+      warrant their own analysis.
+
+   o  Whether "ops_applied": 0 undos (fully superseded groups) should
+      be skipped automatically (cursor keeps moving until something
+      reverts) or surfaced to the user as specified here.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   UndoRequest / RedoRequest (new -- the POST bodies):
+      { "doc": <string> }
+
+   UndoResult / RedoResult (new -- the responses):
+      { "undone": true | "redone": true,
+        "group":       <string>,   ; opaque op-group id
+        "ops_applied": <int>,      ; compensating ops committed (may be 0)
+        "total":       <int>,      ; doc op total after, as in EXT-5
+        "epoch":       <int> }     ; doc epoch, as in EXT-5
+
+   UndoCursor (new -- REPLICATED per-(document, actor) state; not a
+   wire type, shown for implementers):
+      { "doc": <string>, "actor": <string>,
+        "groups": [ <group id>, ... ],   ; bounded (Section 8.3)
+        "done":   <int> }                ; cursor position
+
+   Health/Stats (changed -- shared "capabilities" plus an OPTIONAL
+   limit hint):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [<string>],      ; includes "crdtjson-undo"
+        "limits": { "crdtjson_undo_depth": <int> }? }
+
+   No EXT-5 wire type changes: compensating ops are ordinary EXT-5
+   canonical ops.
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: missing/invalid "doc".
+   401  Unauthorized: missing or invalid bearer token (ACP/1).
+   403  Forbidden: role "reader" (undo is a write); a scoped token
+        whose scope forbids writing this document.
+   404  Not found: the daemon does not implement this extension
+        (Section 4.6).  (An unknown DOCUMENT follows EXT-5's rule --
+        an empty document has nothing to undo and yields 409.)
+   409  Conflict: nothing to undo (no done group) or nothing to redo
+        (no undone group) for this (document, actor).
+   410  Gone: the target op group lies beyond the compaction horizon
+        (Section 4.5); it can no longer be inverted.
+   422  Unprocessable: the compensating group would violate the
+        document's registered schema (Section 8.4; requires EXT-12).
+   429  Too Many Requests: rate budget exceeded (ACP/1 Section 5.4).
+
+   A successful undo/redo returns 200 with UndoResult/RedoResult.
+   All other status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Simple undo of my own edit.
+
+      Actor B pushes one group setting a title:
+         POST /v1/crdt/json/ops
+         { "doc":"boards/q3",
+           "ops":[{"t":"set","path":["title"],"value":"\"Q3 Plan\""}] }
+         < 200 { "total": 41, "epoch": 2 }
+
+      B undoes it:
+         POST /v1/crdt/json/undo  { "doc":"boards/q3" }
+         < 200 { "undone":true, "group":"g-41", "ops_applied":1,
+                 "total":42, "epoch":2 }
+
+      The document materializes without the title binding; the
+      compensating del is an ordinary replicated op (total rose to 42
+      -- nothing was retracted).
+
+   C.2.  Undo does not revert a peer's concurrent write.
+
+      B sets title = "Draft"; A then sets title = "Final" (A's LWW
+      stamp is later).  B undoes:
+         POST /v1/crdt/json/undo  { "doc":"boards/q3" }
+         < 200 { "undone":true, "ops_applied":0, ... }
+
+      B's set is no longer the winner, so the compensation is empty:
+      the document still shows "Final".  Peers' edits are preserved
+      (Section 3.3); B's cursor still advanced, so B's NEXT undo
+      targets B's previous group.
+
+   C.3.  Redo, and losing the redo tail.
+
+      B undoes (C.1), then redoes:
+         POST /v1/crdt/json/redo  { "doc":"boards/q3" }
+         < 200 { "redone":true, "ops_applied":1, ... }
+      B undoes again, then pushes a NEW edit group:
+         POST /v1/crdt/json/ops { ... }        < 200
+      Now redo has nothing to re-apply (the undone tail was cleared,
+      Section 4.1):
+         POST /v1/crdt/json/redo  { "doc":"boards/q3" }
+         < 409 { "error": "nothing to redo" }
+
+   C.4.  Beyond the window.
+
+      After compaction bumped the epoch past B's oldest group:
+         POST /v1/crdt/json/undo  { "doc":"boards/q3" }
+         < 410 { "error": "op group compacted; beyond the undo
+                 window" }
+      The document is unchanged; B's client surfaces "can't undo
+      further".
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt), the ACP/EXT-5 structured-CRDT extension, and the
+   reference implementation distributed at
+   https://github.com/ab0t-com/acp .

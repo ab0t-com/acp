@@ -1,0 +1,642 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-4                                      ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+          ACP Extension Proposal 4: Batch Event Append (Atomic
+                       Multi-Event Log Appends)
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: BATCH EVENT APPEND -- the ability to
+   append MANY events to a space's event log in a SINGLE request that
+   the authority commits ATOMICALLY (all-or-nothing) and stamps with a
+   CONTIGUOUS block of sequence numbers.
+
+   ACP/1 event append (Section 8.2 of ACP/1) is one-event-per-request:
+   POST /v1/events takes a single event object, assigns it the next
+   seq, and returns it.  A high-throughput coordinator that emits
+   several correlated facts per tick (for example, a worklog that
+   records "task.claimed", "file.edited", and "note.added" for one unit
+   of work) must therefore issue N separate POSTs.  That is N network
+   round-trips, N idempotency keys to manage, and -- worst of all -- no
+   way to make the N events land together: a crash or throttle midway
+   leaves a partial, misleading record in the totally-ordered log.
+
+   This extension lets POST /v1/events ALSO accept a JSON array of event
+   objects.  The authority assigns the array a contiguous seq block,
+   persists the whole batch atomically, honors ONE Idempotency-Key for
+   the entire batch, and returns the stored events with their assigned
+   seqs.  The feature is negotiated by a new capability string,
+   "batchevents".  None of this changes the wire version "acp/1": the
+   single-object body works exactly as today, the array body is a NEW
+   accepted shape, and a daemon that does not implement this extension
+   rejects an array body with 400.  A daemon or client that does not
+   implement this extension interoperates unchanged with one that does.
+
+Status of This Memo
+
+   ACCEPTED by the protocol owner (2026-07-12) with the final extension
+   number EXT-4, and IMPLEMENTED in the reference implementation as of
+   the same date (daemon flag -max-batch, default 256; capability
+   "batchevents"; limits.max_batch_events advertised per Section 5).
+   Owner amendments on acceptance: Section 4.7's client-fallback rule
+   now permits an explicit failure in place of a silent fallback (see
+   Section 4.7); the replicated idempotency-state expectation in
+   Section 7 is tracked by the owner as a separate reference-
+   implementation work item (the idempotency cache is currently
+   node-local for ALL operations, batch and single alike).  The base
+   protocol version string remains "acp/1" and the feature is
+   advertised via Section 5.  Distribution is unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Batch Event Append
+   5.  Capability Negotiation and Backward Compatibility
+   6.  Wire API Additions
+   7.  Determinism and High Availability
+   8.  Security Considerations
+   9.  Rollout Plan
+   10. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/1's event log (Section 8 of ACP/1) is the per-space, append-only,
+   totally-ordered record from which every agent derives shared state.
+   Its append primitive (Section 8.2) is deliberately simple: POST
+   /v1/events with ONE event object, and the authority assigns the next
+   seq, sets "at", persists the event before acknowledging, and returns
+   it.  This is exactly right for the occasional, standalone fact.
+
+   It is a poor fit for a busy coordination worklog that produces
+   SEVERAL related events per unit of work.  Three concrete problems
+   motivate this extension:
+
+   1.1.  N round-trips for N events.
+
+      Emitting k events per tick costs k HTTPS request/response
+      round-trips (Section 4 of ACP/1).  For a coordinator that ticks
+      often and records rich activity, per-event latency dominates
+      throughput even though the k events are known at the same instant.
+      There is no way to hand the authority the whole set at once.
+
+   1.2.  N idempotency keys with no batch retry.
+
+      ACP/1 idempotency (Section 6.4) is per-request: safe retry of a
+      single append needs its own Idempotency-Key, and a client emitting
+      k events must mint, send, and reconcile k keys.  If the client
+      crashes partway through the k POSTs it cannot tell, on restart,
+      which suffix still needs sending without inspecting the log.
+      There is no single key that means "these k events, once".
+
+   1.3.  No atomic multi-append.
+
+      Most importantly, ACP/1 offers no way to make k events land
+      TOGETHER.  Between POST #i and POST #i+1 the client may be
+      throttled (429, Section 5.4), disconnected (Section 8.4), or
+      killed.  The log then holds a PARTIAL group -- e.g., a
+      "task.claimed" with no matching "task.started" -- and every other
+      agent replaying the log (Section 8) derives state from a
+      half-written record.  The single totally-ordered log is ACP/1's
+      central guarantee; a partial multi-append silently violates the
+      atomicity a caller expected of a logically indivisible set of
+      facts.
+
+   Together these mean ACP has an ordered log without an ordered-append
+   BATCH: the unit of durability is one event, when the unit of meaning
+   is often several.  This extension closes the gap with the smallest
+   additive surface -- one new accepted body shape on the existing
+   append endpoint -- while preserving ACP/1's invariant: one space, one
+   total order, strictly increasing seq.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, space, event, and idempotency definitions of ACP/1 without
+   restating them; section references of the form "ACP/1 Section N"
+   point into rfc/acp-1.txt.
+
+   BATCH:  An ordered, non-empty JSON array of event objects submitted
+      in one POST /v1/events request, intended to be appended together.
+
+   SEQ BLOCK:  A run of consecutive seq values [s, s+1, ..., s+k-1]
+      assigned by the authority to the k events of a batch, in array
+      order, with no other event interleaved.
+
+   ATOMIC APPEND:  Persistence of a whole batch such that either ALL of
+      its events become durable and visible (with the assigned seq
+      block) or NONE do; no partial batch is ever observable in the log.
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  One space, one total order (preserved).
+
+      A batch does not create a sub-log or a nested order.  Its events
+      take ordinary space-global seq values (ACP/1 Section 8), assigned
+      as a contiguous block in array order.  A reader replaying the log
+      (Section 8.3) or streaming it (Section 8.4) sees the batch's
+      events exactly as it sees any other events: individual records in
+      ascending seq.  Batching is an append-time atomicity and
+      efficiency property, NOT a new read-time structure.
+
+   3.2.  Additive and negotiated, never breaking.
+
+      The single-event body of ACP/1 Section 8.2 is unchanged and
+      REMAINS the default.  The array body is an ADDITIONAL accepted
+      shape on the SAME endpoint.  A daemon without the extension
+      rejects the array body with 400 and behaves exactly as ACP/1
+      today for single events; clients detect support via the
+      capability list (Section 5) before sending an array.  The
+      protocol version string stays "acp/1".
+
+      NOTE: no new endpoint is introduced.  This extension is unusual
+      in overloading an existing endpoint's body shape rather than
+      adding a path; capability negotiation (Section 5) rather than a
+      404 is therefore the primary discovery mechanism, because a
+      pre-extension daemon answers the SAME path with 400, not 404.
+
+   3.3.  All-or-nothing, one key.
+
+      Atomicity (persist the whole batch before acknowledging) and a
+      single batch-wide Idempotency-Key are the point of the feature.
+      Partial success is NOT permitted: a batch that cannot be fully
+      committed MUST leave the log unchanged (Section 4.4).
+
+   3.4.  Reuse the existing event and idempotency shapes.
+
+      A batched event is an ordinary ACP/1 Event (Appendix A of ACP/1);
+      the response is just an array of those events with their assigned
+      seqs.  Idempotency reuses ACP/1 Section 6.4 semantics
+      (X-ACP-Idempotent-Replay on replay), scoped to the batch as a
+      whole.  No new storage subsystem is required.
+
+   3.5.  Non-goals.
+
+      This extension does NOT add: cross-space batches (a batch is
+      confined to the one space named by X-ACP-Space, ACP/1 Section 7;
+      spanning spaces would break single-log atomicity and is
+      forbidden); batch mailbox send (multi-recipient messaging is the
+      separate concern of ACP/EXT-1 group/broadcast mail, and any
+      batch-mail primitive would be its own proposal); transactional
+      semantics ACROSS subsystems (a batch appends events only, and does
+      not, for example, atomically also commit the manifest or acquire a
+      lease); or reordering/deduplication of events WITHIN a batch
+      beyond the caller-supplied order.  These MAY be future extensions.
+
+
+4.  Batch Event Append
+
+   4.1.  Request shape.
+
+      POST /v1/events (ACP/1 Section 8.2) is extended to accept, as an
+      alternative to the single event object it accepts today, a JSON
+      ARRAY of event objects:
+
+         [ {action, entity?, before?, after?, context?, channel?},
+           {action, entity?, ...},
+           ... ]
+
+      The authority distinguishes the two shapes by the top-level JSON
+      type: an object is the ACP/1 single-append; an array is a batch.
+      Each array element carries the SAME client-supplied fields a
+      single append may carry (ACP/1 Section 8.1); the authority sets
+      the server-controlled fields (actor, seq, at) on every element as
+      in Section 4.3.  As in ACP/1 Section 6.2, unknown per-event fields
+      SHOULD be ignored, and (with ACP/EXT-1 present) a per-event
+      "channel" is honored per element.
+
+      An EMPTY array MUST be rejected with 400 (a batch is non-empty by
+      definition, Section 2).  A batch exceeding the configured maximum
+      size MUST be rejected (Section 4.5).
+
+   4.2.  Contiguous seq block.
+
+      The authority MUST assign the k events of a batch a CONTIGUOUS,
+      strictly increasing seq block [s, s+1, ..., s+k-1], where s is the
+      current next-seq, in ARRAY ORDER (element i receives seq s+i).  No
+      other event -- from this or any other agent -- may be interleaved
+      into the block; after the batch, next-seq is s+k.  seq remains
+      strictly increasing space-globally and persists across restarts
+      (ACP/1 Section 8.2).  The response array is in the same order as
+      the request, so response[i].seq == s+i.
+
+   4.3.  Server-stamped fields.
+
+      For every event in the batch the authority MUST set "actor" to the
+      authenticated identity (never from a client-supplied field, ACP/1
+      Section 5.2) and MUST set "at".  All events in one batch SHOULD
+      share a single "at" timestamp (the batch is one logical append);
+      implementations MAY stamp a single time for the batch.  In a
+      cluster this time is leader-assigned and carried in the command
+      (Section 7).
+
+   4.4.  Atomicity.
+
+      The authority MUST persist the ENTIRE batch durably before
+      acknowledging, and MUST do so all-or-nothing: either all k events
+      become durable and visible with their seq block, or NONE do and
+      next-seq is unchanged.  A batch MUST NOT be observable in a
+      partial state by any reader or follower (Section 8.3/8.4 of
+      ACP/1) at any time.  If the authority cannot commit the whole
+      batch (validation failure on any element, over-cap, storage
+      error), it MUST reject the request and leave the log unchanged;
+      no prefix is retained.
+
+      Per-element validation is performed BEFORE any seq is assigned: if
+      ANY element is malformed (e.g., missing the REQUIRED "action",
+      ACP/1 Section 8.1) the authority MUST reject the whole batch with
+      400 and append nothing.
+
+   4.5.  Maximum batch size.
+
+      The authority SHOULD enforce a configurable maximum number of
+      events per batch (and MAY additionally bound the total request
+      body size, ACP/1 Section 19).  A batch whose element count exceeds
+      the maximum MUST be rejected with 400, and a batch rejected
+      because accepting it would exceed a rate/throughput budget MUST be
+      rejected with 429 and Retry-After (ACP/1 Section 5.4).  The
+      configured maximum SHOULD be discoverable (Section 5); a
+      RECOMMENDED default is 256 events per batch.
+
+   4.6.  Idempotency (one key for the whole batch).
+
+      A single Idempotency-Key (ACP/1 Section 6.4) supplied on a batch
+      POST covers the ENTIRE batch as one unit.  On the first successful
+      apply the authority records the key against the batch result
+      (the assigned seq block).  Any RETRY carrying the same key MUST
+      return the ORIGINAL stored batch result -- byte-identical events
+      with their originally assigned seqs -- and MUST NOT append the
+      events a second time (no duplicates, no new seq block).  A
+      replayed response SHOULD carry "X-ACP-Idempotent-Replay: true"
+      (ACP/1 Section 6.4).  Keys MAY be evicted after a bounded
+      retention.
+
+      This is what makes crash-safe multi-append practical: a client
+      that does not know whether its batch landed simply retries with
+      the same key and either gets the original seqs or appends exactly
+      once.
+
+   4.7.  Backward compatibility.
+
+      A pre-extension daemon does not recognize an array body: because
+      ACP/1 Section 8.2 specifies a JSON OBJECT, an array is a malformed
+      body and yields 400 (ACP/1 Appendix B).  A conformant client
+      therefore MUST check for the "batchevents" capability (Section 5)
+      before sending an array, and when the capability is absent MUST
+      either fall back to N single-event POSTs (ACP/1 Section 8.2) --
+      optionally each with its own Idempotency-Key -- or fail
+      EXPLICITLY, surfacing the missing capability to its caller.  A
+      client MUST NOT fall back silently where the caller relied on the
+      batch's atomicity: N single POSTs do not land atomically, so a
+      silent fallback would forfeit the very guarantee the caller asked
+      for.  (The reference client fails explicitly.)  The single-object
+      append is unchanged for all daemons and clients.
+
+
+5.  Capability Negotiation and Backward Compatibility
+
+   Because the batch shape is an additive body overload on an existing
+   endpoint (Section 3.2), a pre-extension daemon answers the SAME path
+   with 400 rather than 404; capability negotiation is therefore the
+   primary and REQUIRED discovery mechanism.  This extension adds a
+   capability string to the ACP/1 introspection endpoints:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain, per the
+      shared convention of ACP/EXT-1 Section 7:
+
+         "protocol": "acp/1",
+         "capabilities": [ "batchevents", ... ]
+
+      A daemon advertising "batchevents" SHOULD also advertise the
+      configured maximum batch size so clients can size their batches
+      without probing, e.g.:
+
+         "limits": { "max_batch_events": 256 }
+
+   A client MUST treat the ABSENCE of "batchevents" as "not supported"
+   and fall back to single-event appends (ACP/1 Section 8.2, and
+   Section 4.7 here).  A daemon MUST advertise "batchevents" only when
+   it fully implements Section 4 (atomic all-or-nothing append,
+   contiguous seq block, one-key batch idempotency).  The capability
+   string defined by this document is "batchevents" (Section 4).  Where
+   the "limits" object is absent, a client SHOULD assume a conservative
+   small batch size and be prepared for 400/429 (Section 4.5) and
+   shrink.
+
+
+6.  Wire API Additions
+
+   Summary (full detail in Section 4; types in Appendix A):
+
+      Modified:
+         POST /v1/events            + OPTIONAL array-of-Event body
+                                      (atomic batch); response is
+                                      array-of-Event with assigned seqs
+         GET  /v1/healthz, /v1/stats+ "capabilities" array (shared with
+                                      other ACP extensions) and OPTIONAL
+                                      "limits.max_batch_events"
+
+      New:
+         (none -- no new endpoint or path is introduced)
+
+   The modified endpoint follows ACP/1 Section 6 conventions: JSON
+   bodies, the standard headers (X-ACP-Agent, X-ACP-Protocol,
+   X-ACP-Space), bearer auth (Section 5 of ACP/1), the Idempotency-Key
+   header (Section 6.4 of ACP/1, applied per Section 4.6 here), and the
+   standard error model (Appendix B of ACP/1 plus Appendix B here).
+   The response media type for a batch is application/json (an array),
+   not application/x-ndjson; the NDJSON stream (ACP/1 Section 8.4) is a
+   READ concern and is unaffected by this extension.
+
+
+7.  Determinism and High Availability
+
+   ACP/1 Section 17 requires the replicated state machine to be
+   deterministic: applying the same ordered command stream MUST yield
+   byte-identical state on every node.  This extension preserves that:
+
+      o  A batch MUST be replicated as ONE logical command (the ordered
+         array of client-supplied events plus the authenticated actor),
+         NOT as k separate append commands.  The leader appends this
+         single command to the Raft log (ACP/1 Section 14.1); on commit
+         every replica applies it identically, assigning the same
+         contiguous seq block in the same array order.
+
+      o  Because the batch is one command, atomicity across a leader
+         change is automatic: a command committed by a majority is not
+         lost (ACP/1 Section 14.1), and a command not committed leaves
+         no partial prefix -- exactly the all-or-nothing property of
+         Section 4.4.  There is no window in which some but not all of a
+         batch's events are replicated.
+
+      o  The base seq "s", every assigned seq, the shared "at"
+         timestamp, and any other generated ids MUST be fixed by the
+         LEADER and carried in the command (ACP/1 Section 17), so
+         followers do not read wall-clock time or a local counter while
+         applying.  Idempotency-key resolution is likewise deterministic
+         from committed state: the recorded key->seq-block mapping is
+         part of the replicated state, so a retry resolves to the same
+         block on any node.
+
+   Batch reads do not exist as a distinct operation; events appended by
+   a batch are read exactly like any other events (ACP/1 Sections
+   8.3/8.4) and require no special leader/follower handling.
+
+
+8.  Security Considerations
+
+   8.1.  Append amplification.
+
+      A batch lets one request create many durable writes.  To prevent
+      log-flooding or storage-exhaustion abuse, a daemon:
+
+         o  MUST count each EVENT in the batch against the sender's rate
+            limit (ACP/1 Section 5.4), not count the batch as one
+            request.
+         o  MUST enforce a configurable maximum batch size and SHOULD
+            enforce a maximum request body size, returning 400 (over
+            the element cap) or 429 (over a rate/throughput budget) per
+            Section 4.5.
+         o  SHOULD apply the same per-agent authorization as single
+            append: appending events requires the "writer" role or
+            higher (ACP/1 Section 5.3); "reader" MUST NOT append,
+            singly or in a batch.
+
+   8.2.  Atomicity as a correctness property.
+
+      The all-or-nothing guarantee (Section 4.4) is also a safety
+      property: it prevents an observer from acting on a partially
+      written group of facts (e.g., a "funds.debited" without its
+      paired "funds.credited").  Implementations MUST NOT expose a
+      partial batch even transiently, including to a streaming follower
+      (ACP/1 Section 8.4) mid-apply.
+
+   8.3.  Idempotency-key trust.
+
+      As in ACP/1 Section 6.4, the Idempotency-Key is client-supplied.
+      The authority MUST scope replay to the same authenticated identity
+      and space, and MUST NOT return another agent's batch result for a
+      colliding key.  The recorded mapping MUST bind the key to (space,
+      actor) so a key from one agent cannot replay another's events.
+
+   8.4.  Spoofing.
+
+      As in ACP/1, the authority MUST set "actor" on EVERY event in the
+      batch to the authenticated identity and MUST NOT trust any
+      client-supplied actor field, per Section 4.3 and ACP/1 Section
+      5.2.
+
+   8.5.  Input validation.
+
+      Every element of a batch MUST be validated to the same standard as
+      a single append (required "action", field types, and -- with
+      ACP/EXT-1 -- channel-name character set).  Validation failure on
+      ANY element rejects the WHOLE batch (Section 4.4) so a malformed
+      element cannot slip into the log alongside valid ones.
+
+
+9.  Rollout Plan
+
+   This is a single, self-contained feature and ships as one phase:
+
+      Phase 1 -- "batchevents".  Accept an array body on POST
+         /v1/events; validate all elements up front; assign a
+         contiguous seq block;
+         persist atomically as one logical op (one Raft command in
+         cluster mode); apply a single batch-wide Idempotency-Key;
+         return the array of stored events; advertise the "batchevents"
+         capability and the "limits.max_batch_events" value.
+
+   The phase is additive and reversible: a daemon may drop the
+   capability without breaking ACP/1 peers (clients fall back to
+   single-event appends per Section 4.7).  Reference-implementation work
+   maps to the high-throughput-worklog line item in the N-agent
+   ergonomics track (ticket T19).
+
+
+10. Open Questions
+
+   o  Partial-success mode.  This proposal is strictly all-or-nothing.
+      A future revision MAY add an OPTIONAL best-effort mode that
+      appends the valid prefix and reports the first failing index, for
+      callers that prefer progress over atomicity.  Deferred: atomicity
+      is the safer and simpler default.
+
+   o  Streaming ("chunked") batch append for very large batches that
+      exceed a single request body limit, versus the client splitting
+      into multiple capped batches.  This proposal takes the latter.
+
+   o  Cross-subsystem transactions (append events AND commit the
+      manifest AND take a lease atomically).  Out of scope here; would
+      require a general transaction primitive over ACP/1 subsystems.
+
+   o  Whether the shared "at" for a batch (Section 4.3) should be a
+      single timestamp for the whole batch or per-event stamps that are
+      merely non-decreasing.  This proposal RECOMMENDS a single shared
+      timestamp; a future revision MAY relax this.
+
+   o  Interaction with ACP/EXT-1 channels: whether a batch MAY mix
+      per-event channels (this proposal permits it) or SHOULD be
+      constrained to one channel per batch for simpler filtered
+      streaming.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   EventBatchRequest (new -- the array form of the POST /v1/events
+   body; each element is an ACP/1 append input, i.e. an Event without
+   server-controlled fields):
+      [ { "action": <string>,
+          "entity": <string>?,
+          "before": <object>?, "after": <object>?,
+          "context": <object>?,
+          "channel": <string>? } ,      ; "channel" only with ACP/EXT-1
+        ... ]                          ; non-empty; <= max_batch_events
+
+   EventBatchResult (new -- the array form of the response; each
+   element is a stored ACP/1 Event, Appendix A of ACP/1, with its
+   assigned seq):
+      [ { "seq": <uint64>, "at": <rfc3339>, "actor": <string>,
+          "action": <string>, "entity": <string>?,
+          "before": <object>?, "after": <object>?,
+          "context": <object>?, "channel": <string>? } ,
+        ... ]                            ; same order as the request,
+                                         ; seqs contiguous & increasing
+
+   Health/Stats (changed -- shared "capabilities" plus an OPTIONAL
+   limits hint):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [<string>],      ; includes "batchevents"
+        "limits": { "max_batch_events": <int> }? }
+
+   The single-object POST /v1/events body and its single-Event response
+   (ACP/1 Section 8.2, Appendix A) are UNCHANGED.
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: empty batch array; a batch element is malformed
+        (e.g., missing the required "action" or a field of the wrong
+        type); batch element count exceeds the configured maximum
+        (Section 4.5); an array body sent to a daemon that does not
+        implement this extension (which parses it as a malformed body,
+        Section 4.7).  On any 400 the log is UNCHANGED (Section 4.4);
+        no prefix is appended.
+   401  Unauthorized: missing or invalid bearer token (ACP/1).
+   403  Forbidden: the caller's role does not permit appending events
+        (Section 8.1); "reader" cannot append a batch.
+   429  Too Many Requests: the batch's expanded event count exceeds the
+        sender's rate/throughput budget (Section 4.5, Section 8.1); see
+        Retry-After.
+
+   A successful batch returns 200 with the array of stored events
+   (Appendix A).  A replayed idempotent batch returns 200 with the
+   original array and "X-ACP-Idempotent-Replay: true" (Section 4.6).
+   All other status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Capability check before batching.
+
+      GET /v1/healthz
+      -> { "status": "ok", "protocol": "acp/1",
+           "capabilities": ["batchevents"],
+           "limits": { "max_batch_events": 256 } }
+      A client that does not see "batchevents" falls back to one POST
+      /v1/events per event (ACP/1 Section 8.2).
+
+   C.2.  Atomic multi-event tick.
+
+      Append three correlated facts for one unit of work, atomically:
+
+         POST /v1/events
+         Authorization: Bearer <tok>
+         X-ACP-Agent: claudeA
+         Idempotency-Key: k-tick-8817
+         [ {"action":"task.claimed","entity":"T-42"},
+           {"action":"file.edited","entity":"app.go",
+            "context":{"lines":12}},
+           {"action":"note.added","entity":"T-42",
+            "context":{"msg":"WIP"}} ]
+
+         < 200 OK
+         < [ {"seq":900,"at":"2026-07-02T00:00:00Z","actor":"claudeA",
+         <    "action":"task.claimed","entity":"T-42"},
+         <   {"seq":901,"at":"2026-07-02T00:00:00Z","actor":"claudeA",
+         <    "action":"file.edited","entity":"app.go",
+         <    "context":{"lines":12}},
+         <   {"seq":902,"at":"2026-07-02T00:00:00Z","actor":"claudeA",
+         <    "action":"note.added","entity":"T-42",
+         <    "context":{"msg":"WIP"}} ]
+
+      The three events occupy the contiguous block 900..902 in array
+      order; no other event is interleaved.
+
+   C.3.  Crash-safe retry (idempotent replay).
+
+      The client is unsure whether C.2 landed and retries the SAME
+      request with the SAME Idempotency-Key: k-tick-8817:
+
+         < 200 OK
+         < X-ACP-Idempotent-Replay: true
+         < [ ...the identical events with seqs 900,901,902... ]
+
+      No duplicate events are appended; next-seq is unchanged by the
+      retry.
+
+   C.4.  Over-cap rejection (nothing appended).
+
+      A 500-event batch against a daemon with max_batch_events=256:
+
+         POST /v1/events
+         [ ...500 events... ]
+         < 400 { "error": "batch exceeds max_batch_events (256)" }
+
+      The log is unchanged; the client splits into capped batches and
+      retries.
+
+   C.5.  Fallback on a pre-extension daemon.
+
+      GET /v1/healthz
+      -> { "status": "ok", "protocol": "acp/1", "capabilities": [] }
+      The client sends events one at a time (ACP/1 Section 8.2); an
+      array body would have returned 400.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .

@@ -1,0 +1,623 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-12                                     ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+       ACP Extension Proposal 12: Per-Document Schema Validation for
+              the Structured CRDT (A Thin Node-Type Catalog)
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: an OPTIONAL, per-document SCHEMA for
+   the structured (JSON) CRDT of ACP/EXT-5, checked by the authority
+   on every write -- an op push whose RESULTING materialization would
+   violate the document's registered schema is rejected with 422 and
+   nothing is committed.
+
+   EXT-5 merges any structurally-valid JSON.  But many structured
+   documents are TYPED: a dashboard node of kind "stat" needs a label
+   and a binding; a "section" needs children.  Today nothing
+   server-side stops a writer from committing a half-formed node; the
+   malformed state MERGES (the CRDT is doing its job) and every reader
+   renders garbage, discovering the corruption far from its source.
+   Consumers want the authority to fail fast at the write.
+
+   The schema language is DELIBERATELY THIN: a catalog of node kinds
+   (kind -> required and optional fields with primitive types) plus an
+   optional top-level shape.  It is NOT JSON-Schema and MUST NOT grow
+   into one (Section 3.2 makes this normative): conditional logic,
+   references, pattern properties, and regular expressions are
+   excluded by design, which also keeps validation cost linear and
+   free of pathological inputs.  Schemas are registered per document
+   (PUT /v1/crdt/json/schema), are replicated configuration state, and
+   an absent schema means today's behavior (accept anything).  The
+   feature is negotiated by a new capability string, "crdtjson-schema".
+   None of this changes the wire version "acp/1"; a daemon that does
+   not implement this extension answers the schema endpoints 404,
+   skips validation, and interoperates unchanged.
+
+Status of This Memo
+
+   This is a PROPOSAL, not yet part of the normative ACP/1
+   specification (rfc/acp-1.txt).  It is published for review by
+   implementers and for the protocol owner's approval.  The extension
+   number EXT-12 is PROVISIONAL; the protocol owner assigns final
+   numbers on acceptance.  It builds on ACP/EXT-5 (structured CRDT),
+   which is ACCEPTED and IMPLEMENTED; this proposal is NOT implemented.
+   If accepted, its endpoints and types fold into a future "acp/1.1"
+   capability set; the base protocol version string remains "acp/1"
+   and the feature is advertised via Section 5.  Distribution is
+   unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Per-Document Schemas
+   5.  Capability Negotiation and Backward Compatibility
+   6.  Wire API Additions
+   7.  Determinism and High Availability
+   8.  Security Considerations
+   9.  Rollout Plan
+   10. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/EXT-5 gives a space convergent structured documents whose
+   materialized value is arbitrary JSON.  Structural validity (paths
+   resolve, containers are containers) is enforced at canonicalization
+   time; SEMANTIC validity -- "is this a well-formed node of the
+   application's type system" -- is not the CRDT's business, and EXT-5
+   rightly says nothing about it.  Three concrete problems motivate
+   this extension:
+
+   1.1.  Typed documents, untyped substrate.
+
+      The flagship EXT-5 consumer is a typed node graph: a board
+      document whose /nodes/* entries each carry a "type" from a small
+      catalog (stat, table, chart, section, form, ...), each kind with
+      required properties.  A write of
+      { "type": "stat" } with no label and no binding is structurally
+      fine and semantically broken.  Nothing at the protocol edge can
+      reject it today.
+
+   1.2.  Corruption is discovered at render time, far from the fault.
+
+      Because the CRDT MERGES whatever it is given, a malformed node
+      lands durably, replicates everywhere, and is discovered only
+      when some reader materializes and renders it -- with no
+      indication of which writer broke it or when.  Fail-fast at the
+      write (the one place with the writer's identity, the failing op,
+      and the option to refuse) is strictly better diagnostics.
+
+   1.3.  Every consumer re-validates, none can enforce.
+
+      Consumers validate in their own engines today, but engine-side
+      validation cannot stop a DIFFERENT (buggy, older, or hostile)
+      writer sharing the document from committing junk.  Only the
+      authority sits on the single write path where enforcement is
+      universal.
+
+   The remedy is bounded: an OPTIONAL per-document schema, thin enough
+   to be validated in one linear pass over the materialized value,
+   registered through the protocol, replicated like other per-space
+   configuration, and enforced at the write with a precise 422.
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in
+   this document are to be interpreted as described in BCP 14
+   [RFC2119] [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, and space definitions of ACP/1, and the structured-CRDT
+   definitions of ACP/EXT-5 (document, op, materialization, epoch)
+   without restating them.  "EXT-5 Section N" points into
+   acp-ext-5-structured-crdt.txt.
+
+   SCHEMA:  The per-document validation configuration of Section 4.1:
+      a node-type catalog plus an optional root shape.
+
+   NODE-TYPE CATALOG:  The map from a KIND name to its field rules
+      (required/optional field names and their primitive types).
+
+   DISCRIMINATOR:  The field whose string value names an object's
+      kind (default "type").  An object carrying the discriminator is
+      a TYPED NODE and is validated against the catalog; an object
+      without it is untyped and unconstrained by the catalog.
+
+   CANDIDATE MATERIALIZATION:  The document's materialized JSON value
+      as it WOULD stand after applying a proposed op group -- the
+      value validation judges.
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Validate the RESULT, not the ops.
+
+      An EXT-5 push may touch a document through paths, container
+      literals, or partial updates; the same semantic damage can be
+      done by many different op shapes.  Validation therefore judges
+      the CANDIDATE MATERIALIZATION -- the document after the ops --
+      never the ops themselves.  A push that transiently passes
+      through invalid shapes but RESULTS in a valid document is valid;
+      a push whose result is invalid is rejected whole (Section 4.4).
+
+   3.2.  Thin by construction (normative anti-goal).
+
+      The schema grammar is CLOSED: exactly the constructs of
+      Section 4.1, nothing else.  Implementations MUST reject schemas
+      containing unknown constructs rather than ignore them, and
+      future revisions of this extension MUST NOT add conditionals,
+      cross-field references, pattern-matched property names, regular
+      expressions, or recursive schema composition.  A deployment that
+      needs full JSON-Schema semantics should validate in its own
+      engine; the protocol's job is the cheap, universal, last-line
+      check.  This line is drawn on purpose: a schema ENGINE inside
+      the coordination authority is scope creep with an unbounded
+      maintenance and attack surface, and the thin catalog covers the
+      motivating class (typed node graphs) completely.
+
+   3.3.  Opt-in per document; absent means today.
+
+      A document with no registered schema behaves exactly as EXT-5
+      today: everything structurally valid is accepted.  Schema
+      registration is itself a write, audited and reversible.
+
+   3.4.  Additive and negotiated, never breaking.
+
+      Two NEW endpoints (PUT/GET schema) and one new refusal (422) on
+      the EXISTING push path -- only for documents that opted in.  A
+      daemon without this extension 404s the schema endpoints and
+      validates nothing; clients discover support via the capability
+      list (Section 5).  The wire version stays "acp/1".
+
+   3.5.  Non-goals.
+
+      This extension does NOT add: JSON-Schema (any draft) or a
+      general constraint language (Section 3.2); access control
+      (schemas constrain SHAPE, not WHO -- EXT-7 scopes do that);
+      validation for the TEXT CRDT (prose has no schema); cross-
+      document constraints; schema versioning/migration tooling
+      (Section 10); or server-side coercion/defaulting (the authority
+      never rewrites a writer's values to fit the schema).
+
+4.  Per-Document Schemas
+
+   4.1.  The schema grammar (complete).
+
+      Schema = {
+        "discriminator": <string>?,        ; default "type"
+        "nodes": {                         ; the node-type catalog
+          <kind>: {
+            "required": { <field>: Type, ... }?,
+            "optional": { <field>: Type, ... }?,
+            "closed":   <bool>?            ; default false
+          }, ...
+        }?,
+        "root": {                          ; optional top-level shape
+          "required": { <key>: Type, ... }?,
+          "optional": { <key>: Type, ... }?,
+          "closed":   <bool>?
+        }?
+      }
+
+      Type = "string" | "number" | "bool" | "object" | "array"
+           | "null" | "any"
+
+      That is the WHOLE grammar (Section 3.2).  Limits: a daemon MUST
+      bound the schema (RECOMMENDED: at most 256 kinds, 256 fields per
+      kind, 64 KiB encoded) and MUST reject an over-limit or unknown-
+      construct schema with 400.
+
+   4.2.  Validation semantics.
+
+      Given a candidate materialization and a schema, validation
+      walks the JSON value once:
+
+      o  ROOT: if "root" is present, the top-level object MUST contain
+         every required key with a value of the declared Type; keys in
+         neither required nor optional are violations iff "closed" is
+         true.
+
+      o  TYPED NODES: every object ANYWHERE in the document (any
+         depth, including inside arrays) whose discriminator field is
+         present with a string value is validated against the catalog:
+         its kind MUST exist in "nodes"; every required field MUST be
+         present with the declared Type; fields in neither map are
+         violations iff that kind is "closed".  Objects WITHOUT the
+         discriminator are not judged by the catalog.
+
+      o  TYPES: "number" accepts any JSON number, "bool" a JSON
+         boolean, "object"/"array" the respective containers, "null"
+         only null, "any" anything.  No format, range, length, or
+         pattern constraints exist (Section 3.2).
+
+      Validation is a PURE function of (candidate materialization,
+      schema): no clock, randomness, external lookup, or request
+      context participates (Section 7).
+
+   4.3.  Registering a schema: PUT /v1/crdt/json/schema.
+
+      Request body:
+
+         { "doc": <string>, "schema": Schema | null }
+
+      Registers (or with null, REMOVES) the schema for one document.
+      Requires role "writer" or above; a daemon MAY restrict it to
+      "admin".  The registration MUST be validated against the grammar
+      and limits of Section 4.1 (400 on failure) and MUST be recorded
+      as an audited event on the space's log (Section 8.3).
+
+      Registering a schema does NOT retro-validate the existing
+      document: an already-invalid document stays readable (readers
+      are never blocked by a schema), and the next WRITE to it is
+      judged against the schema like any other -- a push that leaves
+      pre-existing violations in place but does not introduce new
+      ones will fail only if the resulting materialization is invalid;
+      operators SHOULD therefore register schemas early or clean up
+      first (Section 10).
+
+      GET /v1/crdt/json/schema?doc=<name> returns
+      { "doc", "schema" | null }.
+
+   4.4.  Enforcement on write.
+
+      On POST /v1/crdt/json/ops for a document with a registered
+      schema, the authority MUST, after canonicalizing the push
+      (EXT-5 Section 5.4) and BEFORE committing it: compute the
+      candidate materialization (the document plus this op group),
+      validate it per Section 4.2, and
+
+         o  on success, commit the group exactly as EXT-5 specifies;
+
+         o  on violation, reject the ENTIRE push with 422, commit
+            NOTHING (the op group never enters the replicated log),
+            and name the violation precisely in the body:
+
+            { "error": "schema violation",
+              "doc": <string>,
+              "violations": [
+                { "path": <json-pointer>, "kind": <string>?,
+                  "rule": <string> }, ... ] }
+
+            e.g. { "path": "/nodes/n7", "kind": "stat",
+                   "rule": "missing required field \"bind\"" }.
+
+      Rejection is all-or-nothing per push; there is no partial
+      accept.  Undo/redo compensating groups (EXT-11), if that
+      extension is present, are validated by the same rule.
+      Compaction snapshots (EXT-5 Section 5.8) re-encode EXISTING
+      state and MUST NOT be schema-checked (they cannot fail: they
+      reproduce the same materialization).
+
+   4.5.  Cost bounds.
+
+      Materialize-and-validate is O(document) per write.  A daemon
+      SHOULD bound the size of schema-validated documents (or the
+      validation time) and MAY advertise the bound (Section 5);
+      validating only the touched subtree is a permitted optimization
+      PROVIDED it is semantically identical to whole-document
+      validation (with the closed/required rules of Section 4.2 this
+      holds when the untouched remainder was already valid).
+
+   4.6.  Backward compatibility.
+
+      A daemon that does not implement this extension answers the
+      schema endpoints 404 and enforces nothing.  A client MUST NOT
+      assume a registered schema is enforced without seeing the
+      "crdtjson-schema" capability (Section 5) -- like every ACP
+      guard, an un-advertised validator is absent, and the writer-side
+      engine remains responsible.  EXT-5 peers that know nothing of
+      schemas are unaffected: their pushes to un-schema'd documents
+      behave exactly as today, and their pushes to schema'd documents
+      simply risk 422 like anyone else's.
+
+5.  Capability Negotiation and Backward Compatibility
+
+   This extension adds a capability string to the ACP/1 introspection
+   endpoints, per the shared convention of EXT-1 Section 7:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain:
+
+         "protocol": "acp/1",
+         "capabilities": [ "crdtjson-schema", ... ]
+
+      A daemon advertising "crdtjson-schema" MUST also advertise
+      "crdtjson" (EXT-5) and SHOULD advertise its bounds:
+
+         "limits": { "crdtjson_schema_max_bytes": 65536,
+                     "crdtjson_schema_max_kinds": 256 }
+
+   A daemon MUST advertise "crdtjson-schema" only when it implements
+   all of Section 4 (grammar validation, replicated registration,
+   result-validation with 422, the audited event).  A client MUST
+   treat the ABSENCE of the capability as "not enforced"
+   (Section 4.6).
+
+6.  Wire API Additions
+
+   Summary (full detail in Section 4; types in Appendix A):
+
+      New:
+         PUT /v1/crdt/json/schema        ; register/replace/remove
+         GET /v1/crdt/json/schema?doc=X  ; read back
+
+      Modified:
+         POST /v1/crdt/json/ops          ; MAY now fail 422 (schema'd
+                                           docs only; otherwise
+                                           unchanged)
+         GET /v1/healthz, /v1/stats      + "crdtjson-schema"
+                                           capability, OPTIONAL limits
+
+   All endpoints follow ACP/1 Section 6 conventions: JSON bodies, the
+   standard headers, bearer auth, and the standard error model
+   (Appendix B of ACP/1 plus Appendix B here).  Idempotency-Key on
+   PUT schema SHOULD be honored per ACP/1 Section 6.4.
+
+7.  Determinism and High Availability
+
+   ACP/1 Section 17 requires the replicated state machine to be
+   deterministic.  This extension preserves that:
+
+      o  Schema CONFIGURATION is REPLICATED FSM STATE: a schema
+         registration/removal is proposed as a command through the
+         consensus log (the same pattern as replicated quota
+         configuration, EXT-7 Section 9 as accepted), applied on every
+         replica, and carried by snapshots.  Enforcement therefore
+         always reads replica-identical configuration -- never a
+         node-local file, which would diverge accept/reject decisions
+         across nodes.
+
+      o  VALIDATION is a pure function of (candidate materialization,
+         schema) -- both replicated state -- with no clock or
+         randomness (Section 4.2).  It runs on the LEADER, pre-
+         propose, in the same position as EXT-5 canonicalization: a
+         rejected push never enters the log, so followers never see
+         it, and an accepted push is applied by followers WITHOUT
+         re-validation (the leader's accept decision is implicit in
+         the committed command).  Re-validating on followers would be
+         harmless by purity but is not required.
+
+      o  Ordering: because registration is a command in the same total
+         order as op pushes, "which schema was in force for this push"
+         is well-defined and identical on every replica -- a push
+         committed before a schema registration is never
+         retro-judged.
+
+      o  Failover: a new leader reads the same replicated schema
+         state; validation behavior is unchanged across elections.
+
+8.  Security Considerations
+
+   8.1.  Schemas are integrity, not access control.
+
+      A schema constrains WHAT SHAPE the document may take, not WHO
+      may write it.  It grants no read or write rights, and a
+      conforming write from any authorized token is accepted.  Scoped
+      tokens (EXT-7) and roles (ACP/1 Section 5.3) remain the access-
+      control mechanisms; the two compose (a write must pass BOTH).
+
+   8.2.  Denial of service by misconfiguration.
+
+      A wrong schema's worst case is rejecting legitimate writes --
+      the document becomes read-only-in-practice until the schema is
+      corrected.  Mitigations are mandatory: registration is
+      privileged (Section 4.3), AUDITED as an event on the log
+      (Section 8.3), and REVERSIBLE (PUT with null).  A daemon SHOULD
+      surface schema-rejection counts in /v1/stats so a
+      misconfiguration is visible.
+
+   8.3.  Auditability.
+
+      Every schema registration/removal MUST append an event (e.g.
+      action "crdtjson.schema.set" with the doc name and actor) to the
+      space's event log, so the configuration history of a document is
+      replayable and attributable exactly like its content history.
+
+   8.4.  Bounded validation (no pathological inputs).
+
+      The thin grammar admits NO regular expressions, no references,
+      and no recursion, so validation has no catastrophic-backtracking
+      or billion-laughs analogue; cost is linear in document size plus
+      schema size, both of which are bounded (Sections 4.1, 4.5).
+      This is a deliberate security property of the grammar choice,
+      not an implementation nicety.
+
+   8.5.  Error-body content.
+
+      422 bodies echo document paths, kind names, and field names --
+      all writer-supplied data.  Consumers MUST treat them as opaque
+      data, not markup; daemons MUST bound the number of violations
+      reported per response (RECOMMENDED 32).
+
+9.  Rollout Plan
+
+   This is a single, self-contained feature and ships as one phase:
+
+      Phase 1 -- "crdtjson-schema".  The grammar validator; the
+         replicated schema store keyed by document (registration
+         command + snapshot carriage); PUT/GET endpoints with the
+         audited event; result-validation on the push path with the
+         422 body; stats counters; the capability and limits.
+
+   The phase is additive and reversible: dropping the capability (or
+   removing a schema) returns a document to EXT-5's accept-anything
+   behavior without touching its content.  Sequencing note: if the
+   undo proposal (EXT-11) is also adopted, the two SHOULD land
+   co-designed so compensating groups are validated (EXT-11
+   Section 8.4) from day one.
+
+10. Open Questions
+
+   o  Migration: a workflow for evolving a schema when the document
+      already violates the new version (a dry-run validation endpoint?
+      a "validate now, report, don't enforce" warn-only mode?).
+      Warn-only enforcement is attractive but doubles the semantics;
+      deferred.
+
+   o  Touched-subtree validation as a NORMATIVE fast path (Section 4.5
+      permits it as an optimization) for very large documents, or a
+      per-document size cap instead.
+
+   o  Whether the catalog should support kind INHERITANCE ("form
+      extends section") -- deliberately excluded for now as the first
+      step down the schema-engine slope (Section 3.2).
+
+   o  Per-ARRAY element-type constraints (e.g. "children is an array
+      of typed nodes only").  The current grammar types the field as
+      "array" and relies on the members' own discriminators; whether
+      that is enough in practice is open.
+
+   o  Whether schema registration should be admin-only everywhere
+      (Section 4.3 leaves writer-vs-admin to the daemon).
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   Schema (new -- Section 4.1; the grammar is CLOSED):
+      { "discriminator": <string>?,           ; default "type"
+        "nodes": { <kind>: NodeRule, ... }?,
+        "root":  NodeRule? }
+
+   NodeRule (new):
+      { "required": { <field>: Type, ... }?,
+        "optional": { <field>: Type, ... }?,
+        "closed":   <bool>? }                 ; default false
+
+   Type (new -- a string enum):
+      "string" | "number" | "bool" | "object" | "array" | "null"
+      | "any"
+
+   SchemaPut (new -- PUT /v1/crdt/json/schema body):
+      { "doc": <string>, "schema": Schema | null }   ; null removes
+
+   SchemaGet (new -- GET response):
+      { "doc": <string>, "schema": Schema | null }
+
+   SchemaViolation (new -- element of the 422 body's "violations"):
+      { "path": <json-pointer>, "kind": <string>?, "rule": <string> }
+
+   Health/Stats (changed -- shared "capabilities" plus OPTIONAL
+   limits):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [<string>],   ; includes "crdtjson-schema"
+        "limits": { "crdtjson_schema_max_bytes": <int>,
+                    "crdtjson_schema_max_kinds": <int> }? }
+
+   EXT-5 push/pull/doc types are UNCHANGED; the push endpoint gains
+   only the 422 refusal for schema'd documents.
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: a schema that violates the grammar or limits of
+        Section 4.1 (unknown construct, unknown Type, over-limit),
+        or a malformed PUT body.
+   401  Unauthorized: missing or invalid bearer token (ACP/1).
+   403  Forbidden: insufficient role for schema registration
+        (Section 4.3); "reader" cannot register or remove schemas.
+   404  Not found: the daemon does not implement this extension
+        (Section 4.6).
+   422  Unprocessable Content: an op push whose candidate
+        materialization violates the document's registered schema
+        (Section 4.4).  The push is NOT committed; the body lists
+        the violations.  This status is introduced to the crdtjson
+        push path by this extension.
+   429  Too Many Requests: rate budget exceeded (ACP/1 Section 5.4).
+
+   All other status codes carry the ACP/1 and EXT-5 meanings
+   (Appendix B of rfc/acp-1.txt; EXT-5 Section 9), including EXT-5's
+   409 for unresolved paths and stale epochs -- path resolution
+   failures remain 409, schema failures are 422, and the two never
+   overlap (resolution precedes validation).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Register a board schema.
+
+      PUT /v1/crdt/json/schema
+      { "doc": "boards/q3",
+        "schema": {
+          "nodes": {
+            "stat":    { "required": { "label": "string",
+                                       "bind":  "string" } },
+            "section": { "required": { "children": "array" } },
+            "chart":   { "required": { "bind": "string" },
+                         "optional": { "title": "string" },
+                         "closed": true }
+          },
+          "root": { "required": { "nodes": "object" } } } }
+      < 200 { "doc": "boards/q3", "schema": { ... } }
+
+      The space's event log gains
+      { "action":"crdtjson.schema.set", "entity":"boards/q3", ... }.
+
+   C.2.  A malformed node is refused at the source.
+
+      POST /v1/crdt/json/ops
+      { "doc": "boards/q3",
+        "ops": [ { "t":"set", "path":["nodes","n7"],
+                   "value": "{\"type\":\"stat\"}" } ] }
+      < 422
+      < { "error": "schema violation", "doc": "boards/q3",
+      <   "violations": [
+      <     { "path": "/nodes/n7", "kind": "stat",
+      <       "rule": "missing required field \"label\"" },
+      <     { "path": "/nodes/n7", "kind": "stat",
+      <       "rule": "missing required field \"bind\"" } ] }
+
+      Nothing was committed; the document and its epoch are
+      unchanged; the faulty writer learns immediately.
+
+   C.3.  A conforming write passes.
+
+      POST /v1/crdt/json/ops
+      { "doc": "boards/q3",
+        "ops": [ { "t":"set", "path":["nodes","n7"],
+                   "value": "{\"type\":\"stat\",\"label\":\"Rev\",
+                              \"bind\":\"m.rev\"}" } ] }
+      < 200 { "total": 18, "epoch": 1 }
+
+   C.4.  Untyped objects are not judged by the catalog.
+
+      A write of { "meta": { "owner": "pod-a" } } (no "type" field)
+      is accepted: the catalog constrains only discriminated nodes,
+      and "root" here requires only that "nodes" exist as an object.
+
+   C.5.  Remove the schema.
+
+      PUT /v1/crdt/json/schema  { "doc": "boards/q3", "schema": null }
+      < 200 { "doc": "boards/q3", "schema": null }
+      The document reverts to EXT-5's accept-anything behavior; the
+      removal is itself an audited event.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt), the ACP/EXT-5 structured-CRDT extension, and the
+   reference implementation distributed at
+   https://github.com/ab0t-com/acp .

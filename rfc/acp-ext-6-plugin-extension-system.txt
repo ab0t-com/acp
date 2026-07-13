@@ -1,0 +1,1165 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-6                                      ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+         ACP Extension Proposal 6: Plugin / Extension-Point System
+                            (The Meta-Extension)
+
+
+   [ Editor's note: the extension NUMBER "6" in "ACP/EXT-6" is
+     PROVISIONAL.  The protocol owner assigns the final ACP/EXT number
+     on acceptance; until then treat the number as a placeholder. ]
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: a PLUGIN / EXTENSION-POINT SYSTEM -- a
+   single, stable, security-first contract by which an operator can add
+   capabilities to a coordd deployment WITHOUT authoring a new formal
+   ACP/EXT RFC and forking the reference implementation for every
+   feature.  It is, deliberately, a META-EXTENSION: the one extension
+   whose job is to make most future extensions unnecessary as protocol
+   changes.
+
+   Today ACP has NO plugin system.  Every capability addition -- see
+   the sibling proposals ACP/EXT-1 (channels/groups/pub-sub) through
+   ACP/EXT-5 (structured CRDT) -- requires an RFC, the protocol owner's
+   approval, and a fork of the Go reference daemon.  That is correct
+   for changes to WIRE-CORE semantics, but it is far too heavy for the
+   long tail of deployment-local needs: a webhook bridge, a domain
+   validator on the write path, a custom mailbox message type, a
+   project-specific read endpoint.  Consumers need BOUNDED, SAFE local
+   extensibility.
+
+   This extension defines that boundary.  A plugin is an OUT-OF-PROCESS
+   principal that the operator explicitly allowlists.  It claims a
+   NAMESPACE and declares the EXTENSION POINTS it serves -- namespaced
+   endpoints under /v1/x/{ns}/..., namespaced event actions and
+   channels (reusing ACP/EXT-1 channels), OPTIONAL pre-append /
+   pre-commit VALIDATION hooks, custom mailbox message types, and
+   custom document/blob namespaces.  coordd ROUTES or PROXIES to the
+   plugin; the plugin acts under its OWN token and role (ACP/1
+   Section 5) and can bypass nothing -- not auth, not roles, not
+   leases, not rate limits, not space isolation.  A plugin call that
+   fails or times out fails CLOSED.  Every plugin action appears in the
+   event log with the plugin as actor.
+
+   None of this changes the wire version "acp/1": /v1/x/{ns}/... is a
+   NEW reserved path prefix, capabilities are advertised via ACP/EXT-1
+   Section 7 (/v1/healthz, /v1/stats), and a daemon without this
+   extension returns 404 for the prefix so a client detects absence and
+   falls back.  Plugins are OFF by default and never auto-load.
+
+Status of This Memo
+
+   This is a PROPOSAL, not yet part of the normative ACP/1
+   specification (rfc/acp-1.txt).  It is published for review by
+   implementers and for the protocol owner's approval.  If accepted,
+   its endpoints and types fold into a future "acp/1.1" capability set;
+   the base protocol version string remains "acp/1" and the feature is
+   advertised via the capability list (Section 8).  Distribution is
+   unlimited.
+
+   This proposal carries a load-bearing tension it does not hide: a
+   plugin doing I/O is exactly the kind of code the ACP THREAT_MODEL
+   keeps OUT of the coordination authority, and I/O inside the Raft
+   state machine breaks the determinism ACP/1 Section 17 requires.
+   Section 10 (Determinism and High Availability) confronts this
+   directly and constrains where plugin effects may touch replicated
+   state; Section 13 (Open Questions) records the tradeoffs that remain
+   genuinely open.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Plugin Registration Model
+   5.  Extension Points
+   6.  Sandbox and Isolation Model
+   7.  Audit and the Event Log
+   8.  Capability Negotiation and Backward Compatibility
+   9.  Wire API Additions
+   10. Determinism and High Availability
+   11. Security Considerations
+   12. Rollout Plan
+   13. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Example
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/1 is a fixed, closed surface: a client speaks exactly the
+   endpoints of ACP/1 Section 16, and the authority implements exactly
+   those.  This is a strength -- the wire is small, auditable, and
+   deterministic (ACP/1 Section 17) -- and it is why the protocol can
+   make hard guarantees about ordering, leases, and isolation.  But it
+   means the ONLY way to add a capability is to change the reference
+   implementation.  ACP has no plugin system today.
+
+   The sibling extension proposals demonstrate the cost.  Each of
+   ACP/EXT-1 through ACP/EXT-5 is a self-contained RFC that (a) argues
+   a motivation, (b) specifies new endpoints and types, (c) requires
+   the protocol owner's approval, and (d) requires a fork of the Go
+   daemon to implement.  For genuine wire-core evolution -- new CRDT
+   semantics, a task-board claim protocol -- that ceremony is correct
+   and this proposal does NOT seek to replace it.  The problem is the
+   LONG TAIL of deployment-local needs that will never justify a formal
+   RFC yet recur constantly.  Four concrete problems motivate this
+   extension:
+
+   1.1.  Every addition is an RFC plus an owner sign-off plus a fork.
+
+      A single operator who wants coordd to, say, POST a webhook when a
+      "deploy.done" event lands, or to reject any commit that fails a
+      house lint rule, has no in-protocol way to do it.  The only
+      options are to fork the daemon (now they maintain a divergent
+      authority forever) or to run an out-of-band sidecar that polls
+      the event log (ACP/1 Section 8.3) and re-implements auth, spaces,
+      and idempotency itself.  Both are worse than a defined seam.
+
+   1.2.  No namespaced surface for consumer endpoints.
+
+      ACP/1 Section 16 enumerates every path under /v1.  A consumer has
+      nowhere to expose a deployment-specific read or action without
+      colliding with -- or being mistaken for -- core protocol.  There
+      is no reserved, clearly non-core prefix that clients can discover
+      and that a core-only daemon safely rejects with 404.
+
+   1.3.  No write-path validation seam.
+
+      ACP/1's write endpoints (POST /v1/events Section 8.2, POST
+      /v1/mail Section 9.1, POST /v1/commit Section 11.3) apply a fixed
+      set of checks (path validation Section 11.4, CAS, leases
+      Section 10.5).  An operator who needs a DOMAIN rule -- "no commit
+      may add a file over 1 MiB", "every 'invoice.posted' event MUST
+      carry a positive amount" -- must fork to insert it.  There is no
+      hook to say "before you append/commit this, ask my validator".
+
+   1.4.  No safe place for third-party code.
+
+      The obvious "plugin" implementation -- load a native .so into the
+      daemon and call it in-process -- is precisely the hazard the ACP
+      THREAT_MODEL is built to exclude.  The threat model assumes "the
+      daemon host and its disk are trusted; operators are trusted", and
+      that agents are "cooperative but each authenticated separately".
+      Running arbitrary third-party native code INSIDE the coordination
+      authority collapses that boundary: such code shares the process
+      that holds the bearer tokens, the TLS private key, every space's
+      plaintext state (THREAT_MODEL Assets), and -- fatally for a
+      cluster -- the deterministic Raft state machine (ACP/1
+      Section 17).  A crash, a memory-safety bug, or a single time or
+      network call in that code corrupts or de-syncs the authority.
+
+   Together these gaps mean consumers must either fork the authority or
+   route around it, and any naive plugin design imports unbounded risk
+   into the one component that must stay small and trustworthy.  This
+   extension closes the gap with the smallest additive surface that
+   preserves ACP/1's invariants: it defines a plugin as an
+   out-of-process, separately-authenticated principal reached through a
+   reserved namespaced prefix, opted in by the operator, able to bypass
+   nothing, and kept out of the deterministic FSM.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174] when, and only when, they appear in all capitals.
+
+   This document uses the architecture, transport, authentication,
+   role, space, event, mailbox, lease, blob, manifest, document,
+   determinism, and versioning definitions of ACP/1 without restating
+   them; section references of the form "ACP/1 Section N" point into
+   rfc/acp-1.txt.  It reuses the CHANNEL and capability-list concepts
+   of ACP/EXT-1 (rfc/acp-ext-1-channels-groups-pubsub.txt) and cites
+   the ACP THREAT_MODEL (acp/docs/THREAT_MODEL.md).
+
+   PLUGIN:  An OUT-OF-PROCESS network service, distinct from coordd,
+      that serves one or more EXTENSION POINTS under a single
+      NAMESPACE.  A plugin is an ACP principal in its own right: it
+      holds its own bearer token and role (ACP/1 Section 5).  A plugin
+      is NOT part of coordd and NOT part of the Raft state machine.
+
+   NAMESPACE (ns):  A short opaque label, matching
+      [a-z0-9][a-z0-9_-]{0,31}, that a plugin claims exclusively within
+      a deployment.  It scopes
+      the plugin's endpoints (/v1/x/{ns}/...), its capability string
+      ("x.{ns}"), and, by convention, its event actions and channels.
+
+   EXTENSION POINT:  A defined seam at which coordd will route or
+      proxy to a registered plugin: a namespaced endpoint, an event
+      action/channel prefix, a validation hook, a custom mailbox
+      message type, or a custom document/blob namespace (Section 5).
+
+   PROXY ROUTE:  An extension point of the form /v1/x/{ns}/... where
+      coordd forwards an authenticated client request to the plugin and
+      relays the plugin's response.
+
+   VALIDATION HOOK:  An extension point where, on a core write (append,
+      mail, or commit), coordd calls the plugin SYNCHRONOUSLY to obtain
+      an allow/deny verdict BEFORE the write is committed (Section 5.3).
+
+   PLUGIN MANIFEST:  The operator-supplied allowlist entry describing a
+      plugin: its namespace, endpoint URL, token/role, the extension
+      points it is permitted to serve, its resource and time limits,
+      and its space scope (Section 4, Appendix A).
+
+   FAIL CLOSED:  The rule that if a plugin required for an operation is
+      unreachable, errors, or exceeds its deadline, coordd MUST reject
+      the operation (deny) rather than proceed as if the plugin
+      allowed it (Section 6.6).
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Security first: out-of-process by default.
+
+      A plugin runs as a SEPARATE process, reached over the network (or
+      a local socket), authenticated as its own ACP principal.  It does
+      NOT share coordd's address space, its tokens, its TLS key, or its
+      on-disk state.  This is the central choice of this proposal, and
+      it follows directly from the THREAT_MODEL: the coordination
+      authority must remain a small, trusted core, and third-party code
+      must live OUTSIDE it.  In-process native (.so) plugins are a
+      Non-Goal (Section 3.7); an in-process WASM sandbox is left as an
+      Open Question (Section 13.1), not specified here.
+
+   3.2.  Additive, negotiated, never breaking.
+
+      Every addition is a NEW reserved path prefix (/v1/x/{ns}/...), a
+      NEW capability string, or an OPTIONAL manifest-driven behavior.
+      A daemon without this extension returns 404 for /v1/x/... and
+      advertises no plugin capabilities; a client detects absence via
+      the capability list (Section 8) and does not use the feature.
+      The protocol version string stays "acp/1".
+
+   3.3.  Operator opt-in, never auto-load.
+
+      No plugin runs unless the operator has explicitly listed it in
+      configuration (an allowlist).  coordd MUST NOT discover, download,
+      or auto-load plugins.  There is no plugin marketplace, no dynamic
+      registration by an unauthenticated party, and no way for a client
+      to install a plugin over the wire.  Registration is a privileged,
+      operator-only or admin-only act (Section 4).
+
+   3.4.  A plugin bypasses nothing.
+
+      A plugin is subject to EVERY constraint an ordinary agent is
+      subject to: bearer-token auth (ACP/1 Section 5.1), role checks
+      (Section 5.3), space isolation (ACP/1 Section 7), leases
+      (ACP/1 Section 10), CAS commits (ACP/1 Section 11.3), rate
+      limits (ACP/1 Section 5.4), and path validation (ACP/1
+      Section 11.4).  A plugin cannot read a space it was not granted,
+      cannot write past a lease it does not hold, and cannot act as any
+      identity but its own.  The plugin seam is a way to ADD behavior,
+      never a way to REMOVE a safety check.
+
+   3.5.  The core stays deterministic.
+
+      Plugin effects on REPLICATED (Raft) state MUST be deterministic,
+      leader-stamped, or kept OUT of the state machine entirely
+      (Section 10).  Plugins act as validators, proxies, and clients --
+      not as participants in the FSM.  No plugin I/O ever runs inside
+      command application.
+
+   3.6.  Reuse existing shapes.
+
+      Plugin-emitted events are ordinary events (ACP/1 Section 8) with
+      the plugin as actor; plugin channels are ACP/EXT-1 channels;
+      plugin capabilities ride the ACP/EXT-1 capability list; plugin
+      mail is ordinary mail (ACP/1 Section 9) with a namespaced "type".
+      Nothing here invents a second event log, mailbox, or auth scheme.
+
+   3.7.  Non-goals.
+
+      This extension does NOT:
+
+         o  provide any means to bypass auth, roles, leases, CAS,
+            rate limits, or space isolation (Section 3.4);
+         o  permit mutation of WIRE-CORE semantics -- a plugin MUST NOT
+            redefine /v1/events, /v1/commit, seq assignment, lease
+            fencing, or the CRDT rules; it may only ADD under /v1/x/
+            and OBSERVE/VALIDATE core writes via hooks;
+         o  load arbitrary in-process native code into coordd;
+         o  make plugins participants in the Raft state machine;
+         o  define cross-space or cross-authority plugin federation;
+         o  specify the plugin's internal language, runtime, or
+            packaging -- only the ABI (HTTP contract) between coordd
+            and the plugin.
+
+
+4.  Plugin Registration Model
+
+   4.1.  The plugin manifest (operator allowlist).
+
+      A plugin exists to coordd only if the operator has placed a
+      PLUGIN MANIFEST in the daemon's configuration (a file, a config
+      section, or admin API of Section 4.4).  The manifest is the
+      allowlist entry; there is no other way to enable a plugin
+      (Section 3.3).  A manifest carries at least (full type in
+      Appendix A):
+
+         { "namespace": "<ns>",
+           "endpoint": "https://host:port",  ; where coordd reaches it
+           "token_ref": "<opaque>",          ; plugin's ACP credential
+           "points": [ <ExtensionPointDecl> ],  ; what it may serve
+           "spaces": ["*"] | ["projX", ...], ; space scope grant
+           "limits": { "timeout_ms": 800,
+                       "max_body": 1048576,
+                       "rate_per_sec": 50 },
+           "enabled": true }
+
+      The "namespace" MUST be unique across the deployment; two
+      manifests claiming the same namespace is a configuration error
+      that coordd MUST reject at load.  "token_ref" identifies the
+      plugin's OWN bearer token/role (Section 6.1); it is a reference
+      to operator-managed credential material, never the token literal
+      in a client-visible response.
+
+   4.2.  What a plugin declares.
+
+      Each entry in "points" declares one extension point the plugin
+      offers and coordd is permitted to route to it (Section 5).  A
+      plugin declaring a point it is not allowlisted for is a no-op:
+      coordd only ever routes points named in the manifest.  The
+      declaration binds a point KIND (endpoint, event, channel,
+      validate-append, validate-commit, mailtype, docns, blobns) to the
+      concrete name/prefix it governs, all of which MUST fall within
+      the plugin's namespace (Section 5.6).
+
+   4.3.  Routing and proxying.
+
+      Once loaded and enabled, coordd:
+
+         o  routes any request to /v1/x/{ns}/... to the plugin's
+            endpoint (Section 5.1);
+         o  invokes the plugin's declared VALIDATION hooks on the
+            corresponding core writes (Section 5.3);
+         o  advertises the plugin's capability strings (Section 8).
+
+      coordd is the ONLY caller of the plugin's routed surface from the
+      wire's perspective: clients never address the plugin's endpoint
+      directly (they SHOULD NOT be able to reach it), preserving one
+      logical authority endpoint (ACP/1 Section 3).
+
+   4.4.  Lifecycle: register, health, disable.
+
+      Registration is operator/admin only:
+
+         GET    /v1/plugins                 -> [PluginInfo]   (any auth)
+         GET    /v1/plugins/{ns}            -> PluginInfo     (any auth)
+         POST   /v1/admin/plugins {manifest}-> PluginInfo     (admin)
+         POST   /v1/admin/plugins/{ns}/enable   {enabled:bool}(admin)
+         DELETE /v1/admin/plugins/{ns}      -> 204            (admin)
+
+      GET /v1/plugins is a DISCOVERY surface (redacted: it MUST NOT
+      expose token material) so clients can learn which namespaces and
+      points are live.  The POST/DELETE admin endpoints let an operator
+      manage the allowlist at runtime WITHOUT restarting coordd; they
+      are OPTIONAL (an operator MAY manage plugins purely by config
+      file + reload).  All /v1/admin/plugins/* operations REQUIRE the
+      admin role (ACP/1 Section 5.3, Section 15).
+
+   4.5.  Health and readiness.
+
+      coordd SHOULD probe each enabled plugin's health (a plugin MUST
+      expose GET {endpoint}/healthz returning 200) and reflect it in
+      PluginInfo.status ("ready" | "unreachable" | "disabled").  A
+      plugin that is unreachable is treated per the FAIL CLOSED rule
+      (Section 6.6) for any operation that depends on it; its proxy
+      routes return 502/504 and its validation hooks deny.
+
+
+5.  Extension Points
+
+   Five kinds of extension point are defined.  All are OPTIONAL per
+   plugin; a plugin declares only the ones it serves.
+
+   5.1.  Namespaced custom endpoints (proxy routes).
+
+      coordd reserves the path prefix /v1/x/{ns}/ for plugins.  A
+      client request to /v1/x/{ns}/<subpath> is:
+
+         1. authenticated and rate-limited by coordd as usual (ACP/1
+            Sections 5, 5.4) -- the CLIENT's identity, not the
+            plugin's;
+         2. checked against the plugin manifest: {ns} MUST be a loaded,
+            enabled plugin whose "points" include an "endpoint" point
+            matching <subpath>, else 404;
+         3. checked against the plugin's space scope: the request's
+            X-ACP-Space MUST be in the plugin's "spaces" grant, else
+            403;
+         4. forwarded to the plugin endpoint with a signed CALL CONTEXT
+            (Section 6.3) identifying the calling agent, space, and
+            role;
+         5. relayed back to the client (status, headers within an
+            allowlist, body), subject to the plugin's response
+            size/time limits (Section 6.5).
+
+      The plugin MAY, in servicing the call, act back on coordd as a
+      normal client under its OWN token (Section 6.1) -- e.g., append
+      an event or read a blob -- and those actions are audited as the
+      plugin (Section 7).  The reserved /v1/x/ prefix cannot collide
+      with any current or future CORE path, because CORE paths never
+      begin with x/ (this is the one path-space reservation this
+      proposal asks of ACP/1).
+
+   5.2.  Custom event actions and channels.
+
+      A plugin MAY emit events whose "action" is namespaced
+      "x.{ns}.<verb>" (e.g., "x.ci.deploy.done") and MAY publish them
+      on an ACP/EXT-1 CHANNEL named "x.{ns}" or "x.{ns}.<topic>".
+      These are ORDINARY events on the single per-space log (ACP/1
+      Section 8; ACP/EXT-1 Section 3.1): they carry a space-global seq,
+      preserve total order, and are read/streamed/filtered exactly like
+      any other event.  The namespacing is a convention that keeps
+      plugin traffic discoverable and collision-free; it grants no new
+      powers.  A plugin declaring an "event" or "channel" point signals
+      intent for discovery only -- it does not reserve the action
+      string against other actors (channels are not access control,
+      ACP/EXT-1 Section 3.3).
+
+   5.3.  Pre-append and pre-commit validation hooks.
+
+      This is the write-path seam (Problem 1.3).  A plugin MAY declare
+      "validate-append" and/or "validate-commit" points.  When such a
+      point is active for a space, coordd, on the corresponding core
+      write, calls the plugin SYNCHRONOUSLY before durably committing:
+
+         validate-append : before POST /v1/events is assigned a seq
+                           and persisted (ACP/1 Section 8.2).
+         validate-commit : before POST /v1/commit applies its CAS
+                           (ACP/1 Section 11.3), AFTER path validation
+                           and lease checks (so the plugin never sees a
+                           request that core rules already reject).
+
+      coordd sends the CANDIDATE write (the proposed event, or the
+      proposed manifest changes + base_version) plus the CALL CONTEXT
+      to the plugin's hook, which returns:
+
+         { "verdict": "allow" | "deny",
+           "reason": "<string>"?,          ; shown to client on deny
+           "annotations": { ... }? }       ; OPTIONAL context to merge
+
+      On "allow", coordd proceeds with the normal core write.  On
+      "deny", coordd MUST reject the client write with 422 (Section 9,
+      Appendix B) carrying "reason", and MUST NOT persist anything.  On
+      timeout/error/unreachable, coordd MUST FAIL CLOSED -- treat it as
+      deny (Section 6.6) -- unless the manifest marks the hook
+      "advisory": true, in which case a hook failure is logged and the
+      write proceeds (an operator opt-in for non-critical hooks).
+
+      A hook MUST NOT mutate the write except through the OPTIONAL
+      "annotations" object, which coordd MAY merge into the event
+      "context" (ACP/1 Section 8.1) or the commit "note"; the seq, the
+      actor, the CAS version, and all core-assigned fields remain
+      coordd's alone.  Latency of this call sits on the write path and
+      is bounded by "timeout_ms"; see Section 13.2.
+
+   5.4.  Custom mailbox message types.
+
+      A plugin MAY declare a "mailtype" point binding a namespaced
+      message "type" value "x.{ns}.<kind>" (ACP/1 Section 9.1).
+      Messages of that type are ordinary mail -- stored, listed,
+      acked, and threaded exactly as in ACP/1 Sections 9.2-9.4 -- but
+      coordd MAY additionally NOTIFY the plugin (fire-and-forget, best
+      effort, NEVER on the delivery critical path) that a message of
+      its type was sent, so the plugin can react.  The mail is durable
+      regardless of whether the plugin is reachable; a mailtype
+      notification failure MUST NOT fail the send (this is not a
+      validation hook).
+
+   5.5.  Custom document and blob namespaces.
+
+      A plugin MAY declare "docns" / "blobns" points reserving a
+      logical NAME PREFIX for collaborative documents (ACP/1
+      Section 12) or a manifest PATH PREFIX for blobs/files (ACP/1
+      Section 11) -- e.g., docs named "x/{ns}/..." or manifest paths
+      under "x/{ns}/".  These remain ORDINARY docs/blobs under the
+      normal CRDT, CAS, and path-validation rules (ACP/1 Sections
+      11.4, 12); the prefix is a convention for discovery and for the
+      plugin to know which state is "its" to observe.  A plugin gets NO
+      privileged access to that state -- any agent with the space and
+      role may still read/write it (there are no per-path ACLs;
+      THREAT_MODEL known gaps).
+
+   5.6.  Namespace containment (normative).
+
+      Every name a plugin governs -- endpoint subpath root, event
+      action prefix, channel, mailtype, doc/blob prefix -- MUST lie
+      within its namespace: it MUST begin with "x.{ns}" (dotted forms)
+      or "x/{ns}/" (path forms).  coordd MUST reject a manifest whose
+      declared points reach outside the namespace, and MUST NOT route a
+      request to a plugin for a name outside that plugin's namespace.
+      This makes plugin surfaces mutually non-overlapping and keeps the
+      entire plugin world inside the single reserved "x" sub-tree.
+
+
+6.  Sandbox and Isolation Model
+
+   6.1.  A plugin is its own principal.
+
+      Each plugin authenticates to coordd (for its client-side actions)
+      and is authenticated BY coordd (for hook/proxy calls, Section 6.3)
+      using its OWN credential, distinct from any human agent and from
+      coordd itself.  In per-agent mode (ACP/1 Section 5.2) the plugin
+      has its own token mapped to an agent id (e.g., "plugin:{ns}") and
+      a role.  A plugin SHOULD be granted the LEAST role it needs --
+      typically "reader" for a pure validator/observer, "writer" only
+      if it must emit events or mail.  A plugin MUST NOT be granted the
+      admin role unless it genuinely administers the deployment, since
+      admin can manage other plugins (Section 4.4).
+
+   6.2.  No cross-space access unless granted.
+
+      A plugin operates only in the spaces its manifest "spaces" grant
+      lists (Section 4.1).  A proxy call or hook for a space outside the
+      grant MUST be refused (403) and never reaches the plugin.  When
+      the plugin acts back on coordd as a client, ordinary space
+      isolation (ACP/1 Section 7) applies to its own token: it can
+      touch only spaces its token's role allows.  There is no ambient
+      authority; "*" in the grant is an explicit operator decision.
+
+   6.3.  Authenticated call context (coordd -> plugin).
+
+      When coordd calls a plugin (proxy route, validation hook,
+      mailtype notify), it MUST authenticate ITSELF to the plugin (so a
+      third party cannot forge hook calls) and MUST pass a CALL CONTEXT
+      the plugin can trust:
+
+         { "ns": "<ns>", "point": "<kind>", "space": "<space>",
+           "agent": "<calling-agent-id>", "role": "<role>",
+           "request_id": "<uuid>", "deadline_ms": <int> }
+
+      coordd MUST derive "agent"/"role" from the AUTHENTICATED caller
+      (ACP/1 Section 5.2), never from client-supplied headers, so the
+      plugin sees a trustworthy identity.  Transport SHOULD be mTLS or a
+      shared secret over TLS between coordd and the plugin; over a local
+      UNIX socket, OS permissions MAY substitute.
+
+   6.4.  Cannot bypass leases, auth, roles, rate limits.
+
+      Restated as an invariant because it is the crux (Section 3.4):
+      the plugin seam adds a step, it never removes one.  Core checks
+      run in this order and none is skippable by a plugin:
+
+         auth (401) -> role (403) -> space scope (403) -> rate limit
+         (429) -> core validation incl. path/lease/CAS (400/423/409)
+         -> plugin validation hook (allow/deny -> 422) -> commit.
+
+      A deny-capable hook can only make the policy STRICTER (turn an
+      otherwise-valid write into a 422); it can never turn an invalid
+      write into a valid one, because it runs AFTER core checks and its
+      "allow" does not re-run or waive them.
+
+   6.5.  Resource and time limits.
+
+      Each manifest carries "limits" (Appendix A).  coordd MUST enforce:
+
+         o  timeout_ms -- a hard deadline on every coordd->plugin call;
+            on expiry coordd cancels and FAILS CLOSED (Section 6.6);
+         o  max_body -- a cap (MaxBytesReader-style, cf. THREAT_MODEL
+            resource-exhaustion mitigation) on both the request coordd
+            sends and the response it will read from the plugin;
+         o  rate_per_sec -- a per-plugin token bucket bounding how often
+            coordd will call it (independent of, and in addition to,
+            the CALLING agent's own rate limit).
+
+      These bound the blast radius of a slow, chatty, or oversized
+      plugin so it cannot degrade the authority for everyone else.
+
+   6.6.  Fail closed.
+
+      For any operation whose CORRECTNESS depends on a plugin -- a
+      validation hook, or a proxy route with no meaningful default --
+      if the plugin is unreachable, returns a non-2xx it does not
+      define, or exceeds its deadline, coordd MUST FAIL CLOSED: deny
+      the operation (422 for a hook; 502/504 for a proxy route) and
+      persist NOTHING.  Failing OPEN (proceeding as if the plugin
+      allowed) is permitted ONLY for a hook explicitly marked
+      "advisory": true by the operator (Section 5.3) and for
+      best-effort notifications (Section 5.4), which are not on any
+      correctness path.
+
+   6.7.  Blast-radius summary.
+
+      A misbehaving or malicious plugin can, at worst: (a) deny writes
+      in the spaces it validates (a self-inflicted availability loss
+      the operator opted into and can disable in one admin call,
+      Section 4.4); (b) emit events/mail as its OWN identity, all
+      audited (Section 7) and rate-limited (Section 6.5); (c) consume
+      its own bounded resource budget.  It CANNOT read spaces it was
+      not granted, act as another identity, bypass a lease or CAS,
+      crash coordd's process, or de-sync the Raft cluster -- precisely
+      the properties the THREAT_MODEL requires the authority to keep.
+
+
+7.  Audit and the Event Log
+
+   Every plugin action is attributable.  Two categories:
+
+   7.1.  Plugin acting as a client.
+
+      When a plugin acts on coordd under its own token (appending an
+      event, sending mail, reading state), the authority sets
+      actor/from to the plugin's authenticated identity (ACP/1
+      Section 5.2, Section 8.2) -- e.g., "plugin:ci".  These appear in
+      the event log indistinguishably in FORM from any agent's events,
+      but the actor makes the plugin's authorship explicit.
+
+   7.2.  Plugin decisions on the write path.
+
+      coordd SHOULD record plugin lifecycle and hook DECISIONS as
+      events on a reserved channel "x.{ns}" (or "_plugins" for
+      lifecycle), so operators can audit what plugins did WITHOUT
+      polling the plugins:
+
+         plugin.registered / plugin.enabled / plugin.disabled
+                                              (actor = admin identity)
+         plugin.hook.denied  (actor = "plugin:{ns}", entity = target,
+                              context = {point, reason, request_id})
+         plugin.unreachable  (actor = coordd, when a hook fails closed)
+
+      A "deny" that blocks a client write is thus visible in the audit
+      trail with the plugin, the reason, and the correlating
+      request_id.  Because these are ordinary events (ACP/1 Section 8),
+      they inherit the log's ordering and durability -- and its known
+      limitation that the log is append-only but not yet tamper-evident
+      (THREAT_MODEL known gaps); a host-level attacker is out of scope
+      as in ACP/1 Section 19.
+
+
+8.  Capability Negotiation and Backward Compatibility
+
+   Discovery reuses the ACP/EXT-1 Section 7 capability list on
+   /v1/healthz and /v1/stats.  A daemon implementing this extension
+   advertises the base string "plugin" and one "x.{ns}" string PER
+   loaded, enabled plugin:
+
+      GET /v1/healthz ->
+         { "ok": true, "protocol": "acp/1",
+           "capabilities": [ "plugin", "x.ci", "x.billing", ... ] }
+
+   A client:
+
+      o  MUST treat the ABSENCE of "plugin" as "no plugin system" and
+         MUST NOT call /v1/x/... or /v1/plugins (they will 404);
+      o  discovers available namespaces either from the "x.{ns}"
+         capability strings or from GET /v1/plugins (richer: kinds,
+         status), and gates its use of a namespace on that presence;
+      o  MUST tolerate a namespace disappearing (operator disabled it):
+         subsequent /v1/x/{ns}/... calls return 404/503 and the client
+         falls back to core-only behavior.
+
+   A daemon MUST advertise "plugin" only when it fully implements this
+   section's routing, isolation (Section 6), and fail-closed (Section
+   6.6) rules, and MUST advertise "x.{ns}" only for a plugin that is
+   loaded, enabled, and reporting ready (Section 4.5).  Because the
+   whole feature lives under the reserved /v1/x/ prefix and the
+   capability list, a mixed fleet is correct: a core-only daemon simply
+   offers no plugins and a conformant client uses none.
+
+
+9.  Wire API Additions
+
+   Summary (detail in Sections 4-7; types in Appendix A):
+
+      Reserved path prefix (NEW):
+         ANY   /v1/x/{ns}/...      client-facing plugin proxy routes;
+                                   404 if ns not a loaded enabled plugin
+
+      Discovery (NEW):
+         GET   /v1/plugins         -> [PluginInfo]   (redacted)
+         GET   /v1/plugins/{ns}    -> PluginInfo     (redacted)
+
+      Admin (NEW, admin role -- ACP/1 Section 15):
+         POST   /v1/admin/plugins            {manifest} -> PluginInfo
+         POST   /v1/admin/plugins/{ns}/enable {enabled} -> PluginInfo
+         DELETE /v1/admin/plugins/{ns}                  -> 204
+
+      Modified (advertisement only):
+         GET   /v1/healthz, /v1/stats  + "plugin"/"x.{ns}" capabilities
+                                         (per ACP/EXT-1 Section 7)
+
+      Plugin-side ABI (the contract coordd calls; NOT a coordd route):
+         GET   {endpoint}/healthz                     -> 200
+         ANY   {endpoint}/x/{ns}/<subpath>            proxy target
+         POST  {endpoint}/hooks/validate-append       -> Verdict
+         POST  {endpoint}/hooks/validate-commit       -> Verdict
+         POST  {endpoint}/notify/mailtype             -> 2xx (best-eff.)
+
+   The plugin-side ABI is versioned independently of the wire (Section
+   13.3): coordd sends an "abi": "1" field in every CALL CONTEXT and a
+   plugin advertises the ABI versions it speaks in its /healthz
+   response; a mismatch makes the plugin "unreachable" (fail closed),
+   never a core error.  All client-facing new endpoints follow ACP/1
+   Section 6 conventions: JSON bodies, standard headers (X-ACP-Agent,
+   X-ACP-Protocol, X-ACP-Space), bearer auth (ACP/1 Section 5), and the
+   standard error model (Appendix B of ACP/1 plus Appendix B here).
+
+
+10. Determinism and High Availability
+
+   This is the hard part, and this proposal states it honestly.  ACP/1
+   Section 17 requires the replicated state machine to be
+   DETERMINISTIC: applying the same ordered command stream yields
+   byte-identical state on every node, so implementations MUST NOT read
+   wall-clock time, randomness, or perform I/O while APPLYING a
+   command.  A plugin, by definition, does I/O (it is a network
+   service).  Therefore:
+
+   10.1.  Plugins are NEVER in the FSM.
+
+      No plugin call -- proxy, hook, or notify -- may occur inside Raft
+      command application.  A plugin is a validator, a proxy, and a
+      client; it is NOT a command-application participant.  This is an
+      absolute rule; violating it would inject non-determinism (and
+      unbounded latency, and failure) into every replica's apply loop.
+
+   10.2.  Validation hooks run BEFORE the command is proposed.
+
+      A validation hook (Section 5.3) executes on the LEADER, on the
+      request path, BEFORE the write is turned into a Raft command and
+      replicated.  Its outcome is binary: on "allow" the leader
+      proposes the normal, unmodified core command (an ordinary event
+      append or commit, ACP/1 Sections 8.2, 11.3), which every replica
+      applies deterministically as today; on "deny" the leader never
+      proposes anything and returns 422 to the client.  Any
+      "annotations" the leader chooses to merge (Section 5.3) are
+      FIXED by the leader into the command bytes before proposal, so
+      replicas apply identical bytes.  Followers do not call the plugin;
+      a follower that receives such a write forwards it to the leader
+      (ACP/1 Section 14.2), and only the leader runs the hook.  The
+      hook thus behaves exactly like leader-side admission control --
+      the same category as the leader stamping "Now" and ids (ACP/1
+      Section 17) -- and adds nothing non-deterministic to the log.
+
+   10.3.  Proxy routes are outside replicated state.
+
+      A /v1/x/{ns}/ proxy call (Section 5.1) is a request/response
+      relay; it mutates coordd's replicated state ONLY if the plugin
+      turns around and calls a core write endpoint under its own token,
+      and that write goes through the NORMAL leader/replicate/apply
+      path deterministically.  The proxy relay itself is not a command
+      and is not replicated; if served by a follower for a read-only
+      route it is subject to the usual "reads MAY be slightly stale"
+      rule (ACP/1 Section 14.2).
+
+   10.4.  Effects on replicated state: the three permitted shapes.
+
+      Any plugin effect that DOES reach replicated state MUST be one of:
+
+         (a) DETERMINISTIC -- it produces a normal core command whose
+             bytes are identical on every replica (the validation-hook
+             allow case, 10.2);
+         (b) LEADER-STAMPED -- any timestamp, id, or non-deterministic
+             value is fixed by the leader and carried in the command
+             (as ACP/1 Section 17 already requires for Now/ids),
+             including merged "annotations";
+         (c) OUT OF THE FSM -- the effect stays a plugin-local or
+             external side effect (the webhook it POSTs, the row it
+             writes to its own database) and never enters the Raft log.
+
+      No fourth shape is permitted.  In particular a plugin MUST NOT
+      cause each node to independently call out and fold the result
+      into replicated state, which would diverge.
+
+   10.5.  Configuration consistency across the cluster.
+
+      The plugin allowlist (manifests) is OPERATOR configuration, not
+      per-space replicated state.  For consistent behavior every node
+      SHOULD load the SAME manifests (same namespaces, endpoints,
+      points), so a hook denies identically regardless of which node is
+      leader.  If manifests are managed via the admin API (Section 4.4)
+      rather than static config, coordd SHOULD replicate the allowlist
+      change through the Raft log as a config command (leader-driven,
+      deterministic) so all nodes converge -- but the PLUGIN CALLS it
+      enables still run only on the leader/request path, never in
+      apply.  Divergent manifests across nodes are an operator error
+      that manifests as leader-dependent policy; Section 13 notes this.
+
+   10.6.  Availability.
+
+      Because a required hook fails closed (Section 6.6), an
+      unreachable plugin converts to WRITE UNAVAILABILITY for the
+      spaces it gates, not to unsafe writes.  Operators trade
+      availability for the plugin's guarantee knowingly, and can
+      restore availability instantly by disabling the plugin (Section
+      4.4) or marking its hook advisory (Section 5.3).  Reads, and
+      writes in spaces the plugin does not gate, are unaffected.
+
+
+11. Security Considerations
+
+   11.1.  Third-party code stays out of the authority (primary).
+
+      The whole design exists to honor the THREAT_MODEL's trust
+      boundary: the coordination authority is small and trusted;
+      third-party extension code is not, so it runs OUT OF PROCESS as a
+      separate principal.  A plugin never shares coordd's address
+      space, tokens, TLS key, or plaintext space state, so a bug or
+      compromise in a plugin cannot directly read those assets or crash
+      the daemon.  Operators MUST resist the temptation to "just link
+      it in" -- an in-process native plugin re-imports every risk this
+      proposal removes (Sections 1.4, 3.7).
+
+   11.2.  A plugin cannot escalate.
+
+      A plugin is bounded by its token's role and space grant (Section
+      6.1-6.2) and bypasses no core check (Section 6.4).  Grant plugins
+      the LEAST role that works (reader for validators).  Never grant a
+      plugin admin unless it must manage the deployment, because admin
+      can register/enable OTHER plugins (Section 4.4) -- a plugin with
+      admin is a bootstrap for arbitrary further plugins.
+
+   11.3.  Fail-closed vs. fail-open is a security choice.
+
+      A required validation hook that fails closed (Section 6.6)
+      protects the invariant the hook enforces at the cost of
+      availability; an "advisory" hook does the reverse.  Marking a
+      SECURITY-CRITICAL hook advisory silently disables the control
+      whenever the plugin is down; operators MUST only mark hooks
+      advisory when a missed check is acceptable.
+
+   11.4.  Call-context spoofing.
+
+      The CALL CONTEXT coordd sends a plugin (Section 6.3) asserts the
+      calling agent's identity and role.  coordd MUST derive these from
+      the authenticated caller (ACP/1 Section 5.2), never from
+      client-supplied headers, and MUST authenticate itself to the
+      plugin (mTLS/shared secret) so a third party cannot forge hook or
+      proxy calls that impersonate coordd or a privileged caller.
+      Plugins MUST reject calls that are not authenticated as coordd.
+
+   11.5.  Resource exhaustion and amplification.
+
+      A plugin adds a synchronous dependency to the write path (hooks)
+      and a proxied fan-out surface (endpoints).  Per-plugin timeout,
+      body cap, and rate limit (Section 6.5) bound this, in addition to
+      the CALLING agent's own rate limit (ACP/1 Section 5.4) -- both
+      apply, so a plugin cannot be used to amplify past a caller's
+      budget.  coordd MUST cap the response it reads from a plugin
+      (max_body) to prevent a plugin from exhausting the daemon's
+      memory.
+
+   11.6.  Namespace and input safety.
+
+      Namespaces, action strings, channel names, and doc/blob prefixes
+      are echoed in events and discovery responses.  coordd MUST
+      validate them against the documented character sets (Section 2,
+      Section 5.6) to avoid log/display injection, and consumers MUST
+      treat them as opaque data, not markup (as ACP/EXT-1 Section 10.5
+      requires for channel/group names).  The reserved /v1/x/ prefix
+      and the "x." action prefix keep plugin surfaces from ever being
+      confused with core.
+
+   11.7.  Confidentiality is still the space.
+
+      A plugin does not create a new isolation boundary any more than a
+      channel does.  Any agent with a space and role may use a plugin's
+      /v1/x/{ns}/ routes and read the plugin's events/docs/blobs;
+      confidential separation requires a separate SPACE (ACP/1 Section
+      7).  A plugin that needs to keep its OWN secrets keeps them in the
+      plugin process, never in shared space state.
+
+   11.8.  Residual risks.
+
+      The event log records plugin decisions but is not tamper-evident
+      (THREAT_MODEL known gaps; ACP/1 Section 19).  Rate limiting is
+      per-agent in-memory and resets on restart (THREAT_MODEL).  A
+      compromised plugin host is outside coordd's trust boundary just
+      as a compromised agent host is; operators MUST protect plugin
+      credentials and hosts as they protect agents'.
+
+
+12. Rollout Plan
+
+   The pieces are independent and SHOULD ship incrementally; each is
+   independently valuable and independently negotiated by capability.
+
+      Phase 1 -- "plugin" core + proxy routes.  Add the manifest/
+         allowlist, the reserved /v1/x/{ns}/ proxy, GET /v1/plugins,
+         the admin lifecycle endpoints, the CALL CONTEXT + coordd->
+         plugin auth, per-plugin limits, and the capability flags.
+         Highest value-to-effort: consumers get namespaced endpoints
+         and audited plugin identities with NO change to any core write
+         path.
+
+      Phase 2 -- validation hooks.  Add "validate-append" /
+         "validate-commit", the leader-side pre-propose call (Section
+         10.2), 422 on deny, and fail-closed/advisory semantics.  This
+         is the highest-risk phase (write-path latency, Section 13.2)
+         and ships only after Phase 1's isolation is proven.
+
+      Phase 3 -- mailtype notify + doc/blob namespaces.  Add
+         best-effort mailtype notifications and the docns/blobns
+         conventions.  Purely additive, off the critical path.
+
+   Each phase is additive and reversible: an operator can disable any
+   plugin (Section 4.4) or drop the whole capability without breaking
+   ACP/1 peers.  Reference-implementation work forks coordd ONCE to add
+   the seam; thereafter operators add capability by writing plugins,
+   not by forking again -- which is the point of the meta-extension.
+
+
+13. Open Questions
+
+   o  13.1.  In-process WASM sandbox vs. out-of-process sidecar.
+      This proposal specifies OUT-OF-PROCESS because it is
+      unambiguously safe under the THREAT_MODEL.  An in-process WASM
+      sandbox (deterministic, memory-isolated, no ambient I/O) is
+      tempting: it could run a validation hook with microsecond latency
+      and -- if the runtime were truly deterministic and I/O-free --
+      even inside the FSM.  The open questions are whether a
+      production-grade deterministic WASM runtime is trustworthy enough
+      to sit in the authority, how to bound its CPU/memory hard, and
+      whether "deterministic WASM in the FSM" is worth the enormous
+      increase in the authority's attack surface.  Recommendation:
+      defer; revisit only if write-path hook latency (13.2) proves
+      unacceptable and a hardened deterministic runtime is available.
+
+   o  13.2.  Validation-hook latency on the write path.
+      A synchronous coordd->plugin call adds a network round trip
+      (bounded by timeout_ms) to every gated append/commit, on the
+      LEADER, before replication.  For hot write paths this may
+      dominate.  Open: whether to allow BATCHED hook calls (validate
+      many candidate writes in one call, cf. ACP/EXT-4 batch append),
+      an async "observe-only" mode that cannot deny but adds no
+      latency, and what default timeout balances safety against
+      throughput.  The advisory/fail-closed switch (Section 5.3) is a
+      blunt first answer.
+
+   o  13.3.  Versioning the plugin ABI itself.
+      The wire stays "acp/1", but the coordd<->plugin ABI (CALL
+      CONTEXT shape, hook request/response, notify) will evolve.  This
+      proposal carries an "abi" version in the CALL CONTEXT and has
+      plugins advertise supported versions at /healthz (Section 9), but
+      the negotiation/deprecation policy is unsettled: how long coordd
+      supports old ABI versions, whether a plugin may serve multiple,
+      and how an ABI break is signaled without a wire-version bump.
+
+   o  13.4.  Cluster manifest consistency.
+      Section 10.5 requires all nodes to share the allowlist for
+      consistent policy, but static-config drift is possible and
+      admin-API-driven replication of the allowlist is only SHOULD.
+      Open: whether the manifest set should be first-class replicated
+      per-space/global state with its own CAS, and how a rolling
+      manifest change interacts with leader failover.
+
+   o  13.5.  Endpoint response header/status passthrough.
+      How much of a proxied plugin response (Section 5.1) should be
+      relayed verbatim (status codes, content types, caching headers)
+      versus normalized, to keep plugin routes feeling native without
+      letting a plugin emit misleading core-looking errors.
+
+   o  13.6.  Per-path ACLs for plugin namespaces.
+      Section 5.5 notes a plugin gets no privileged access to "its"
+      docs/blobs because ACP has no per-path ACLs (THREAT_MODEL known
+      gap).  If per-path ACLs land, whether a plugin namespace should
+      be able to request an ACL scoping its prefix is open.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   ExtensionPointDecl (new):
+      { "kind": "endpoint" | "event" | "channel"
+                | "validate-append" | "validate-commit"
+                | "mailtype" | "docns" | "blobns",
+        "name": <string>,          ; subpath root / action or channel
+                                   ; prefix / type / doc|path prefix,
+                                   ; MUST be within the namespace (5.6)
+        "advisory": <bool>? }      ; hooks only; default false (5.3)
+
+   PluginManifest (new -- operator config; NEVER returned with token):
+      { "namespace": <string>,     ; [a-z0-9][a-z0-9_-]{0,31}
+        "endpoint": <url>,         ; where coordd reaches the plugin
+        "token_ref": <string>,     ; ref to plugin's own credential
+        "role": "reader"|"writer"|"admin"?,   ; default reader
+        "points": [ExtensionPointDecl],
+        "spaces": [<string>],      ; ["*"] or explicit space names
+        "limits": { "timeout_ms": <int>, "max_body": <int>,
+                    "rate_per_sec": <int> },
+        "enabled": <bool> }
+
+   PluginInfo (new -- discovery, REDACTED: no token/endpoint secrets):
+      { "namespace": <string>,
+        "capabilities": [<string>],   ; e.g. ["x.ci"]
+        "points": [ExtensionPointDecl],
+        "spaces": [<string>],
+        "status": "ready"|"unreachable"|"disabled",
+        "enabled": <bool>,
+        "last_seen": <rfc3339>? }
+
+   CallContext (new -- coordd -> plugin, on every hook/proxy/notify):
+      { "abi": "1", "ns": <string>, "point": <string>,
+        "space": <string>, "agent": <string>, "role": <string>,
+        "request_id": <string>, "deadline_ms": <int> }
+
+   HookRequest (new -- body of validate-append / validate-commit):
+      { "context": CallContext,
+        "candidate": <Event> | { "base_version": <uint64>,
+                                 "changes": [Change] } }
+
+   Verdict (new -- plugin -> coordd hook response):
+      { "verdict": "allow" | "deny",
+        "reason": <string>?,        ; surfaced to client on deny (422)
+        "annotations": <object>? }  ; OPTIONAL, leader-merged (5.3,10.2)
+
+   Health/Stats (changed -- per ACP/EXT-1 Section 7):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [ "plugin", "x.{ns}", ... ] }
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: malformed manifest; namespace outside the allowed
+        character set; a declared point reaching outside the namespace
+        (Section 5.6); duplicate namespace at registration.
+   401  Unauthorized: (unchanged) missing/invalid bearer token; also, a
+        plugin rejecting a coordd call it cannot authenticate.
+   403  Forbidden: caller's role insufficient for /v1/admin/plugins/*;
+        request space not in the plugin's "spaces" grant.
+   404  Not found: /v1/x/{ns}/... where {ns} is not a loaded, enabled
+        plugin, or the subpath matches no declared "endpoint" point;
+        any /v1/x/ or /v1/plugins path on a daemon without the
+        "plugin" capability.
+   422  Unprocessable Entity: a validation hook returned "deny"; the
+        body's "error" carries the plugin's "reason" and the
+        request_id.  (This is the one genuinely new status semantic
+        this extension introduces -- a valid-by-core write rejected by
+        plugin policy.)
+   429  Too Many Requests: the calling agent's rate budget, or the
+        per-plugin call budget (Section 6.5), is exceeded; see
+        Retry-After.
+   502  Bad Gateway: a proxy route's plugin returned an undefined
+        error, or the plugin is unreachable (fail closed, Section 6.6).
+   504  Gateway Timeout: a plugin call exceeded timeout_ms (fail
+        closed).
+
+   All other status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt).
+
+
+Appendix C.  Worked Example
+
+   A "ci" plugin that (1) exposes a read endpoint, (2) publishes on a
+   custom channel, and (3) enforces a pre-commit rule -- all
+   out-of-process, under its own token, discovered by capability.
+
+   C.1.  Operator registers the plugin (allowlist; admin only).
+
+      POST /v1/admin/plugins            (X-ACP-Agent: ops, admin role)
+      { "namespace": "ci",
+        "endpoint": "https://ci-plugin.internal:9443",
+        "token_ref": "kms://acp/plugin/ci",
+        "role": "writer",
+        "points": [
+          { "kind": "endpoint",        "name": "status" },
+          { "kind": "channel",         "name": "x.ci" },
+          { "kind": "validate-commit", "name": "x/ci/",
+            "advisory": false }
+        ],
+        "spaces": ["projX"],
+        "limits": { "timeout_ms": 800, "max_body": 262144,
+                    "rate_per_sec": 50 },
+        "enabled": true }
+      -> 200 PluginInfo { "namespace":"ci", "capabilities":["x.ci"],
+                          "status":"ready", "enabled":true, ... }
+
+      coordd also appends, on channel "_plugins":
+         { "action":"plugin.registered", "actor":"ops",
+           "entity":"ci", "context":{"points":3,"spaces":["projX"]} }
+
+   C.2.  A client discovers the capability, then calls the route.
+
+      GET /v1/healthz
+      -> { "ok":true, "protocol":"acp/1",
+           "capabilities":["plugin","x.ci"] }
+
+      Seeing "x.ci", the client calls the proxy route:
+         GET /v1/x/ci/status            (X-ACP-Agent: claudeA,
+                                         X-ACP-Space: projX)
+      coordd authenticates claudeA, checks projX is in ci's grant,
+      forwards to https://ci-plugin.internal:9443/x/ci/status with a
+      CALL CONTEXT { abi:"1", ns:"ci", point:"endpoint",
+      space:"projX", agent:"claudeA", role:"writer", request_id:...,
+      deadline_ms:800 }, and relays the plugin's JSON reply.
+
+   C.3.  The plugin publishes on its channel (as its own identity).
+
+      The plugin, acting as a client under its own token, appends:
+         POST /v1/events            (plugin token; X-ACP-Space: projX)
+         { "action":"x.ci.deploy.done", "channel":"x.ci",
+           "entity":"build#4127", "context":{"env":"staging"} }
+      -> stored with actor "plugin:ci", a space-global seq, on channel
+         "x.ci".  Agents subscribed via
+         GET /v1/events?follow=true&channels=x.ci (ACP/EXT-1 4.3) see
+         it in order.
+
+   C.4.  The pre-commit hook denies a bad commit (fail closed).
+
+      claudeA commits a file under the plugin's prefix:
+         POST /v1/commit            (X-ACP-Space: projX)
+         { "base_version": 12,
+           "changes": [ { "path":"x/ci/pipeline.yaml",
+                          "hash":"<h>", "size":900000 } ] }
+
+      coordd runs core checks (auth, role, path validation, lease, CAS
+      pre-check), then -- because a "validate-commit" point covers the
+      "x/ci/" prefix -- calls the plugin ON THE LEADER, before
+      proposing the Raft command:
+         POST https://ci-plugin.internal:9443/hooks/validate-commit
+         { "context": {..., "point":"validate-commit"},
+           "candidate": { "base_version":12, "changes":[...] } }
+
+      The plugin decides the pipeline exceeds its size policy:
+         -> { "verdict":"deny",
+              "reason":"pipeline.yaml exceeds 512KiB CI limit" }
+
+      coordd persists NOTHING and returns:
+         < 422 { "error":"pipeline.yaml exceeds 512KiB CI limit",
+                 "current":{"request_id":"..."} }
+      and audits it:
+         { "action":"plugin.hook.denied", "actor":"plugin:ci",
+           "entity":"x/ci/pipeline.yaml", "channel":"x.ci",
+           "context":{"point":"validate-commit","reason":"...",
+                      "request_id":"..."} }
+
+      Had the plugin been unreachable or slow past 800 ms, coordd would
+      have FAILED CLOSED with 504 and the same audit intent
+      ("plugin.unreachable"), never committing unvalidated.  An
+      operator can restore write availability instantly:
+         POST /v1/admin/plugins/ci/enable { "enabled": false }
+
+      In a cluster, only the leader ran the hook; on "allow" it would
+      have proposed the ordinary commit command (leader-stamped
+      version/Now), which every replica applies identically (Section
+      10.2) -- the plugin never touched the FSM.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt), the sibling proposals ACP/EXT-1 through ACP/EXT-5,
+   and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .

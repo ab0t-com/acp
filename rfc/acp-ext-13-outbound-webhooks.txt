@@ -1,0 +1,668 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-13                                     ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+         ACP Extension Proposal 13: Outbound Webhooks (Signed,
+              At-Least-Once Event Push to External Receivers)
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: OUTBOUND WEBHOOKS -- an admin-
+   registered delivery that makes the authority POST matching events
+   from a space's log to an external HTTPS receiver, HMAC-signed,
+   with bounded retries and at-least-once semantics.
+
+   Every ACP consumer today learns what happened in a space by holding
+   an open follow stream (GET /v1/events?follow=true, ACP/1
+   Section 8.4).  Consumers that CANNOT hold a stream -- serverless
+   functions, third-party dashboards, receivers behind integration
+   platforms -- have no way in.  A webhook inverts the flow: register
+   a URL plus an event filter, and the authority pushes.
+
+   This is the one proposal in the current set that makes ACP INITIATE
+   outbound network connections, which is a security and reliability
+   category shift, and this memo treats it as such.  Normatively:
+   destinations are DENY-BY-DEFAULT behind a mandatory operator
+   allowlist (SSRF is the headline risk, Section 8.1); payloads are
+   HMAC-signed so receivers can authenticate them; delivery is
+   AT-LEAST-ONCE with the event seq as the receiver's deduplication
+   key -- never exactly-once, stated honestly; and delivery is a
+   leader-side SIDE-EFFECT strictly OUTSIDE the replicated state
+   machine, while the webhook REGISTRY and each delivery CURSOR are
+   replicated state that survives failover.  The feature is negotiated
+   by a new capability string, "webhooks", and is OFF by default.
+   None of this changes the wire version "acp/1"; a daemon that does
+   not implement this extension answers the admin endpoints 404 and
+   interoperates unchanged.
+
+Status of This Memo
+
+   This is a PROPOSAL, not yet part of the normative ACP/1
+   specification (rfc/acp-1.txt).  It is published for review by
+   implementers and for the protocol owner's approval.  The extension
+   number EXT-13 is PROVISIONAL; the protocol owner assigns final
+   numbers on acceptance.  This proposal is NOT implemented, and its
+   own design review recommends HOLDING implementation until a
+   concrete consumer needs push delivery (current consumers hold
+   follow streams); it is specified now so the security posture is
+   fixed BEFORE demand arrives, not improvised after.  If accepted,
+   its endpoints and types fold into a future "acp/1.1" capability
+   set; the base protocol version string remains "acp/1" and the
+   feature is advertised via Section 5.  Distribution is unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Outbound Webhooks
+   5.  Capability Negotiation and Backward Compatibility
+   6.  Wire API Additions
+   7.  Determinism and High Availability
+   8.  Security Considerations
+   9.  Rollout Plan
+   10. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/1's delivery model is PULL: the event log (ACP/1 Section 8) is
+   read by followers, live via the NDJSON follow stream and
+   historically via ranged reads, with EXT-1 adding server-side
+   channel/action filtering.  Pull is the right default -- the
+   authority stays a passive server; consumers own their liveness.
+   Three concrete gaps motivate an OPTIONAL push path:
+
+   1.1.  Consumers that cannot hold a stream.
+
+      A serverless function has no process to park on a follow stream.
+      A third-party SaaS dashboard accepts inbound POSTs but will not
+      open outbound long-lived connections into a private deployment.
+      An integration platform (the GitHub/Stripe-webhook consumer
+      class) is BUILT around receiving signed POSTs.  For all of
+      these, "hold a stream" is not an inconvenience but an
+      impossibility.
+
+   1.2.  Polling is the workaround, and it is a bad one.
+
+      The streamless consumer today must poll ranged event reads on a
+      timer: latency equals the poll interval, every poll costs a
+      request even when nothing happened, and every such consumer
+      re-implements cursor persistence and retry.  The authority
+      already knows the moment an event commits; pushing it is
+      strictly better for this class.
+
+   1.3.  Push must be a first-class, hardened primitive or it will be
+         improvised.
+
+      A deployment that needs push without protocol support will bolt
+      a forwarder onto a follow stream -- typically with no payload
+      signing, no destination policy, and ad-hoc retry.  Webhooks done
+      wrong are an SSRF primitive and a silent-data-loss machine; if
+      ACP is to have them at all, the protocol should fix the
+      signing, delivery-semantics, and destination-policy bar.
+
+   This extension specifies that primitive at the smallest honest
+   surface: an admin-registered (url, filter, secret) triple, a
+   leader-side delivery loop over the committed log, and a replicated
+   cursor -- with the security constraints of Section 8 made
+   MANDATORY, not advisory.
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in
+   this document are to be interpreted as described in BCP 14
+   [RFC2119] [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, space, and event definitions of ACP/1, and the channel/action
+   filter grammar of EXT-1, without restating them.  "ACP/1 Section N"
+   points into rfc/acp-1.txt.
+
+   WEBHOOK:  One registered delivery: { id, space, url, filter,
+      secret, state } plus its cursor.  Registered by an admin,
+      stored replicated.
+
+   RECEIVER:  The external HTTPS endpoint at the webhook's url.  The
+      receiver is OUTSIDE ACP's trust boundary in both directions: it
+      does not authenticate to ACP, and ACP proves payload
+      authenticity to it by signature.
+
+   DELIVERY:  One attempted POST of one matching event (or batch,
+      Section 10) to the receiver.
+
+   DELIVERY CURSOR:  The per-webhook, durably-replicated seq up to
+      which delivery is CONFIRMED (2xx received).  Resume point after
+      restart or failover.
+
+   ALLOWLIST:  The operator-configured set of permitted destination
+      hosts/ports/schemes.  Empty allowlist = no webhook can be
+      registered (deny by default).
+
+   AT-LEAST-ONCE:  Every matching event is delivered one or more
+      times (never zero, absent permanent receiver failure); the
+      receiver MUST deduplicate by (webhook id, event seq).
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Delivery is a side-effect, never state-machine work (the
+         invariant).
+
+      An outbound POST MUST NOT occur inside the deterministic apply
+      path of the replicated state machine (ACP/1 Section 17): a
+      network call there is non-deterministic, blocking, and would
+      re-fire on every replay and on every replica.  Delivery is
+      performed by a SINGLE ACTIVE DELIVERER (the leader, Section 7)
+      tailing the COMMITTED log -- architecturally a server-side
+      follow-stream consumer that POSTs instead of streams.  Only the
+      REGISTRY and CURSORS are replicated state.
+
+   3.2.  Honest delivery semantics: at-least-once, in order, resumed.
+
+      Exactly-once push over HTTP does not exist, and this memo does
+      not pretend otherwise.  A crash or failover between a POST and
+      its cursor advance re-delivers in-flight events; receivers MUST
+      treat (webhook id, seq) as an idempotency key.  Per webhook,
+      deliveries are made in seq order and the cursor only advances
+      on confirmed (2xx) delivery, so a receiver sees a gap-free,
+      possibly-duplicated, ordered feed.
+
+   3.3.  Deny-by-default outbound (security posture).
+
+      The feature is OFF until the operator configures a destination
+      allowlist; there is no "allow all" wildcard in the normative
+      configuration surface.  HTTPS is required by default.  The full
+      SSRF treatment is Section 8.1 and is MANDATORY: a daemon that
+      implements this extension without those controls is
+      non-conformant.
+
+   3.4.  Additive and negotiated, never breaking.
+
+      Three NEW admin endpoints and an outbound loop; no existing
+      endpoint, type, or read path changes.  A daemon without the
+      extension answers 404; clients discover support via the
+      capability list (Section 5).  The wire version stays "acp/1".
+      Follow streams are unaffected and remain the recommended
+      delivery path for any consumer that CAN hold one.
+
+   3.5.  Non-goals.
+
+      This extension does NOT add: inbound webhooks (ACP is not
+      triggered by third parties; its API is its API); payload
+      transformation/templating (receivers get ACP events, Section 4.4
+      -- adapters live receiver-side); exactly-once delivery
+      (Section 3.2); fan-in aggregation across spaces (a webhook is
+      per-space, ACP/1 Section 7); guaranteed real-time latency
+      (delivery is best-effort prompt); or a general outbound-request
+      facility for other subsystems.  These MAY be future extensions
+      or are permanently out of scope (inbound triggers).
+
+4.  Outbound Webhooks
+
+   4.1.  Registering: POST /v1/admin/webhooks.
+
+      Admin role required (ACP/1 Section 5.3).  Request body:
+
+         { "url":    <string>,            ; https URL of the receiver
+           "filter": { "channels": [<string>]?,   ; EXT-1 grammar,
+                       "actions":  [<string>]? }?, ; wildcards allowed
+           "secret": <string>?,           ; HMAC key; generated if absent
+           "from_seq": <uint64>? }        ; start point; default: now
+
+      The authority MUST validate the url against the destination
+      policy (Section 8.1) at registration time AND at every delivery
+      (DNS can change between the two), and MUST reject a disallowed
+      destination with 403.  The response is the stored Webhook
+      (Appendix A) including its generated id and -- ONLY in this one
+      response -- the secret; subsequent reads never echo it
+      (Section 4.2).  Registration MUST append an audited event to the
+      space's log (action "webhook.created", carrying the id and url,
+      NEVER the secret).
+
+      The filter uses the EXT-1 channel/action grammar; an absent
+      filter matches every event in the space.  "from_seq" earlier
+      than the log's compacted horizon is clamped to the horizon.
+
+   4.2.  Listing: GET /v1/admin/webhooks.
+
+      Returns the space's webhooks with their delivery state:
+
+         [ { "id", "url", "filter", "state",       ; secret NEVER echoed
+             "cursor": <uint64>,                   ; confirmed seq
+             "failing_since": <rfc3339>?,
+             "last_error": <string>? }, ... ]
+
+      "state" is "active" | "failing" | "disabled" (Section 4.5).
+
+   4.3.  Removing: DELETE /v1/admin/webhooks/{id}.
+
+      Removes the registration and its cursor; appends an audited
+      "webhook.deleted" event.  In-flight deliveries MAY complete;
+      no new deliveries begin after the removal commits.
+
+   4.4.  The delivery request.
+
+      For each committed event matching the filter, the deliverer
+      POSTs to the url:
+
+         POST <url>
+         Content-Type: application/json
+         X-ACP-Webhook-Id: <id>
+         X-ACP-Webhook-Timestamp: <unix seconds>
+         X-ACP-Webhook-Signature: v1=<hex hmac-sha256>
+
+         { "webhook": <id>, "space": <string>,
+           "event": { ...the ACP/1 Event, verbatim, incl. seq... } }
+
+      The signature is HMAC-SHA256 over
+      "<timestamp>.<body bytes>" with the webhook's secret, hex
+      lowercase, prefixed "v1=" for future agility -- the shape
+      receivers already know from the mainstream webhook providers,
+      and the same primitive as EXT-3's capability-URL signing.
+      Receivers MUST verify the signature with a constant-time
+      compare and SHOULD reject timestamps older than a few minutes
+      (replay damping); the DEDUPLICATION key is (webhook id,
+      event.seq) per Section 3.2.
+
+      A response with a 2xx status confirms delivery.  Any other
+      status, a timeout (RECOMMENDED 10 seconds), or a connection
+      error is a failed attempt.  Redirects MUST NOT be followed
+      (a redirect is an SSRF vector; the registered URL is the only
+      permitted destination).
+
+   4.5.  Retries, backoff, and disablement.
+
+      Failed deliveries are retried with exponential backoff
+      (RECOMMENDED: initial 1s, factor 2, cap 15 minutes, jittered).
+      The cursor does not advance past an unconfirmed event, so a
+      failing receiver stalls ITS OWN webhook only -- never the log,
+      other webhooks, or any ACP subsystem (delivery is fully
+      asynchronous, Section 3.1).  A webhook failing continuously for
+      a bounded period (RECOMMENDED 24 hours) SHOULD be transitioned
+      to "disabled" with the reason recorded and an audited event
+      appended; a disabled webhook resumes only by admin action
+      (re-register or a future enable verb, Section 10).  Backlog is
+      bounded by the log's own retention: a webhook disabled long
+      enough that compaction passed its cursor resumes, on re-enable,
+      from the compacted horizon -- with the gap recorded in an
+      audited event (delivery is at-least-once per RETAINED event,
+      not an archival guarantee).
+
+   4.6.  Backward compatibility.
+
+      A daemon that does not implement this extension answers the
+      /v1/admin/webhooks endpoints 404 and initiates no outbound
+      connections whatsoever -- the pre-extension posture is exactly
+      "ACP never dials out".  Receivers are outside ACP and need no
+      ACP version awareness; they verify signatures and dedup by seq.
+
+5.  Capability Negotiation and Backward Compatibility
+
+   This extension adds a capability string to the ACP/1 introspection
+   endpoints, per the shared convention of EXT-1 Section 7:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain:
+
+         "protocol": "acp/1",
+         "capabilities": [ "webhooks", ... ]
+
+   A daemon MUST advertise "webhooks" only when it implements ALL of
+   Section 4 AND the mandatory destination policy of Section 8.1 --
+   the capability asserts the hardening, not just the endpoints.  A
+   daemon whose allowlist is empty MAY still advertise the capability
+   (registration will 403 until the operator configures destinations).
+   A client (necessarily an admin) MUST treat the ABSENCE of
+   "webhooks" as "no push available" and fall back to follow streams
+   or polling.
+
+6.  Wire API Additions
+
+   Summary (full detail in Section 4; types in Appendix A):
+
+      New (all admin-only, ACP/1 Section 5.3):
+         POST   /v1/admin/webhooks        ; register (secret returned
+                                            once)
+         GET    /v1/admin/webhooks        ; list + delivery state
+         DELETE /v1/admin/webhooks/{id}   ; remove
+
+      New (outbound, not an ACP endpoint):
+         POST <receiver url>              ; signed delivery
+                                            (Section 4.4)
+
+      Modified:
+         GET /v1/healthz, /v1/stats       + "webhooks" capability;
+                                            stats SHOULD add per-
+                                            webhook delivery counters
+
+   The admin endpoints follow ACP/1 Section 6 conventions: JSON
+   bodies, the standard headers, bearer auth, and the standard error
+   model (Appendix B of ACP/1 plus Appendix B here).  Idempotency-Key
+   on registration SHOULD be honored per ACP/1 Section 6.4 (a retried
+   registration returns the SAME webhook, including the same one-time
+   secret disclosure).
+
+7.  Determinism and High Availability
+
+   ACP/1 Section 17 requires the replicated state machine to be
+   deterministic.  This extension is designed around keeping an
+   inherently non-deterministic act (an outbound POST) from ever
+   touching it:
+
+      o  The REGISTRY (webhooks: url, filter, secret, state) and each
+         DELIVERY CURSOR are REPLICATED FSM STATE: registration,
+         removal, state transitions (failing/disabled), and cursor
+         advances are commands through the consensus log, carried by
+         snapshots.  After any failover the new leader knows exactly
+         which webhooks exist and where each one's confirmed delivery
+         stands.
+
+      o  DELIVERY is performed OUTSIDE the FSM by a single active
+         deliverer -- normatively the current LEADER -- running a
+         background loop: read committed events past the cursor,
+         POST, and on 2xx propose a cursor-advance command.  Followers
+         MUST NOT deliver.  Leadership change moves the loop with the
+         lease: the new leader resumes every webhook from its
+         replicated cursor.
+
+      o  The failover window is WHERE at-least-once comes from: an
+         event POSTed by the old leader whose cursor advance did not
+         commit is re-POSTed by the new leader.  This is specified
+         behavior, not a bug; receivers dedup by seq (Section 3.2).
+         The converse (an advance committing for an undelivered
+         event) MUST be impossible: the deliverer proposes the
+         advance only AFTER receiving the 2xx.
+
+      o  Cursor-advance commands SHOULD be batched/coalesced (e.g.
+         advance once per N events or per second) to bound consensus
+         traffic; coarser advances only widen the duplicate window,
+         never lose events.
+
+      o  Applying a cursor-advance command on a replica does nothing
+         but update the cursor -- replay of the log NEVER re-fires
+         POSTs, because POSTing lives in the deliverer loop, not in
+         apply (Section 3.1).
+
+8.  Security Considerations
+
+   This extension makes the authority an HTTP CLIENT.  That is a new
+   attack surface category for ACP, and this section is normative.
+
+   8.1.  SSRF: the headline risk.
+
+      An operator-supplied URL that the daemon will dutifully POST to
+      is, unconstrained, a Server-Side Request Forgery primitive
+      against everything the daemon's network position can reach:
+      cloud metadata services (169.254.169.254), localhost admin
+      planes (including ACP's own listener), and internal RFC-1918
+      services.  Mandatory controls; a daemon advertising "webhooks"
+      MUST implement all of them:
+
+         o  DESTINATION ALLOWLIST, deny by default: outbound POSTs are
+            permitted only to hosts (or host:port patterns) the
+            operator explicitly configured (e.g. a -webhook-allow
+            list).  No allowlist, no webhooks.
+
+         o  BLOCKED RANGES: loopback, link-local (incl. 169.254.0.0/16
+            and fe80::/10), RFC-1918/ULA private ranges, and 0.0.0.0/8
+            MUST be refused as resolved destinations even if a DNS
+            name on the allowlist points there, unless the operator
+            explicitly allowlists that literal address range.
+
+         o  RESOLVE-THEN-PIN: the policy check MUST apply to the
+            RESOLVED addresses actually connected to, and the
+            connection MUST be pinned to a checked address (DNS
+            rebinding between check and connect is the classic
+            bypass).  Re-validation occurs at every delivery, not
+            only at registration (Section 4.1).
+
+         o  HTTPS-ONLY by default, with certificate verification;
+            plain http only by explicit per-deployment opt-in for
+            closed networks.  Redirects are never followed
+            (Section 4.4).
+
+   8.2.  Payload confidentiality: pushing data OUT.
+
+      A webhook exports event data (including "context" objects,
+      which may be sensitive) to a receiver OUTSIDE the space's
+      access-control domain -- a receiver that never authenticated to
+      ACP and holds no role.  This is an operator decision made
+      per-webhook, admin-only, audited (Section 4.1), and shaped by
+      the filter (send only the channels/actions the receiver needs
+      -- SHOULD be as narrow as possible).  Operators MUST treat a
+      webhook registration as equivalent to granting the receiver
+      READ on the filtered slice of the space.
+
+   8.3.  What the signature does and does not do.
+
+      The HMAC signature (Section 4.4) lets the RECEIVER authenticate
+      the SENDER: only a holder of the secret can produce valid
+      payloads, so a receiver can expose a public URL without
+      accepting forged events.  It does NOT authenticate the receiver
+      to ACP -- anyone at the URL sees the payload; that direction is
+      protected only by the allowlist and TLS (Section 8.1, 8.2).
+      Secrets MUST be stored server-side with the same care as agent
+      tokens, disclosed only once at registration (Section 4.1), and
+      SHOULD be rotatable (Section 10).
+
+   8.4.  The daemon as a DDoS/abuse source.
+
+      A compromised or careless admin could aim deliveries at a
+      victim URL.  The allowlist is the primary control; additionally
+      a daemon SHOULD cap per-webhook delivery rate and concurrency
+      (RECOMMENDED: 1 in-flight request per webhook -- which seq
+      ordering already implies -- and a configurable events/second
+      cap), and MUST apply the backoff/disable policy of Section 4.5
+      so a refusing receiver is not hammered indefinitely.
+
+   8.5.  Admin surface and audit.
+
+      All three endpoints are admin-only; every registration,
+      deletion, disablement, and gap (Section 4.5) appends an audited
+      event.  The webhook subsystem adds no new authentication modes
+      and no unauthenticated paths to ACP itself.
+
+9.  Rollout Plan
+
+   This feature is deliberately gated and ships, if accepted, in two
+   phases:
+
+      Phase 0 -- HOLD (current recommendation).  Specification only.
+         Implementation waits for a concrete streamless consumer; the
+         security posture above is fixed in advance so an urgent
+         request cannot water it down.
+
+      Phase 1 -- "webhooks".  The replicated registry and cursors;
+         the leader-side deliverer with retry/backoff/disable; the
+         signed delivery format; the mandatory destination policy
+         (allowlist, blocked ranges, resolve-then-pin, https-only);
+         admin endpoints; audited events; stats counters; the
+         capability.  Off by default; enabled by configuring the
+         allowlist.
+
+   The phase is additive and reversible: deleting all webhooks (or
+   clearing the allowlist) returns the daemon to the "never dials
+   out" posture with no effect on any other subsystem.
+
+10. Open Questions
+
+   o  Batched deliveries: one POST carrying an ARRAY of events (with
+      one signature) would cut receiver load for busy channels; it
+      complicates receiver dedup (per-event seq still works) and
+      partial-failure semantics.  Deferred; single-event POSTs are
+      the simple, provider-conventional baseline.
+
+   o  Secret ROTATION: a two-secret overlap window (sign with new,
+      receivers accept either) versus delete-and-recreate.  Likely a
+      small follow-up; the "v1=" signature prefix leaves room.
+
+   o  An explicit ENABLE/DISABLE verb (pause without losing the
+      cursor) versus the automatic disablement of Section 4.5 only.
+
+   o  Follower-distributed delivery (sharding webhooks across nodes)
+      if a deployment ever has enough webhooks to outgrow the leader;
+      requires per-webhook single-ownership leases.  Out of scope for
+      v1.
+
+   o  mTLS to receivers for deployments that want mutual
+      authentication rather than allowlist+HMAC.
+
+   o  Whether delivery counters belong in /v1/stats (per-webhook
+      used/failed/lag) normatively rather than SHOULD (Section 6).
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   WebhookCreate (new -- POST /v1/admin/webhooks body):
+      { "url":      <string>,
+        "filter":   WebhookFilter?,
+        "secret":   <string>?,        ; generated when absent
+        "from_seq": <uint64>? }
+
+   WebhookFilter (new -- the EXT-1 grammar):
+      { "channels": [<string>]?,      ; wildcards per EXT-1
+        "actions":  [<string>]? }
+
+   Webhook (new -- registration response; list element):
+      { "id":        <string>,
+        "space":     <string>,
+        "url":       <string>,
+        "filter":    WebhookFilter?,
+        "secret":    <string>?,       ; ONLY in the create response
+        "state":     "active" | "failing" | "disabled",
+        "cursor":    <uint64>,        ; confirmed-delivered seq
+        "failing_since": <rfc3339>?,
+        "last_error":    <string>? }
+
+   WebhookDelivery (new -- the OUTBOUND POST body, Section 4.4):
+      { "webhook": <string>, "space": <string>,
+        "event": Event }              ; the ACP/1 Event, verbatim
+
+   Outbound headers (new): X-ACP-Webhook-Id,
+      X-ACP-Webhook-Timestamp, X-ACP-Webhook-Signature
+      ("v1=" + lowercase hex HMAC-SHA256 over
+      "<timestamp>.<body>").
+
+   Health/Stats (changed):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [<string>],   ; includes "webhooks"
+        "webhooks": { <id>: { "delivered": <uint64>,
+                              "failed": <uint64>,
+                              "lag": <uint64> } }? }   ; OPTIONAL
+
+   No ACP/1 read-path or event-type changes.
+
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: malformed url or filter; invalid from_seq;
+        oversized secret.
+   401  Unauthorized: missing or invalid bearer token (ACP/1).
+   403  Forbidden: caller is not admin; OR the url fails the
+        destination policy (not on the allowlist, blocked range,
+        non-https without opt-in) -- the body names the policy, not
+        the resolved internal address (no network oracle).
+   404  Not found: the daemon does not implement this extension; or
+        DELETE of an unknown webhook id.
+   409  Conflict: a duplicate registration (same space+url+filter)
+        where the daemon chooses to reject rather than duplicate.
+   429  Too Many Requests: admin-endpoint rate budget exceeded.
+
+   Delivery-side failures (receiver 4xx/5xx, timeouts) are NOT ACP
+   API errors; they surface as webhook state ("failing"/"disabled"),
+   list-response fields, and audited events (Section 4.5).  All other
+   status codes carry the ACP/1 meanings (Appendix B of
+   rfc/acp-1.txt).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  Operator enables the feature, admin registers a webhook.
+
+      coordd config:  -webhook-allow hooks.example.com:443
+
+      POST /v1/admin/webhooks
+      { "url": "https://hooks.example.com/acp",
+        "filter": { "channels": ["build"], "actions": ["task.*"] } }
+      < 200
+      < { "id": "wh_7f2a", "space": "acme",
+      <   "url": "https://hooks.example.com/acp",
+      <   "filter": { "channels": ["build"], "actions": ["task.*"] },
+      <   "secret": "whsec_9c41...",          ; shown ONCE
+      <   "state": "active", "cursor": 90312 }
+
+      The log gains { "action": "webhook.created",
+      "entity": "wh_7f2a", ... }.
+
+   C.2.  A matching event is delivered, signed.
+
+      Event seq 90313 (channel "build", action "task.claimed")
+      commits.  The leader's deliverer POSTs:
+
+         POST https://hooks.example.com/acp
+         X-ACP-Webhook-Id: wh_7f2a
+         X-ACP-Webhook-Timestamp: 1783948112
+         X-ACP-Webhook-Signature: v1=6b2d...e9
+         { "webhook": "wh_7f2a", "space": "acme",
+           "event": { "seq": 90313, "at": "...",
+                      "actor": "claudeA", "action": "task.claimed",
+                      "entity": "T-42", "channel": "build" } }
+
+         < 200 OK
+      The cursor advances to 90313 (a replicated command).
+
+   C.3.  Receiver-side verification and dedup (informative).
+
+      expected = hmac_sha256(secret, timestamp + "." + body)
+      require constant_time_eq("v1=" + hex(expected), header)
+      require now - timestamp < 300s
+      if seen(webhook_id, event.seq): return 200   ; duplicate -- ok
+      mark_seen(webhook_id, event.seq); process(event)
+
+      Returning 200 for a recognized duplicate is what makes
+      at-least-once safe.
+
+   C.4.  Failover duplicates, receiver unharmed.
+
+      The leader POSTs seq 90314, receives 200, and crashes before
+      the cursor advance commits.  The new leader resumes from the
+      replicated cursor 90313 and re-POSTs 90314; the receiver's
+      dedup (C.3) discards it.  No event was lost; one was delivered
+      twice -- exactly the contract of Section 3.2.
+
+   C.5.  SSRF attempt refused.
+
+      POST /v1/admin/webhooks
+      { "url": "https://169.254.169.254/latest/meta-data/" }
+      < 403 { "error": "destination not permitted by webhook policy" }
+
+      Likewise a DNS name on the allowlist that RESOLVES to a blocked
+      range is refused at delivery time (resolve-then-pin,
+      Section 8.1); the daemon never connects.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .
