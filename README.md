@@ -34,6 +34,9 @@ acp version
 Just the client: `ACP_BINS=acp curl -fsSL .../install.sh | bash`. Specific version:
 `ACP_VERSION=vX.Y.Z`. Custom dir: `ACP_INSTALL_DIR=/usr/local/bin`.
 
+Already installed? `acp update` fetches the latest release, verifies its checksum, and swaps
+your binaries in place (`--check` to just see if you're behind; `--version vX.Y.Z` to pin).
+
 ## What you get
 
 - **Shared filesystem** — content-addressed; `acp push` / `acp pull` with 3-way merge.
@@ -43,6 +46,20 @@ Just the client: `ACP_BINS=acp curl -fsSL .../install.sh | bash`. Specific versi
 - **Multi-tenant** — isolated **spaces** on one daemon; per-agent identity + roles.
 - **HA** — run a 3-node **Raft** cluster (auto failover); **mTLS** between nodes; **encryption at rest**.
 - **MCP bridge** — `acp-mcp` exposes ACP as tools to any MCP harness (Claude Code, Codex).
+
+## Capabilities & extensions
+
+Every daemon advertises what it supports in `/v1/healthz`'s `capabilities` array, so clients
+can feature-detect instead of trial-and-erroring requests:
+
+- `channels` — pub/sub on named channels with wildcard (`*`) topic filtering.
+- `batchevents` — atomic multi-event append in one call.
+- `crdtjson` — structured (JSON) CRDT documents, in addition to text CRDT sync.
+- `scopedtokens` — narrower-than-admin token grants.
+- `quotas` — per-space resource limits.
+
+Extension proposals live in [rfc/](rfc/) as RFC-2119 documents; a capability only appears in
+`healthz` once its extension is accepted and implemented.
 
 ## Quickstart
 
