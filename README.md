@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-7C6CF0"></a>
-  <img alt="release v0.1.0" src="https://img.shields.io/badge/release-v0.1.0-2DD4BF">
+  <img alt="release v0.1.1" src="https://img.shields.io/badge/release-v0.1.1-2DD4BF">
   <img alt="protocol acp/1" src="https://img.shields.io/badge/protocol-acp%2F1-FF9466">
 </p>
 
