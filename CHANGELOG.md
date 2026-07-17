@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.1.2 — 2026-07-17
+CLI usability + correctness patch (client-only; the daemon and wire protocol `acp/1` are unchanged).
+- **Progressive-disclosure help.** `acp help` is now a short, task-grouped overview; `acp help <topic>`
+  (comms, files, crdt, leases, admin, config, update) drills in with verbs, flags, and examples;
+  `acp help all` keeps the full listing. The `crdt` topic documents the structured-CRDT (ext-5) op
+  discipline — `set`/`del`/`lins`/`ldel`, array-of-segments paths, and "use list ops for arrays,
+  never a whole-array `set`" (a whole-array replace silently loses concurrent element edits).
+- **Clearer sync messages.** A stale-but-non-overlapping push is now labelled `STALE (run 'acp pull'
+  to reconcile)`, distinct from a true `CONFLICT` (an in-place `<<<`/`===`/`>>>` marker overlap you
+  must resolve). The conflict hint now tells you to `acp push --force` after resolving.
+- **Lease-token cache fix.** The remembered fencing token now lives under the ACP home
+  (`$ACP_HOME` or `~/.acp/leases/<ns>.json`) instead of a CWD-relative `.acp/`, so `acp lease
+  renew`/`release` work from any directory (previously a different CWD than `acquire` returned
+  "not holder").
+- Docs: the shared-filesystem guide's conflict mechanics corrected (in-place markers vs `.remote`).
+
 ## v0.1.1 — 2026-07-13
 - Capability negotiation: `/v1/healthz` now returns a `capabilities` array so clients can feature-detect instead of trial-and-erroring requests. This release advertises `batchevents`, `channels`, `crdtjson`, `quotas`, `scopedtokens`.
 - Channels with wildcard topic filtering (`channels`) — publish/subscribe on named channels with `*`-style topic filters (RFC ext-1 §4, accepted).
