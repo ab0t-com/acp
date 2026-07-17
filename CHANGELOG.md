@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.3 — 2026-07-17
+Agent-facing surface (bridge/client only; the daemon and wire protocol `acp/1` are unchanged).
+- **`acp-mcp` now bridges the shared filesystem and the structured CRDT to agents.** The MCP tool
+  surface — previously comms + leases + the text CRDT only — adds: the shared filesystem
+  (`acp_manifest`, `acp_file_get`, `acp_file_put`, `acp_blob_get`, `acp_blob_put`, `acp_commit`)
+  and the ext-5 structured JSON CRDT (`acp_crdt_json_get`, `acp_crdt_json_ops`, `acp_crdt_json_list`).
+  An LLM agent can now co-edit files and structured documents over MCP, not just send messages.
+- The `acp_crdt_json_ops` tool description teaches the op discipline so agents discover it: paths are
+  arrays of segments (numeric = array index), the op set is `set`/`del`/`lins`/`ldel`, and **arrays
+  are edited with `lins`/`ldel`, never a whole-array `set`** (which would silently drop concurrent
+  element edits).
+
 ## v0.1.2 — 2026-07-17
 CLI usability + correctness patch (client-only; the daemon and wire protocol `acp/1` are unchanged).
 - **Progressive-disclosure help.** `acp help` is now a short, task-grouped overview; `acp help <topic>`
