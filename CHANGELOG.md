@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.1.5 — 2026-07-25
+Daemon + client release (the wire protocol version `acp/1` is unchanged — an op and a
+negotiated capability, per the extension model).
+- **Identity-preserving MOVE for the structured (JSON) CRDT (ext-14).** A fifth op `mv`
+  relocates an existing node — a subtree under an object key, or an array element — to a
+  new location **without minting a new id**, so a peer's concurrent edit to the moved
+  thing follows it instead of being lost. This makes drag-to-reorder, move-item-between-
+  columns (kanban), reparent-a-node (outliner/tree), and relocate-a-block **safe on a live
+  multi-editor surface**. Guarantees: concurrent moves of one node collapse to a single
+  winner (no duplicate); a move that would create a parent cycle is ignored and the node
+  **stays put** (nothing vanishes); delete-after-move deletes (no resurrection). All
+  deterministic, convergent, and compaction-transparent. Negotiated by a new capability
+  string **`crdtjson-move`** (advertised alongside `crdtjson`); `mv` travels through the
+  existing `POST /v1/crdt/json/ops` (no new endpoint). The reference JSON-Patch mapper now
+  emits a real `mv` for RFC-6902 `move`, and the CLI gains `acp crdt json mv <doc> <from>
+  <to>`. Old behavior (delete+reinsert) duplicated the subtree and dropped concurrent
+  edits. Spec: `rfc/acp-ext-14-crdt-move.txt`; guide: `docs/CRDT_JSON_MOVE.md`.
+- **Performance & memory (structured CRDT).** Reads of a structured document are now
+  **O(1) amortized** (the resolved view is memoized between writes), and long-lived or
+  heavily-edited documents keep their resident size **bounded to live content** through
+  cheaper, automatic compaction (a counter-based trigger replaces a per-document scan).
+  Large or overwrite-heavy JSON documents now use materially less memory and CPU under
+  sustained load. No API or wire change.
+- **Operator note (mixed-version clusters):** `crdtjson-move` is advertised always-on. On a
+  multi-node Raft cluster, **upgrade all nodes before relying on `mv`** — a node still on a
+  pre-move binary silently no-ops incoming `mv` ops and would diverge. Single-node
+  deployments are unaffected.
+
 ## v0.1.3 — 2026-07-17
 Agent-facing surface (bridge/client only; the daemon and wire protocol `acp/1` are unchanged).
 - **`acp-mcp` now bridges the shared filesystem and the structured CRDT to agents.** The MCP tool

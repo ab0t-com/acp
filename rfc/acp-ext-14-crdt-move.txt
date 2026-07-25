@@ -1,0 +1,1173 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-14                                     ab0t.com
+Updates: ACP/EXT-5                                                 July 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+      ACP Extension Proposal 14: Identity-Preserving MOVE for the
+                       Structured (JSON) CRDT
+
+
+   [ Editor's note: the extension NUMBER "14" in "ACP/EXT-14" is
+     PROVISIONAL.  The protocol owner assigns the final ACP/EXT number
+     on acceptance; until then treat the number as a placeholder. ]
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: a fifth operation type, "mv", for the
+   structured (JSON) CRDT of ACP/EXT-5, which relocates an EXISTING
+   node -- a subtree bound to an object key, or an array element -- to
+   a new location while PRESERVING ITS IDENTITY (its nid).
+
+   EXT-5 deliberately deferred move (EXT-5 Sections 3.6(d), 11.3): a
+   move expressed as delete-plus-reinsert mints a fresh nid, so two
+   replicas moving the same subtree concurrently DUPLICATE it, and an
+   edit made concurrently with a move lands on the deleted copy and is
+   LOST.  Worse, two moves that are each individually legal can form a
+   parent CYCLE when merged.  This extension closes that gap with the
+   design the peer-reviewed move literature converges on (Appendix D):
+   a move is a new leader-stamped PLACEMENT of the same node; the
+   node's LOCATION is the greatest-stamped placement that does not
+   create a cycle, resolved by a deterministic STAMP-ORDERED VALIDITY
+   PASS at materialization; a move that would create a cycle is simply
+   ignored and the node STAYS PUT -- nothing is duplicated, nothing
+   vanishes, and no history is rewritten.
+
+   No new endpoint is added: "mv" travels through the existing
+   POST /v1/crdt/json/ops.  The feature is negotiated by a new
+   capability string, "crdtjson-move", with an explicit operator-gated
+   rollout procedure for mixed-version clusters (Section 9).  None of
+   this changes the wire version "acp/1".  Move for the TEXT/sequence
+   CRDT of ACP/1 Section 12 is an explicit NON-GOAL of this document
+   and is reserved for a future extension (Section 3.7).
+
+Status of This Memo
+
+   [ REVISION B APPLIED (2026-07-23): the independent adversarial
+     review (tickets/crdt-json-move-20260722/REVIEW_opus_rfc.md) found
+     a BLOCKING self-contradiction (its F1): the draft's observed
+     retirement of the moved node's OWN placements (old Section 4.2)
+     destroyed the fallback the stays-put rule (Section 4.4) depends
+     on -- in the concurrent A<->B cycle both subtrees vanished, the
+     forbidden outcome, and worked example C.3 was unreachable.  The
+     finding was independently re-derived and CONFIRMED.  Revision B
+     resolves it by DERIVED SUPPRESSION: location(c) is chosen by
+     VALIDITY (greatest-stamped valid placement, history-stable), a
+     node renders only if its location is LIVE (no fallback past a
+     deleted winner -- delete means delete), and "mv" retires only
+     source-slot GHOSTS, never the child's own placements (Sections
+     4.2-4.4; recomputed examples C.3/C.4).  Note the review's own
+     sketched fix #2 was subtly wrong (it would have reintroduced
+     delete-after-move resurrection); the rule above is the corrected
+     resolution and was verified by hand against C.1-C.5 and the
+     compaction-transparency invariant.  Also folded: F2 (member
+     join/replace rule, Section 9), F3 (exact depth inequality +
+     honesty about concurrency, Section 4.5), F4-F13 (text fixes).
+     Ready for team re-review; NOT ready for implementation until the
+     owner accepts. ]
+
+   This is a PROPOSAL, not yet part of the normative ACP/1
+   specification (rfc/acp-1.txt).  It is published for review by the
+   team and for the protocol owner's approval.  The extension number
+   EXT-14 is PROVISIONAL; the protocol owner assigns final numbers on
+   acceptance.  It builds on ACP/EXT-5 (structured CRDT), which is
+   ACCEPTED and IMPLEMENTED; this proposal is NOT implemented.
+
+   This memo was drafted from the design record in
+   tickets/crdt-json-move-20260722/ (DESIGN rev 2 + IMPLEMENTATION_PLAN
+   rev 2), which was independently and adversarially reviewed before
+   drafting; the review findings (cycle-outcome semantics, observed
+   retirement, the location-aware read path, and the mixed-version
+   rollout hazard) are folded into the normative text below rather
+   than left as open questions.
+
+   Header note (review F9): "Updates: ACP/EXT-5" is deliberate --
+   this extension genuinely changes the EXT-5 data model (list
+   placements gain a stamp, Section 4.1/Appendix A; a fifth op type
+   exists that an EXT-5 implementation must know about once "mv" ops
+   are in a log).  The family convention is inconsistent (EXT-11
+   also builds on EXT-5 yet says "Updates: ACP/1"); the owner should
+   pick one convention at acceptance and apply it across the family.
+
+   If accepted, the feature folds into a future "acp/1.1" capability
+   set; the base protocol version string remains "acp/1".
+   Distribution is unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  The Move Operation
+   5.  Capability Negotiation and Backward Compatibility
+   6.  Wire API Additions
+   7.  Determinism and High Availability
+   8.  Security Considerations
+   9.  Rollout Plan (Mixed-Version Clusters)
+   10. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Appendix D.  Research Basis and Algorithm Lineage
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   ACP/EXT-5 gives a space convergent structured documents: JSON node
+   graphs mutated by four operations (set, del, lins, ldel), leader-
+   stamped, totally ordered through the replicated log, materialized
+   byte-identically on every replica.  What it does not give is a way
+   to RELOCATE something.  Four concrete problems motivate this
+   extension:
+
+   1.1.  A move today destroys identity.
+
+      With only {set, del, lins, ldel}, "move X from A to B" must be
+      expressed as delete-at-A plus reinsert-at-B.  The reinserted
+      value is a NEW node with a NEW nid (EXT-5 Section 4.4); the
+      moved thing's identity is destroyed.  The reference JSON-Patch
+      mapper does exactly this today (RFC 6902 "move" expands to
+      remove + add) and documents the hazard as a known caveat.
+
+   1.2.  Concurrent moves duplicate; concurrent edits are lost.
+
+      If two actors concurrently move the same subtree, both deletes
+      and both reinserts survive merge -- two copies with two fresh
+      nids (duplication).  If one actor edits a field of a subtree
+      while another moves it, the edit addresses the OLD nid, whose
+      binding the move deleted: the edit lands on a dead node and is
+      silently lost.  On a collaborative canvas this is user-visible:
+      drag-reorder a card while a peer edits its text, and the text
+      edit disappears.  These are precisely the failure modes
+      documented in the move literature (Appendix D, [DK24] Figure
+      1(b)).
+
+   1.3.  Cycles: two legal moves can merge into an illegal state.
+
+      Move B under A on one replica; concurrently move A under B on
+      another.  Each is legal against the state it saw; the merged
+      placement set contains a parent cycle A <-> B.  In ACP this can
+      occur even with a single authority, because two pushes may be
+      canonicalized against the same committed state before either
+      commits (the canonicalize-then-propose window).  A correct move
+      design MUST resolve cycles deterministically, identically on
+      every replica, without hiding or corrupting data.
+
+   1.4.  Only the authority can solve this cheaply.
+
+      The serverless literature pays heavy machinery for this feature
+      (per-replica revalidation, restore/reapply, lifecycle tracking --
+      Appendix D) because without an authority every replica must
+      re-derive move validity as ops arrive in different orders.  ACP
+      has what those systems lack: a leader that stamps a TOTAL ORDER
+      onto every operation (ACP/1 Section 17, EXT-5 Section 3.4).
+      This extension exploits that: the validity rule of the
+      literature's simple, from-scratch algorithm ([DK24] Algorithm 1)
+      runs as a pure function inside materialization, with no
+      incremental machinery at all.  We adopt the literature's
+      SEMANTICS and skip its serverless COSTS.
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in
+   this document are to be interpreted as described in BCP 14
+   [RFC2119] [RFC8174].
+
+   This document uses the architecture, transport, authentication,
+   role, and space definitions of ACP/1, and the structured-CRDT
+   definitions of ACP/EXT-5 (document, node, nid, MAP, LIST, REGISTER,
+   binding, tag, element id, LWW stamp, epoch, materialization,
+   canonicalization) without restating them.  "EXT-5 Section N" points
+   into acp-ext-5-structured-crdt.txt.
+
+   STAMP:  The leader-assigned LWW ordering token of an op:
+      (now, actor, op id), per EXT-5's accepted LWW rule (Status of
+      This Memo, owner refinement 1).  Op ids are unique, so stamps
+      form a STRICT TOTAL ORDER.
+
+   PLACEMENT:  One (parent, slot) -> child reference: a MAP binding
+      (parent nid, key, tag) -> child nid, or a LIST element
+      (parent nid, element id) -> child nid.  EXT-5's set/lins each
+      create one placement together with a new node; "mv" creates a
+      placement referencing an EXISTING node.  Every placement carries
+      the stamp of the op that created it.
+
+   LIVE placement:  A placement whose binding tag has not been
+      observed-removed and whose list element is not tombstoned.
+
+   VALID placement:  A placement accepted by the validity pass of
+      Section 4.4 (it does not create a parent cycle at its position
+      in stamp order).  Validity is judged over ALL placements,
+      regardless of liveness, and is HISTORY-STABLE: it depends only
+      on smaller-stamped placements, so later operations can never
+      change an earlier placement's verdict.
+
+   LOCATION (of a node c):  location(c) = the greatest-stamped VALID
+      placement of c (liveness NOT considered in the choice).  A node
+      RENDERS at its location if and only if that placement is LIVE
+      (Section 4.3); it renders nowhere otherwise.  There is no
+      fallback past a dead location -- deletion is final; fallback
+      happens only across INVALID (cycle-skipped) placements.
+
+   STAYS-PUT RULE:  The cycle semantic of Section 4.4: a placement
+      that would create a cycle is ignored; the node remains at its
+      previous valid location.  (Literature outcome: [DK24] Figure
+      1(c)/(d), "one move ignored".)
+
+   GHOST PURGE (Revision B; replaces the draft's broader "observed
+      retirement"):  The rule of Section 4.2: a "mv" carries the
+      binding tags of OTHER children's live bindings at the source
+      map slot (superseded "ghosts"), retired exactly as a "del"
+      retires observed tags.  A "mv" MUST NOT retire the moved
+      child's own placements -- those are SUPPRESSED derivationally.
+      Unobserved (concurrent) placements survive.
+
+   SUPPRESSED (derived, Revision B):  A placement renders nothing
+      without being retired: either a greater-stamped VALID placement
+      of the same child exists (out-arbitrated), or it is the child's
+      location but is not live (deleted).  Suppression is computed at
+      materialization and never written into removed/tombstone state
+      by a "mv".
+
+   RESOLVED VIEW:  The materialization-equivalent projection of the
+      document (locations applied, losers hidden).  Section 4.6
+      requires ALL reads -- rendering, path resolution, and index
+      arithmetic -- to consult the same resolved view.
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Identity is the point.
+
+      A move MUST NOT mint a new nid.  The moved node keeps its
+      identity, so (a) concurrent edits addressed to the node follow
+      it to its new location, and (b) concurrent moves of the same
+      node collapse to ONE winner instead of duplicating.  This is the
+      property delete+reinsert cannot provide and the single reason
+      this extension exists.
+
+   3.2.  One operation for every move shape.
+
+      Subtree move (map key -> map key), array-element move
+      (reorder), and cross-container move (map -> list, list -> map)
+      are ONE operation with one semantic: create a placement,
+      arbitration does the rest.  The destination form is selected by
+      the TARGET NODE'S KIND, normatively (Section 4.5) -- not by
+      which optional fields happen to be present.
+
+   3.3.  Move is data, not mechanism.
+
+      Like EXT-11's "undo is data" principle: a "mv" is an ordinary
+      appended, leader-stamped, replicated op.  Apply/integrate stays
+      COMMUTATIVE, IDEMPOTENT, and APPLY-ONCE (EXT-5 Section 4.6);
+      it only records the placement and retires observed tags.  ALL
+      conflict and cycle resolution lives in the pure materialization
+      function (Section 4.4).  No history is rewritten; no second
+      replication path exists to get wrong.
+
+   3.4.  Determinism by leader stamping.
+
+      Everything replicas must agree on -- the op id, the stamp, the
+      resolved child nid, the destination (target nid + key / minted
+      element id), and the OBSERVED retirement set -- is fixed by the
+      leader at canonicalize time and carried in the replicated op,
+      per ACP/1 Section 17 and EXT-5 Section 3.4.  Followers apply
+      verbatim and never re-resolve.
+
+   3.5.  Compaction is observably transparent (new invariant).
+
+      No sequence of future operations may distinguish a compacted
+      replica from an uncompacted one by observable behavior.  EXT-5
+      compaction (Section 5.8) already GCs superseded state; this
+      extension MUST NOT create state that is invisible now but could
+      become visible later (which compaction would silently break).
+      The stays-put rule and observed retirement exist partly to
+      preserve this invariant: nothing a move hides can ever resurface
+      (Section 4.2), and nothing a cycle touches ever vanishes
+      (Section 4.4).  Conformance is testable: for all op sequences,
+      materialize(ops1 ++ ops2) == materialize(compact(ops1) ++ ops2).
+
+   3.6.  Architected for the CRDT extension family.
+
+      This design is chosen so that adjacent and future CRDT
+      extensions compose without rework:
+
+      o  UNDO (EXT-11).  Under EXT-11's server-computed inverses, the
+         inverse of a "mv" group is definitional: a compensating "mv"
+         re-asserting the node's previous location (plus re-binding
+         any retired placements observed at undo time), computed by
+         the same rules as every other inverse.  Had move been
+         delete+reinsert, undo-of-move would require resurrecting a
+         deleted subtree by id -- a second hard problem.  Accepting
+         this extension therefore SIMPLIFIES EXT-11; EXT-11's
+         Section 4.2 rules extend with one case ("mv": compensate
+         with a mv back, restoring retired placements) and no new
+         mechanism.
+
+      o  A shared resolution kernel.  The validity pass (Section 4.4)
+         is a stamp-ordered replay over the op set -- the same kernel
+         shape EXT-11's inverse computation uses ("the document
+         without my group").  Implementations MAY share this kernel;
+         this document does not require it.
+
+      o  SCHEMA VALIDATION (EXT-12).  A "mv" is a write; if EXT-12 is
+         configured, the leader validates the post-move document like
+         any other push (422 on violation).  No special case.
+
+      o  COUNTERS / new node kinds (EXT-5 Section 11.4).  The
+         placement/location model is kind-agnostic: any future node
+         kind is movable with zero change to this specification.
+
+   3.7.  Non-goals.
+
+      This extension does NOT add:
+
+      (a) MOVE FOR THE TEXT/SEQUENCE CRDT of ACP/1 Section 12.  The
+          text type is character-granular; a text move is a RANGE
+          move, which requires a range-identity model the character
+          sequence does not have (single-element list move is solved
+          in the literature [K20]; contiguous-range move is not).
+          RESIDUAL LOSS MODE (users MUST be warned): reordering
+          paragraphs in a Section 12 text document (e.g. via
+          "acp crdt sync") still decomposes to delete+insert and still
+          loses concurrent intra-paragraph edits.  Reserved for a
+          future extension; design ticket crdt-text-move-20260722.
+          Note that BLOCK-structured documents get block reorder from
+          THIS extension already, by modeling blocks as EXT-5 list
+          elements whose prose bodies are text-doc references (EXT-5
+          Section 3.1) -- often the better architecture regardless.
+
+      (b) COPY as a first-class op.  Copy genuinely duplicates
+          (fresh nids are correct there); the existing expansion
+          stands.
+
+      (c) CROSS-DOCUMENT or cross-space moves.  "Child" MUST resolve
+          within the addressed document.
+
+      (d) Multi-node atomic move batches beyond what one push already
+          provides (ops in one push apply as one group, EXT-5
+          Section 5.5).
+
+      (e) Any change to EXT-5's four existing operations, stores, or
+          endpoints.
+
+4.  The Move Operation
+
+   4.1.  The op and its placement.
+
+      A move op has type "t": "mv" and carries (wire detail in
+      Appendix A):
+
+         child          nid of the EXISTING node being moved.
+         target (+key)  destination MAP slot, or
+         target (+index_origin)
+                        destination LIST position; the leader mints
+                        the new element id (= the op id), exactly as
+                        for "lins".  A zero/root index_origin means
+                        the list head, as in EXT-5.
+         tags           the GHOST-PURGE set (Section 4.2): observed
+                        live binding tags of OTHER children at the
+                        source map slot, stamped by the leader.
+                        NEVER includes placements of "child" itself
+                        (Revision B).
+         now/actor/id   the leader stamp (EXT-5 Section 3.4).
+         from/path      client-convenience source and destination
+                        paths, resolved and cleared by the leader
+                        (EXT-5 Section 5.4).
+
+      Applying a "mv" RECORDS one new placement (parent = target,
+      slot = key or new element id, child = child, stamp = the op's
+      stamp) and retires the listed ghost tags.  Nothing else: no
+      cycle logic, no arbitration, no errors (a malformed op is a
+      deterministic no-op, as in EXT-5).  Guard against out-of-order
+      deletion, split by destination kind (review F12): a MAP-
+      destination "mv" whose op id is already in the observed-removed
+      tag set MUST stay dead (the "set" guard); a LIST-destination
+      "mv" whose minted element id is already tombstoned in the RGA
+      MUST stay dead (the "lins"/tombstone guard).
+
+      Implementation note (normative effect): LIST placements MUST
+      carry their placement stamp.  EXT-5 implementations that store
+      only element->child for lists must widen that record; without a
+      stamp, list placements cannot be arbitrated against map
+      placements in Section 4.3.
+
+   4.2.  What happens to the old placement (Revision B: derived
+         suppression + a minimal ghost purge).
+
+      The draft rule ("retire every live placement of the child")
+      was found jointly unsatisfiable with stays-put (review F1,
+      confirmed): in the concurrent A<->B cycle each move retired the
+      OTHER node's previous home, so the cycle loser had no fallback
+      and both subtrees vanished.  Revision B splits the concern:
+
+      (1) THE CHILD'S OWN OLD PLACEMENTS ARE NEVER RETIRED BY A "mv".
+          They are SUPPRESSED derivationally: location(c) is the
+          greatest-stamped VALID placement (Section 4.4), so a
+          winning move out-arbitrates every older placement of the
+          same child with no state change.  Because a placement's
+          validity is history-stable, this suppression survives
+          compaction unchanged (Section 3.5 holds).
+
+      (2) NO FALLBACK PAST A DEAD LOCATION (the no-resurrection
+          rule).  A node renders only if location(c) is LIVE.  If
+          the winning placement is deleted (observed-removed /
+          tombstoned), the node renders NOWHERE -- location does NOT
+          fall back to an older live placement.  Fallback occurs
+          ONLY across INVALID (cycle-skipped) placements, which is
+          exactly the stays-put case.  Delete means delete; losing
+          an arbitration means staying put.
+
+      (3) GHOST PURGE (the only retirement a "mv" performs).  At
+          canonicalize time the leader stamps into "tags" the
+          observed live binding tags of OTHER children at the SOURCE
+          map slot -- the superseded values a departing winner would
+          otherwise re-expose (slot k held X superseded by Y; moving
+          Y away must not resurrect X).  This is the "del" observed-
+          tags discipline (EXT-5 Section 4.1) scoped to the source
+          slot, minus the moved child's own tags.  For a LIST source
+          no purge is needed: list elements are not LWW-superseded,
+          and the source element is suppressed by rule (1) and
+          skipped by the resolved view (Section 4.6).  If no source
+          slot is determinable, "tags" is empty (Section 4.5).
+
+      Consequences, each REQUIRED and each covered by a named
+      conformance test (Section 7):
+
+         o  No duplication: concurrent "mv"s of one child = multiple
+            placements, one location, losers render nothing.
+         o  Stays-put works WITH deletion semantics: the cycle loser
+            falls back to its previous VALID placement, which is
+            still live because no "mv" retired it (C.3); a deleted
+            winner does not fall back (C.4(a)).
+         o  No ghost resurrection: the vacated slot empties exactly
+            as del+set would leave it, independent of compaction
+            timing (Section 3.5).
+         o  Concurrent edits follow: an edit addresses the child's
+            nid, which nothing here touches.
+         o  Concurrent del-vs-mv: a "del" at the old location that
+            never observed the mv's new placement does not kill it
+            -- the node SURVIVES at its new location (add-wins
+            analog; C.4(b)).
+
+   4.3.  Arbitration (two levels, normative order).
+
+      1. Per-child: location(c) = the greatest-stamped VALID
+         placement of c (Section 4.4 decides validity; liveness is
+         NOT part of the choice).  c RENDERS at location(c) only if
+         that placement is LIVE (Section 4.2 rule (2)).  With no
+         cycles involved this is plain LWW -- last move wins.
+
+      2. Per-slot (FILTER-THEN-MAX): a map slot (P, k) renders the
+         child c such that a live placement (P, k, c) exists AND
+         location(c) == (P, k); if several children qualify
+         (concurrent moves INTO one slot), the greatest-stamped
+         qualifying placement wins and the losers render nothing --
+         the same fate as a superseded "set" binding (overwrite
+         semantics).  Implementations MUST filter to
+         location-qualifying placements BEFORE taking the maximum: a
+         stale higher-stamped binding of a child that has moved away
+         MUST NOT suppress a legitimately-located child.
+
+      A LIST renders its non-tombstoned elements in sequence order,
+      SKIPPING any element whose child's location is elsewhere (no
+      null holes); such elements are also EXCLUDED from index
+      arithmetic (Section 4.6).
+
+   4.4.  The validity pass (cycle resolution -- normative algorithm).
+
+      Materialization is preceded by a pure pass over the applied op
+      set (this is [DK24] Algorithm 1 driven by ACP's leader-total
+      stamp order; see Appendix D for the lineage):
+
+         resolve(doc):
+           P <- ALL placements of all non-root nodes, live AND dead
+                ; dead placements participate so the validity of a
+                ; deleted winner is well-defined (Section 4.2 rule 2)
+           sort P ascending by stamp        ; strict total order:
+                                            ;   (now, actor, op id)
+           parent <- {}                     ; child -> (parent, slot)
+           for (stamp, child, par, slot) in P:
+             if child is a container        ; MAP or LIST; a child
+                                            ; whose node is not yet
+                                            ; present is treated as
+                                            ; a REGISTER (no
+                                            ; descendants) at this
+                                            ; evaluation
+                and isAncestorOrSelf(parent, par, child):
+               continue                     ; INVALID: would create a
+                                            ; cycle; child STAYS PUT
+                                            ; at its previous VALID
+                                            ; placement
+             parent[child] <- (par, slot)   ; VALID: later valid
+                                            ; placements override --
+                                            ; this IS the per-child
+                                            ; LWW of Section 4.3
+           return parent                    ; location(c) for all c;
+                                            ; RENDER c iff its entry
+                                            ; is LIVE (4.2 rule 2)
+
+         isAncestorOrSelf(parent, node, anc):
+           while node is not ROOT and parent has an entry for node:
+             if node == anc: return true
+             node <- parent[node].parent
+           return (node == anc)
+
+      Sentinel note (review F8, normative): "parent has an entry" is
+      the termination condition for an unplaced node -- the ABSENCE
+      of a map entry, which is distinct from both the zero id and
+      ROOT's reserved nid.  An implementation reading a missing key
+      as a zero value MUST NOT walk it (infinite-loop trap).
+
+      Unknown-child note (review F7, normative): a placement whose
+      child node has not yet been created (buffer-free delivery,
+      EXT-5's pending discipline) is processed with the child
+      treated as having NO descendants (register-equivalent: the
+      ancestor check is skipped for placements OF it, and a walk
+      arriving AT it stops as unplaced-or-leaf).  It renders nothing
+      until the child's creation op applies.  The pass is recomputed
+      per materialization over the then-current op set, so replicas
+      holding the same set agree at every point.
+
+      Properties (each REQUIRED of an implementation):
+
+         o  STAYS-PUT: an invalid (cycle-creating) placement is
+            skipped; the child keeps its previous valid location.
+            In the concurrent A<->B case exactly one of the two moves
+            takes effect (the greater-stamped one that remains
+            acyclic at its turn); BOTH nodes remain visible.  A
+            resolved cycle MUST NOT hide, delete, or duplicate any
+            node.  (Rejected alternative, recorded for reviewers:
+            "hide the cycle" -- rendering cyclic nodes unreachable --
+            silently vanishes every subtree in the cycle and the loss
+            becomes PERMANENT at the next compaction, violating
+            Section 3.5.  It MUST NOT be implemented.)
+
+         o  SCALAR SHORTCUT: a REGISTER has no children and can never
+            be an ancestor; register placements skip the ancestor
+            check ([DK24] Section 3.2).
+
+         o  DETERMINISM / ORDER-INDEPENDENCE: the input is the SET of
+            placements (live and dead) plus the liveness state; the
+            sort key is a strict total order; the output is a pure
+            function of the applied op set -- byte-identical on every
+            replica regardless of delivery order or duplication (the
+            EXT-5 Section 4.6 contract).  Validity is HISTORY-STABLE
+            (a placement's verdict depends only on smaller-stamped
+            placements), which is what makes compaction transparent:
+            the snapshot keeps exactly the valid winners, and no
+            later op can retroactively invalidate them.
+
+         o  TERMINATION: one pass over P; the parent map is at all
+            times a forest (cycle-creating placements are never
+            applied), so every ancestor walk is bounded by tree
+            height.  Cost O(|P| log |P|) for the sort plus one
+            bounded walk per CONTAINER move; within the EXT-5
+            Section 9.2 bounds this is comparable to materialization
+            itself.  Implementations MAY memoize the resolved
+            locations keyed by applied-op count.
+
+   4.5.  Addressing and validation (canonicalize-time, leader-only).
+
+      As in EXT-5 Section 5.4, path forms are client convenience; the
+      leader resolves and stores canonical NID form.  The leader MUST
+      reject (400) a "mv" whose:
+
+         o  "child" is the root, is unknown, or does not resolve
+            within the addressed document;
+         o  destination form mismatches the target node's kind ("key"
+            with a LIST target, "index_origin" with a MAP target) --
+            the TARGET KIND selects the form, never field presence
+            (a zero index_origin legitimately means "list head");
+         o  resulting materialized depth would exceed the EXT-5
+            Section 9.2 MaxDepth bound.  Exact inequality (review
+            F3a, normative):
+
+               depth(targetParent) + 1 + height(movedSubtree)
+                  <= MaxDepth
+
+            where depth(root) = 0, and height(movedSubtree) = the
+            number of node levels strictly BELOW the moved node
+            (a leaf has height 0).  HONESTY CLAUSE (review F3b):
+            this check runs at canonicalize time against committed
+            state and is BEST-EFFORT -- concurrently-canonicalized
+            moves, each individually within bound, can compose a
+            materialized tree deeper than MaxDepth (the same race
+            window as cycles, Section 1.3).  There is deliberately
+            NO materialization-time depth rejection (it would
+            re-open the where-does-the-node-go question); instead
+            deeper-than-bound nodes remain renderable but MAY be
+            path-unaddressable, and the Section 8.2 cost statement
+            is bounded by ACTUAL height, not MaxDepth.
+
+      The leader MUST reject with 409 (+ "current", the rebaseable
+      conflict class -- review F4 resolved in favor of 409, matching
+      Appendix B) a "mv" whose destination lies INSIDE the moved
+      subtree as of committed state.  This is a courtesy fast-reject;
+      the authoritative guard is Section 4.4, because two racing
+      pushes can each pass this check (Section 1.3).
+
+      SOURCE-SLOT determination for the ghost purge (review F5,
+      normative): if "from" is supplied, the source slot is the map
+      slot the resolved source path denotes.  If the "mv" is
+      submitted in NID form WITHOUT "from", the source slot is the
+      slot of location(child) as of committed state at canonicalize
+      time; if location(child) is a LIST element or the child is
+      currently unplaced, there is no source map slot and "tags" is
+      empty.  Implementations MUST NOT guess beyond this rule.
+
+      An unresolvable "from"/"path" follows EXT-5 Section 5.6
+      (409 + current value, or create_intermediate for the
+      DESTINATION only; a missing SOURCE is always 409 -- there is
+      nothing to move).
+
+   4.6.  One resolved view for every read (normative).
+
+      Path resolution, list index arithmetic, materialization, and
+      compaction MUST all consult the SAME resolved view of Sections
+      4.3-4.4:
+
+         o  Path descent follows the slot's RENDERED occupant.  After
+            a move, a write addressed to the node's old path MUST NOT
+            silently land on the moved-away subtree; it resolves
+            against what a reader of GET .../doc sees (and 409s per
+            EXT-5 Section 5.6 where the path no longer exists).
+         o  List index positions (lins "idx" convenience, ldel by
+            index, "elemAt") count only RENDERED elements, so index
+            semantics match the JSON a client just read.
+         o  This applies WITHIN one push too: later ops in a request
+            observe earlier ops' effects (EXT-5 Section 5.4's shadow),
+            including a "mv"'s.
+
+      Rationale (binding): every one of these read paths resolving
+      against RAW placements instead of the resolved view is a
+      deterministic, convergent, and WRONG behavior -- replicas agree
+      while users' writes land on invisible nodes.  Convergence
+      fuzzing cannot catch this class; conformance requires the
+      semantic tests of Section 7.
+
+   4.7.  Compaction.
+
+      "mv" is an ordinary op under the epoch barrier (EXT-5 Sections
+      5.5, 5.8): a stale-epoch push is 409.  A compaction snapshot
+      MUST emit each live node ONCE, at its RESOLVED LOCATION, as
+      ordinary set/lins with nids preserved -- a snapshot MUST NOT
+      contain "mv" ops (replay would re-run resolution against a
+      partial set) and MUST NOT emit placements for moved-away list
+      elements (the list re-anchoring of EXT-5 Section 5.8 is
+      computed over the RENDERED elements so replayed origins are
+      never dangling).  Post-compaction replay MUST reproduce the
+      identical materialized JSON (EXT-5's existing gate) and the
+      Section 3.5 transparency property.
+
+   4.8.  RFC 6902 (JSON-Patch) mapping.
+
+      Where a daemon advertises "crdtjson-move", a JSON-Patch "move"
+      SHOULD map to one "mv" op (from -> path), making the mapping
+      identity-preserving end-to-end.  Where it does not, the mapper
+      keeps today's remove+add expansion and SHOULD surface its
+      documented non-atomicity caveat.  "copy" always remains
+      remove-free duplication (fresh nids are correct for copy).
+
+5.  Capability Negotiation and Backward Compatibility
+
+   This extension adds a capability string to the ACP/1 introspection
+   endpoints, per the shared convention of EXT-1 Section 7:
+
+      GET /v1/healthz (and/or GET /v1/stats) responses gain:
+
+         "protocol": "acp/1",
+         "capabilities": [ ..., "crdtjson", "crdtjson-move", ... ]
+
+   A daemon MUST advertise "crdtjson-move" when (a) it fully implements
+   Section 4 and the Section 7 conformance bar and (b) it advertises
+   "crdtjson" (EXT-5 -- move without the type is meaningless).  It is
+   ALWAYS ON alongside "crdtjson" (owner decision, Section 9 -- no
+   runtime flag; mixed-version safety is a release-layer concern).  A
+   daemon that does NOT advertise it (a pre-move build) 404s/400s "mv"
+   ops rather than silently applying them.
+
+   A client MUST treat the ABSENCE of "crdtjson-move" as "not
+   supported" and fall back to delete+reinsert with its documented
+   identity-loss caveat (Section 4.8).  EXT-5 documents containing no
+   "mv" ops materialize exactly as before on every daemon; documents
+   whose logs CONTAIN "mv" ops require a move-capable daemon
+   thereafter (downgrade is unsupported, as with any capability that
+   introduces a stored op type -- Section 9).
+
+6.  Wire API Additions
+
+   Summary (full detail in Section 4; types in Appendix A):
+
+      New endpoints:  NONE.
+
+      Modified:
+         POST /v1/crdt/json/ops     accepts ops with "t": "mv"
+                                    (gated, Sections 5 and 9); the
+                                    stored canonical form carries
+                                    child/target/key-or-element/
+                                    ghost tags/stamp
+         GET  /v1/crdt/json/ops     returns "mv" ops in canonical
+                                    NID form like any other op
+         GET  /v1/healthz, /v1/stats + "crdtjson-move" capability
+
+   Everything else -- auth, roles ("writer"+ to push, as EXT-5
+   Section 7), headers, the epoch field, error model -- is unchanged.
+   A "mv" costs one op against MaxOps and the writer's rate budget.
+   Idempotency-Key (ACP/1 Section 6.4) MUST be honored on pushes
+   containing "mv" ops, as EXT-11 Section 6 requires for undo: a
+   replayed push returns the original result and MUST NOT mint a
+   second placement (review F10 -- without this, an HTTP retry is a
+   second logical move with a freshly derived ghost set).
+
+7.  Determinism and High Availability
+
+   ACP/1 Section 17 requires deterministic replicated apply.  This
+   extension preserves it:
+
+      o  The leader canonicalizes a "mv" against committed state:
+         resolves child + destination, mints the op id (and list
+         element id), stamps (now, actor), and stamps the OBSERVED
+         ghost-purge set (tags).  Followers apply the
+         canonical op verbatim; nothing is re-resolved, no clock or
+         randomness is read in apply or materialize.
+
+      o  Apply is commutative/idempotent/apply-once (Section 3.3), so
+         shuffled or duplicated delivery converges (the EXT-5
+         Section 4.6 contract, extended to "mv").
+
+      o  Materialization, including the Section 4.4 validity pass, is
+         a pure function of the applied op set (order-independence
+         argued in 4.4); every replica returns byte-identical JSON.
+
+      o  THE MIXED-VERSION HAZARD (the one way this extension can
+         corrupt a cluster): a follower running a pre-move daemon
+         applies an unknown "mv" as a silent no-op and diverges
+         PERMANENTLY from move-capable peers -- while both believe
+         they are healthy.  For this reason the leader MUST NOT admit
+         a "mv" into the replicated log unless the operator has
+         asserted cluster-wide support (Section 9).  There is no
+         in-band mechanism by which Raft members learn each other's
+         capabilities; the assertion is the OPERATOR'S (Section 9),
+         and the refusal is the leader's (Section 5).
+
+   Conformance bar (all REQUIRED before advertising the capability):
+
+      (a) the EXT-5 convergence property/fuzz suite extended with
+          concurrent moves and deliberately induced cycles, byte-
+          identical under shuffle+dup;
+      (b) a cross-replica determinism vector including "mv" (apply an
+          identical stream on independent state machines, compare
+          bytes), plus a leader-failover round-trip across a move;
+      (c) the SEMANTIC test set -- the CONCURRENT A<->B cycle WITH
+          the ghost-purge tags actually stamped (both nodes MUST
+          remain visible; this is the exact interaction review F1
+          caught, so the test MUST exercise retirement, not idealize
+          it away), delete-after-move deletes (no fallback past a
+          dead location), no superseded-ghost resurrection,
+          concurrent del-vs-mv add-wins, write-at-old-path misses,
+          list index arithmetic matches rendered arrays, compaction
+          transparency (Section 3.5) -- because fuzzing proves
+          replicas AGREE, and these prove they agree on the RIGHT
+          thing.
+
+8.  Security Considerations
+
+   8.1.  Authority and spoofing.
+
+      "mv" is a write: "reader" MUST be refused 403; scoped tokens
+      (EXT-7) MUST pass the same scope checks as any write to the
+      document.  The leader overwrites all stamps and ids and derives
+      the retirement set from committed state (EXT-5 Section 9.4): a
+      client cannot name tags it never observed into deletion beyond
+      what "del" already allows, cannot forge stamps to win
+      arbitration, and cannot reference nodes outside the addressed
+      document (Section 3.7(c)).
+
+   8.2.  Resource use.
+
+      A "mv" is one stored op regardless of subtree size -- moves do
+      NOT amplify storage.  The costs are (a) canonicalize-time
+      resolution (bounded by EXT-5 Section 9.2 path/depth caps) and
+      (b) the materialization-time validity pass: O(P log P) for the
+      sort plus one ancestor walk per container move, each bounded
+      by the ACTUAL tree height -- which, per the Section 4.5
+      honesty clause, concurrency can push past MaxDepth; the true
+      worst case is O(P^2) with P <= MaxOps (review F3b).  Daemons
+      SHOULD memoize the resolved view between writes (collapsing
+      repeated reads to O(1)) and MAY rate-limit materialized reads
+      (EXT-5 Section 9.3).  Move-churn spam is rate-limited as
+      ordinary writes; the MaxOps cap bounds the pathological case
+      absolutely.
+
+   8.3.  Audit.
+
+      Moves are ordinary logged ops attributed to the authenticated
+      actor; the event log's "crdt.op" records note activity as for
+      every push.  History is never rewritten: a resolved-away
+      (losing) move remains in the log until compaction, and the
+      audit trail shows who moved what, when, whether or not the move
+      won arbitration.
+
+   8.4.  Isolation.
+
+      Space isolation is unchanged (ACP/1 Section 7).  There is no
+      per-node ACL (EXT-5 Section 3.6(f)); anyone who can write the
+      document can move anything in it.  Confidential separation
+      remains a separate space.
+
+9.  Rollout Plan (Mixed-Version Clusters)
+
+   OWNER DECISION (2026-07-23): the capability is ALWAYS ON, advertised
+   alongside "crdtjson" with NO runtime flag.  Mixed-version safety is
+   handled at the RELEASE layer, not per-request: the release SOP ships
+   and deploys a single move-capable binary across the whole fleet, so
+   a cluster is never durably split between move-capable and pre-move
+   members.  (The reference deployment is single-node behind the release
+   SOP; a "mv" is canonicalized and accepted whenever the structured
+   store is present.)  This replaces the earlier flag-gated draft: the
+   divergence hazard of Section 7 is real, but it is closed by atomic
+   fleet-wide binary replacement rather than an operator flag.
+
+      Deploy -- ship the move-capable binary to EVERY node via the
+         release SOP (its deploy stage healthchecks the structured
+         store and rolls back on failure).  On start, every daemon
+         with the structured store advertises "crdtjson-move" and the
+         leader admits "mv" ops.  Clients feature-detect per Section 5
+         and use real moves (Section 4.8).
+
+   MEMBERSHIP CHANGES (review F2, normative).  The Section 7 hazard
+   still applies to JOINING and REPLACEMENT members: once "mv" ops
+   exist in a cluster's log, an OLD-binary member that joins catches
+   up either by log replay (it silently no-ops every "mv" -> permanent
+   divergence) or by snapshot (safe only if post-compaction, which
+   carries no "mv" ops, Section 4.7).  Therefore an operator MUST NOT
+   add or replace a member with a binary that is not move-capable once
+   move-capable binaries are deployed -- which the single-binary
+   release model makes the default (every node runs the same release).
+   Implementations SHOULD mark FSM snapshots taken from a move-capable
+   state with a "requires: crdtjson-move" annotation that a pre-move
+   binary REFUSES rather than silently applies; operators MUST NOT rely
+   on compaction timing for join safety.
+
+   Reversibility: a pre-move daemon simply lacks the endpoints' mv
+   support and does not advertise the capability; ACP/1 and EXT-5 peers
+   are unaffected.  DOWNGRADE of a daemon below move support after "mv"
+   ops exist in a document's log is UNSUPPORTED (the op would silently
+   no-op on replay); operators MUST compact first (a post-move snapshot
+   contains no "mv" ops, Section 4.7) or accept the documented
+   limitation.  This mirrors every stored-op capability addition.
+
+10. Open Questions
+
+   o  Memoization guidance: whether to specify a normative caching
+      key (applied-op count) for the Section 4.4 pass or leave it to
+      implementations (this document leaves it MAY).
+
+   o  Whether a future revision should let one "mv" atomically carry
+      SEVERAL children (bulk drag of a selection).  Today a multi-
+      select drag is several "mv" ops in one push -- one group,
+      atomic at the push level, which may be sufficient.
+
+   o  Conflict SURFACING: a losing concurrent move is silently
+      superseded (correct for convergence); whether the authority
+      should optionally emit an advisory event so UIs can toast
+      "your move was overridden" is open (cf. EXT-11's open question
+      on surfacing no-op undos).
+
+   o  TEXT-RANGE MOVE (Section 3.7(a)): reserved for a future
+      extension; its spike must resolve range identity over the
+      character sequence, likely a different mechanism (the
+      per-element LWW of [K20] does not compose to ranges).
+
+   o  Whether the EXT-12 schema validator needs a move-specific rule
+      class (e.g. "children of node type X may live only under Y"),
+      which moves make newly expressible; deferred to EXT-12.
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   JsonOp (changed -- one NEW op type; EXT-5 Appendix A shapes
+   otherwise unchanged.  Stamps use the accepted now/actor form of
+   EXT-5 owner refinement 1, which GOVERNS over EXT-5 Appendix A's
+   original ts/tag shapes -- that appendix was never updated; review
+   F11):
+
+      { "t": "mv",
+        "id":           OpId,      ; leader-minted; for a LIST
+                                   ;   destination this is also the
+                                   ;   new element id (as "lins")
+        "child":        Nid,       ; the EXISTING node being moved
+        "target":       Nid,       ; destination parent node
+
+        ; destination slot -- form selected by target's KIND (4.5):
+        "key":          <string>?, ; MAP destination: object key
+        "index_origin": Nid?,      ; LIST destination: insert-after
+                                   ;   (zero/root id = list head)
+
+        ; ghost purge (leader-stamped, Section 4.2 rule (3); NEVER
+        ; the moved child's own placements -- Revision B):
+        "tags":         [ OpId ]?, ; OTHER children's live binding
+                                   ;   tags at the source map slot;
+                                   ;   empty when no source map slot
+                                   ;   is determinable (Section 4.5)
+
+        ; leader stamp (EXT-5 owner refinement 1):
+        "now":          <int64>,   ; leader clock (unix nanos)
+        "actor":        <string>,  ; authenticated writer
+
+        ; client-convenience addressing (resolved + CLEARED by the
+        ; leader; never stored):
+        "from":         [ <string|int> ]?,   ; source path
+        "path":         [ <string|int> ]? }  ; destination path
+
+      A "mv" carries NO "nid", "kind", or "value": it never creates a
+      node.  Unknown-field tolerance follows EXT-5 Section 3.3.
+
+   Implementation-internal (not wire; normative effect per 4.1):
+      LIST placement records gain the placement stamp:
+         element id -> { child: Nid, stamp: (now, actor, op id) }
+
+   Health/Stats (changed -- capability advertised, plus the limits
+   hint per the EXT-4/EXT-11 convention; review F13):
+      { ...existing fields...,
+        "protocol": "acp/1",
+        "capabilities": [ ..., "crdtjson", "crdtjson-move", ... ],
+        "limits": { "crdtjson_max_depth": 32, ... }? }
+
+Appendix B.  New Error Conditions
+
+   400  Bad request: "mv" submitted to a pre-move daemon that does not
+        advertise "crdtjson-move" (Section 5); unknown or root "child";
+        destination form mismatching the target kind (Section 4.5);
+        move would exceed the materialized-depth bound; malformed op.
+   403  Forbidden: role "reader" (move is a write); scope refusal
+        (EXT-7).
+   409  Conflict: epoch changed (compacted -- resync, EXT-5 Section
+        5.8); unresolvable "from"/"path" (with "current", EXT-5
+        Section 5.6); courtesy rejection of a move into its own
+        subtree as of committed state (Section 4.5).
+   429  Too Many Requests: rate budget exceeded (ACP/1 Section 5.4).
+
+   All other status codes carry the ACP/1 and EXT-5 meanings.
+
+Appendix C.  Worked Examples
+
+   C.1.  Reorder an array element while a peer edits it (the
+         motivating case -- identity preserved).
+
+      Document "board": {"cards":[{"text":"draft"},{"text":"ship"}]}
+
+      Agent A drags card 0 after card 1 (path convenience form):
+         > POST /v1/crdt/json/ops
+         > X-ACP-Agent: claudeA
+         > { "doc":"board",
+         >   "ops":[ {"t":"mv","from":["cards",0],
+         >            "path":["cards",1]} ] }
+         < 200 { "doc":"board","total":9,"epoch":0 }
+         (leader resolves the card's nid, mints a new element id
+          after card 1's; the old element is SUPPRESSED derivation-
+          ally -- location(card) moved -- and skipped by the
+          resolved view, Section 4.2/4.6.)
+
+      CONCURRENTLY agent B edits the same card's text, addressing
+      the card's NID (its client tracked the nid from a prior sync):
+         > POST /v1/crdt/json/ops
+         > X-ACP-Agent: codexB
+         > { "doc":"board",
+         >   "ops":[ {"t":"set","target":<text-register nid of the
+         >            draft card>, "value":"\"draft v2\""} ] }
+
+      The card kept that nid across the move, so the edit follows it
+      unconditionally.  NOTE (review F6): the follow guarantee is a
+      property of NID-addressed writes.  A PATH write ("cards",0,...)
+      resolves against committed state at ITS canonicalize time
+      (EXT-5 Section 5.4) -- before the move commits it resolves to
+      the draft card and follows; after, index 0 is the ship card
+      and the edit lands there.  Clients wanting follow-the-node
+      semantics MUST address by nid (or re-resolve paths from a
+      fresh read).  Converged result:
+         { "cards":[ {"text":"ship"}, {"text":"draft v2"} ] }
+      The edit FOLLOWED the moved card.  Under delete+reinsert the
+      edit would have landed on the deleted copy and vanished
+      (Section 1.2).
+
+   C.2.  Concurrent moves of the SAME node -- one winner, no
+         duplicate.
+
+      A moves node X under "done"; B concurrently moves X under
+      "archive".  Both mvs commit; X now has two live placements.
+      location(X) = the greater-stamped one (say B's).  X renders
+      ONCE, under "archive"; A's placement renders nothing and is
+      GC'd at the next compaction.  Both replicas, and any replica
+      receiving the ops in any order, agree -- compare [DK24]
+      Section 3.1 (largest-ID move wins).
+
+   C.3.  The concurrent cycle (the literature's Figure 1) -- STAYS
+         PUT.
+
+      Start: {"A":{...},"B":{...}} (A and B siblings under root).
+      A's client: mv B under A.  B's client, racing: mv A under B.
+      Both canonicalize against the same committed state (each
+      acyclic when checked, Section 1.3); both commit.
+
+      Retirement interaction (the exact case review F1 caught --
+      under Revision B, NEITHER move retires the other node's root
+      placement: mv1's ghost purge covers only OTHER children's
+      bindings at B's source slot root/"B" (there are none), and the
+      moved child's own placements are never retired (Section 4.2
+      rule (1)).  So root/"A" and root/"B" both remain LIVE.
+
+      Validity pass (Section 4.4), stamps s1 < s2 (root placements
+      carry earlier stamps s0/s0'):
+         s0 : A -> under root           VALID
+         s0': B -> under root           VALID
+         s1 : B -> under A              VALID (acyclic);
+                                        location(B) := under A
+         s2 : A -> under B              SKIPPED -- B is inside A's
+                                        subtree; cycle.  location(A)
+                                        stays s0 (under root), which
+                                        is LIVE -> A renders there.
+
+      Materialized, on every replica: {"A":{...,"B":{...}}} -- the
+      [DK24] Figure 1(c)/(d) outcome: one move ignored, BOTH nodes
+      visible, nothing duplicated, nothing lost.  (Under the
+      pre-Revision-B rule, mv2 retired root/"A" and BOTH subtrees
+      vanished -- the forbidden outcome; the conformance suite MUST
+      include this exact scenario with the tags actually stamped,
+      Section 7(c).)
+
+   C.4.  Delete after move deletes; concurrent delete loses to an
+         unobserved move.
+
+      (a) mv X: root/"a" -> root/"b" (stamp 20; the placement at "a",
+          stamp 10, stays live but suppressed); then del root/"b"
+          observes and retires the stamp-20 placement.  location(X)
+          is STILL the stamp-20 placement -- location is chosen by
+          VALIDITY, not liveness (Section 4.2 rule (2)) -- and it is
+          now DEAD, so X renders NOWHERE.  No fallback to "a"; no
+          resurrection.  Delete means delete.
+
+      (b) mv X: "a" -> "b" racing del "a" (the del canonicalized
+          before the mv committed, so it observed only the stamp-10
+          tag): the del kills the old placement; the mv's NEW
+          placement was never observed by the del, is live and
+          valid, and is location(X).  X lives at "b" -- the
+          specified add-wins outcome (Section 4.2).
+
+   C.5.  Capability check and fallback (against a PRE-MOVE daemon).
+
+      > GET /v1/healthz
+      < 200 { "capabilities":["channels","crdtjson"] }     ; no move
+      Client maps JSON-Patch "move" to remove+add (identity-lossy,
+      documented).  Pushing a "mv" to that old daemon anyway:
+      > POST /v1/crdt/json/ops {"doc":"d","ops":[{"t":"mv",...}]}
+      < 400 { "error":"unknown op type \"mv\"" }
+      A move-capable daemon (this extension) advertises "crdtjson-move"
+      alongside "crdtjson" and accepts the same push (Section 9: always
+      on, no flag).
+
+Appendix D.  Research Basis and Algorithm Lineage
+
+   This design is the identity-preserving move lineage of the CRDT
+   literature, adapted to ACP's authority architecture.  The papers,
+   what each contributes, and what this specification adopts:
+
+   [S11]  Shapiro, Preguica, Baquero, Zawirski.  "Conflict-free
+          Replicated Data Types."  SSS 2011.
+          The CRDT foundations (strong eventual consistency;
+          commutative/idempotent ops) underlying ACP/1 Section 12 and
+          EXT-5 Section 4.6.
+
+   [KB17] Kleppmann, Beresford.  "A Conflict-Free Replicated JSON
+          Datatype."  IEEE TPDS 28(10), 2017.  arXiv:1608.03960.
+          The nested map/list/register JSON CRDT model EXT-5 descends
+          from.  Notably has NO move -- the gap this lineage then
+          closes.
+
+   [K20]  Kleppmann.  "Moving Elements in List CRDTs."  PaPoC 2020.
+          THE single-element move primitive: one LWW register per
+          element for its position; concurrent moves of one element
+          resolve by greatest stamp.  Section 4.3's per-child
+          location rule is this primitive generalized to every node.
+          [K20] also shows why delete+reinsert duplicates -- the
+          motivation of Section 1.2 -- and leaves RANGE moves open,
+          which is why text-range move is a non-goal (Section 3.7(a)).
+
+   [KMGB21] Kleppmann, Mulligan, Gomes, Beresford.  "A Highly-
+          Available Move Operation for Replicated Trees."  IEEE TPDS
+          33(7), 2021.
+          The tree-move algorithm (an undo-do-redo scheme over a
+          totally ordered op log; renamed RAR in [DK24] to avoid
+          confusion with user-facing undo -- the same distinction
+          EXT-11 draws).  Establishes the correctness frame this
+          document reuses: apply moves in a total order; a move that
+          would create a cycle at its turn is skipped; skipped moves
+          leave the node at its prior parent.
+
+   [DK24] Da, Kleppmann.  "Extending JSON CRDTs with Move
+          Operations."  PaPoC 2024.  DOI 10.1145/3642976.3653030;
+          arXiv:2311.14007.
+          The direct basis.  Contributes (a) the JSON-specific
+          validity rules -- largest-ID wins per moved element, no
+          cycles, invalid move invisible with predecessors visible
+          (its Section 3.1; our Sections 4.3-4.4); (b) ALGORITHM 1,
+          the from-scratch ascending-ID validity pass with the
+          IsAncestor walk -- Section 4.4 is Algorithm 1 driven by
+          ACP's leader stamp order; (c) the scalar-move cycle
+          shortcut (its Section 3.2; our 4.4); (d) Figure 1's outcome
+          taxonomy -- this document guarantees outcome (c)/(d)
+          (one move ignored) and forbids (a) cycles and (b)
+          duplication.
+
+          What this document deliberately does NOT adopt from [DK24]:
+          Algorithm 2 (Restore-Apply-Reapply) and lifecycle tracking.
+          Those exist because a SERVERLESS replica receives ops out
+          of causal order and must incrementally re-derive validity.
+          ACP's authority already imposes one total order on every
+          replica (ACP/1 Section 17), so the from-scratch pass is
+          run (or memoized) inside pure materialization instead --
+          the same semantics at none of the incremental complexity.
+          Their batch-updating observation survives trivially: one
+          push's ops canonicalize together already (EXT-5 Section
+          5.5).
+
+   [B25]  Brocco.  "Introducing Support for Move Operations in Melda
+          CRDT."  arXiv:2503.04811, 2025.
+          Independent corroboration from the delta-state line:
+          identity preservation (moves as reference updates over
+          stable unique ids) is the consensus fix for duplication,
+          reached separately from the Kleppmann lineage.
+
+   Testing lineage: [DK24] Section 4.3 validates by Jepsen-style
+   randomized convergence; EXT-5 already institutionalized the same
+   method (its fuzz gate).  Section 7 extends that gate with moves
+   and adds the SEMANTIC test class (stays-put, no-resurrection,
+   resolved-view reads, compaction transparency) that pure
+   convergence testing cannot see.
+
+   Full annotated bibliographies, forward-citation survey, and the
+   algorithm extraction live in the design record:
+   tickets/crdt-json-research-spike-20260722/ (ALGORITHMS.md,
+   CITATIONS.md, FORWARD_CITATIONS.md, SYNTHESIS) and
+   tickets/crdt-json-move-20260722/ (DESIGN rev 2, review reports).
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt), the ACP/EXT-5 structured-CRDT extension, and the
+   reference implementation distributed at
+   https://github.com/ab0t-com/acp .

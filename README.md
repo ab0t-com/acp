@@ -55,6 +55,7 @@ can feature-detect instead of trial-and-erroring requests:
 - `channels` — pub/sub on named channels with wildcard (`*`) topic filtering.
 - `batchevents` — atomic multi-event append in one call.
 - `crdtjson` — structured (JSON) CRDT documents, in addition to text CRDT sync.
+- `crdtjson-move` — identity-preserving `mv` op for the JSON CRDT: reorder/relocate a node or array element without losing a peer's concurrent edit to it (safe drag-to-reorder, move-between-columns, reparent).
 - `scopedtokens` — narrower-than-admin token grants.
 - `quotas` — per-space resource limits.
 

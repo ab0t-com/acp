@@ -1,0 +1,733 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-15                                     ab0t.com
+Updates: ACP/1                                                     July 2026
+Category: Extension Proposal (EARLY DRAFT)                         ISSN: n/a
+
+
+        ACP Extension Proposal 15: Identity-Preserving RANGE MOVE
+                  for the Text/Sequence CRDT (DRAFT)
+
+
+   [ Editor's notes.
+     (1) The extension NUMBER "15" is EARMARKED by the protocol owner
+         (2026-07-23) and remains formally PROVISIONAL until assigned
+         on acceptance.
+     (2) THIS IS AN EARLY DRAFT.  The commissioned deep research pass
+         LANDED 2026-07-23 (tickets/crdt-text-move-20260722/:
+         LITREVIEW.md, OPTIONS_ext15.md, per-paper extractions 1-7)
+         and is FOLDED IN: the open-problem status is triangulated
+         for 2026 (Appendix D.3), the overlap rule (Section 4.4) and
+         the new edge-membership knob (Section 4.4a) are research-
+         informed, and the remaining [RESEARCH-PENDING] tags mark
+         only what is genuinely still open -- the Section 4.5
+         state-cost representation (per the research, THE hard part)
+         and the D.2 implementation-survey gap (Loro/Automerge/Yjs
+         not yet fully surveyed; only the YATA-move exploration
+         was).  One design input arrived from the JSON sibling after
+         this draft was first cut: EXT-14 Revision B's F1 lesson
+         (Section 3.2a). ]
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies one additive,
+   backward-compatible feature: an identity-preserving MOVE for the
+   TEXT/SEQUENCE CRDT of ACP/1 Section 12 -- relocating a contiguous
+   RANGE of elements (a paragraph, a bullet point, a block of lines)
+   to a new position without destroying the moved elements' identity.
+
+   Today a text move is a delete-run plus an insert-run of fresh
+   element ids (the Section 12 client surface is a whole-document
+   diff, which can express nothing else).  Under concurrency this
+   loses data: an edit made inside a paragraph while a peer reorders
+   that paragraph anchors to the OLD position ids and is stranded or
+   lost.  The sibling extension ACP/EXT-14 closes the analogous gap
+   for the structured (JSON) CRDT and names this residual text-CRDT
+   loss mode as an explicit non-goal pointing here.
+
+   Moving a SINGLE list element is a solved problem in the literature
+   (one last-writer-wins position register per element).  Moving a
+   RANGE is, as of the 2020 state of the art, an explicitly OPEN
+   problem in serverless settings.  This proposal's central argument
+   is that ACP's authority changes the problem: with a leader that
+   canonicalizes every mutation against committed state and a Raft
+   total order over operations, a range move can be expressed as ONE
+   ATOMIC BATCH of identity-preserving single-element moves, and the
+   serverless edge cases (concurrent overlapping range moves; edits
+   inside a moving range) reduce to arbitration rules ACP/EXT-14 has
+   already established (leader-total-ordered stamps; stays-put
+   conflict semantics).  The feature is negotiated by a new
+   capability string, "crdt-text-move", with the same operator-gated
+   mixed-version rollout as EXT-14.  The wire version stays "acp/1".
+
+Status of This Memo
+
+   This is an EARLY-DRAFT PROPOSAL, not yet part of the normative
+   ACP/1 specification and not yet ready for acceptance review.  It
+   is published so the team can review the architecture DIRECTION
+   while the commissioned literature review completes, and so the
+   research agents have a concrete target to confirm or refute.
+   Sections 4.4, 4.5, and Appendix D carry [RESEARCH-PENDING] hooks.
+
+   Lineage and sequencing: this proposal depends on nothing in
+   ACP/EXT-5, but its DESIGN inherits from ACP/EXT-14 (identity
+   preservation, LWW location, stays-put semantics, the operator-
+   gated rollout) and its BUILD is sequenced AFTER EXT-14 lands.
+   Per-actor undo remains ACP/EXT-11 and is NOT bundled here (owner
+   ruling 2026-07-23; one feature per extension).  The extension
+   number EXT-15 is owner-earmarked, provisional until acceptance.
+   The base protocol version string remains "acp/1".  Distribution is
+   unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Range Move (Candidate Design)
+   5.  Capability Negotiation and Backward Compatibility
+   6.  Wire API Additions
+   7.  Determinism and High Availability
+   8.  Security Considerations
+   9.  Rollout Plan (Mixed-Version Clusters)
+   10. Open Questions (the research agenda)
+   Appendix A.  New and Changed Data Types (DRAFT)
+   Appendix B.  New Error Conditions (DRAFT)
+   Appendix C.  Worked Examples
+   Appendix D.  Research Basis [RESEARCH-PENDING sections marked]
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   1.1.  Text reorder loses concurrent edits today.
+
+      The Section 12 text CRDT is character-granular: every element
+      is one rune with a stable id, inserted after an origin element.
+      Its only client surface is a whole-document diff, so "move this
+      paragraph up" reaches the authority as delete-run + insert-run
+      OF FRESH IDS.  A peer's concurrent edit inside that paragraph
+      anchors to the OLD element ids -- which are now tombstones far
+      from the re-inserted text -- and the edit is stranded at the
+      old position or silently lost.  This is the anomaly documented
+      in [K20] Figure 4 (Appendix D): the edit's surrounding context
+      moved; the edit did not follow.
+
+   1.2.  EXT-14 names this gap and points here.
+
+      ACP/EXT-14 Section 3.7(a) closes identity-preserving move for
+      the JSON CRDT and explicitly documents the residual text loss
+      mode ("acp crdt sync" paragraph reorder) as out of its scope,
+      reserved for this extension.  Block-STRUCTURED documents get
+      block reorder from EXT-14 already (blocks as EXT-5 list
+      elements referencing text docs); [K20] Section 4 proves that
+      recipe still does not remove the need for range moves: SPLIT
+      and JOIN of blocks move character ranges BETWEEN text objects.
+
+   1.3.  Single-element move is solved; range move is open --
+         and ACP's authority is the lever.
+
+      [K20] gives the single-element algorithm (one LWW position
+      register per element; fresh destination position ids) and
+      states plainly that RANGE moves have "no known algorithm" in
+      the serverless model, naming the killers: concurrent moves of
+      partially overlapping ranges, and destinations inside ranges
+      that are themselves moving.  Those killers are artifacts of
+      NO-AUTHORITY replication: replicas receive the conflicting
+      range moves in different orders and must converge anyway.  ACP
+      replicas do not: the leader canonicalizes every mutation
+      against committed state, stamps a strict total order, and Raft
+      delivers one sequence to every replica (ACP/1 Sections 8, 17).
+      This proposal therefore reduces a range move to ONE ATOMIC,
+      LEADER-ORDERED BATCH of single-element moves and inherits
+      EXT-14's arbitration discipline for the residual races.  The
+      claim "the authority makes the open problem tractable" is the
+      load-bearing bet of this draft, and it is exactly what the
+      commissioned research pass must pressure-test
+      [RESEARCH-PENDING].
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL
+   NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL"
+   in this document are to be interpreted as described in BCP 14
+   [RFC2119] [RFC8174].
+
+   This document uses the ACP/1 definitions (spaces, auth, roles, the
+   Section 12 text CRDT: element, element id, origin, tombstone,
+   epoch, compaction) and, for design lineage only, the EXT-14
+   definitions (placement, location, stamp, stays-put, observed
+   retirement) without restating them.
+
+   RANGE:  A contiguous run of live elements [first..last] in a text
+      document's sequence order, addressed by the STABLE ELEMENT IDS
+      of its endpoints (never by integer offsets on the wire).
+
+   POSITION REGISTER:  Per-element LWW register holding the element's
+      current position anchor; writing it moves the element ([K20]
+      Section 3).  The register's stamp is leader-assigned
+      (now, actor, op id), as in EXT-14.
+
+   MOVE BATCH:  The canonical form of one range move: the ordered set
+      of per-element position-register writes the leader expands a
+      range-move request into, applied atomically as one op group.
+
+   REDIRECTION:  The required semantics for an edit concurrent with a
+      move of the range containing its anchor: the edit integrates
+      relative to its anchor element AT THE ANCHOR'S NEW POSITION
+      ([K20] Figure 5, the "desired outcome").
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Identity preservation, lifted from EXT-14.
+
+      A moved element keeps its id; only its position register
+      changes.  Everything follows from this: concurrent edits
+      anchored to moved elements redirect (Section 2), concurrent
+      moves of the same element collapse to one LWW winner, and
+      delete+reinsert duplication is impossible for moves expressed
+      through this extension.
+
+   3.2.  Stays-put conflict semantics (EXT-14 Section 4.4 inherited).
+
+      Where two moves conflict irreconcilably, the losing move is
+      IGNORED and the affected elements REMAIN at their previous
+      valid positions.  A conflict resolution MUST NOT hide, delete,
+      or duplicate text.  (The precise overlap rule is Section 4.4
+      and is an open design decision -- but whatever is chosen must
+      satisfy this principle.)
+
+   3.2a. The EXT-14 Revision-B lesson is BINDING here (2026-07-23).
+
+      EXT-14's independent review found its draft retirement rule
+      jointly unsatisfiable with stays-put: retiring the moved
+      thing's OWN prior placement destroyed the fallback the
+      conflict loser needed, vanishing data (its F1).  The corrected
+      rule -- DERIVED SUPPRESSION: location chosen by validity, a
+      thing renders only where its location is live, no fallback
+      past a deleted winner, and a move NEVER retires the moved
+      thing's own prior position -- carries over here verbatim: a
+      position-register write MUST NOT tombstone or retire the
+      element's prior position record; the old position is
+      out-arbitrated derivationally, and deletion semantics come
+      only from real deletes.  Any ext-15 design that eagerly
+      "cleans up" source positions will reproduce EXT-14's F1 bug in
+      sequence form.  (EXT-14 Sections 4.2-4.4, Revision B.)
+
+   3.3.  Move is data, not mechanism.
+
+      Position-register writes are ordinary appended, leader-stamped,
+      replicated ops; apply stays commutative/idempotent/apply-once;
+      resolution is a pure function of the applied op set.  No
+      history rewriting; no second replication path.
+
+   3.4.  The diff surface stays; a move surface is added.
+
+      The Section 12 whole-document diff client flow is untouched
+      (and remains move-blind).  Range move is expressed through a
+      NEW explicit request (Section 6); how clients DETECT move
+      intent (an editor verb vs diff heuristics) is a client concern
+      outside this protocol (Section 10).
+
+   3.5.  Compaction stays observably transparent.
+
+      The EXT-14 Section 3.5 invariant applies verbatim: snapshots
+      emit elements at their RESOLVED positions, position registers
+      survive replay, and no future op sequence can distinguish a
+      compacted from an uncompacted replica.
+
+   3.6.  Non-goals.
+
+      This extension does NOT add: (a) JSON/structured move -- that
+      is EXT-14; (b) UNDO -- that is EXT-11 (owner ruling 2026-07-23:
+      not bundled; note EXT-11's own open question already reserves
+      text-CRDT undo, whose inverse rules this extension's position
+      registers would simplify the same way EXT-14 Section 3.6
+      simplifies undo-of-move); (c) rich-text FORMATTING spans
+      (Peritext-class machinery -- adjacent, not move); (d) cross-
+      document range moves (split/join across text docs is REAL and
+      is deliberately staged as an open question, Section 10, not
+      silently promised); (e) any change to Section 12's existing
+      ins/del semantics for non-move edits.
+
+4.  Range Move (Candidate Design)
+
+   [ This section is the architecture the owner asked to see drafted.
+     4.1-4.3 rest on evidence already in hand ([K20] + the EXT-14
+     arbitration discipline).  4.4 and 4.5 are genuinely open and
+     carry the research hooks. ]
+
+   4.1.  Element position registers (the [K20] retrofit).
+
+      Every live element of a text document gains a POSITION
+      REGISTER.  Creation (ins) initializes it implicitly to the
+      insertion position at zero extra cost; only elements that have
+      BEEN moved carry an explicit register value (sparse
+      representation -- an unmoved document stores nothing new).
+      Moving an element writes its register with a fresh leader-
+      minted destination position anchor ([K20]'s fresh-destination
+      rule, which EXT-14 D8 mirrors); concurrent moves of one element
+      resolve by the leader-stamped LWW rule; the vacated position is
+      treated as nonexistent.  Integration order among elements at
+      the same anchor follows the Section 12.1 origin/id rule
+      unchanged.
+
+   4.2.  A range move is one atomic MOVE BATCH.
+
+      The client names a range by its endpoint ELEMENT IDS plus a
+      destination anchor (an element id after which the range lands,
+      or the document head).  The LEADER, against committed state:
+
+         (a) resolves the range to the ordered run of live elements
+             [first..last] (400 if the endpoints are not both live,
+             not in order, or the destination anchor lies INSIDE the
+             range);
+         (b) mints fresh destination position anchors preserving the
+             run's internal order;
+         (c) expands to per-element position-register writes -- the
+             MOVE BATCH -- stamped as ONE op group and proposed
+             atomically (all-or-nothing, exactly as an EXT-5 push
+             group).
+
+      Raft's total order serializes whole batches: two "concurrent"
+      range moves are two batches with disjoint stamp intervals, so
+      the serverless nightmare of interleaved overlapping range
+      moves cannot occur BETWEEN batches.  The residual race is the
+      canonicalize-vs-commit window (two batches both canonicalized
+      against the same committed state -- the same window EXT-14
+      Section 1.3 handles), which Section 4.4's arbitration rule
+      resolves deterministically at materialization.
+
+   4.3.  Redirection of concurrent in-range edits (the payoff).
+
+      An insert concurrent with a move of the range containing its
+      origin anchors to an ELEMENT ID whose identity survived the
+      move.  It therefore integrates next to that element at the
+      element's NEW position -- the [K20] Figure 5 desired outcome --
+      with NO new merge machinery: identity preservation plus the
+      existing origin rule delivers it.  A delete concurrent with a
+      move tombstones its element wherever that element now is.
+      Conformance MUST include the Figure-4-scenario semantic test:
+      edit-inside-range concurrent with range move lands INSIDE the
+      moved range at its new location.
+
+   4.4.  Overlap arbitration.  [research folded 2026-07-23; the
+         DECISION remains open for the design phase]
+
+      Research input (LITREVIEW G1; extraction 3-sypytkowski-yata-
+      move.md): the one practitioner attempt at YATA-range-move
+      found some overlapping concurrent moves have NO reconciling
+      merge -- "in some cases the only sensible solution would be to
+      cancel/revert the effect of one or both move operations."
+      That is independent support for a stays-put-style rule (a
+      losing batch is IGNORED, deterministically, by stamp order)
+      over any attempt at merging overlapping ranges.  Also
+      relevant: sequences cannot form parent cycles, so EXT-14's
+      IsAncestor machinery is replaced by a simple RANGE-OVERLAP
+      check (OPTIONS_ext15.md) -- ext-15's validity pass is simpler
+      than ext-14's, not harder.
+
+      When two batches were canonicalized against the same committed
+      state and their ranges OVERLAP, per-element LWW (each element
+      follows its greatest-stamped register write) is deterministic
+      and convergent but can SPLIT a range: some elements follow
+      batch 1, the overlap follows batch 2's later stamps.  Candidate
+      rules, to be settled by the research pass + team review:
+
+         (a) ELEMENT-WISE LWW (split allowed) -- simplest, always
+             converges, text is never lost, but a range can end up
+             divided across two destinations;
+         (b) BATCH-WISE stays-put -- treat the batch as the conflict
+             unit: the earlier-stamped batch wins wholly; the later
+             batch is ignored wholly where it overlaps (EXT-14
+             Section 4.4 lifted from nodes to batches; requires
+             batch identity in the resolution pass);
+         (c) leader courtesy-serialization -- the leader rejects (409
+             + current state) a batch whose range intersects a batch
+             admitted since the client's epoch/cursor, forcing a
+             client rebase (cheapest; turns the race into a normal
+             conflict; does not cover multi-leader failover windows
+             and so needs (a) or (b) underneath regardless).
+
+      DRAFT position: (c) as the front door plus (b) as the
+      deterministic floor, with (a) rejected FOR SHIPPING (a
+      silently split paragraph is astonishing).  Research
+      concurrence and one nuance: the pass found NO better-analyzed
+      2024-2026 rule (Appendix D.3), and OPTIONS_ext15.md
+      recommends PROTOTYPING (a) element-wise first in the design
+      phase -- it is just the batched [K20] primitive plus stays-put
+      and validates all the machinery -- while treating atomic-
+      range-wins (b) as the delta to specify before acceptance.
+      Adopted: prototype (a), ship (c)+(b).  The (b) floor requires
+      batch identity in the canonical ops (Appendix A "batch").
+
+   4.4a. Edge membership (NEW knob, from the research pass).
+
+      When an insert lands concurrently AT A BOUNDARY of a moving
+      range (just before "first" or just after "last"), does it
+      travel with the range or stay?  Peritext solved exactly this
+      membership question for static formatting spans with
+      before/after ANCHOR SIDES on stable character ids (extraction
+      4-litt2022-peritext.md); ext-15 MUST adopt the same device so
+      boundary behavior is a SPEC'D CHOICE, not an accident of
+      integration order: a range is (first, side) .. (last, side),
+      and the leader stamps the sides into the canonical batch.
+      DRAFT default: begin-side = "before first" EXCLUSIVE growth,
+      end-side = "after last" EXCLUSIVE (boundary inserts stay) --
+      matching typical editor cut/paste expectations; the design
+      phase may flip the default with user testing.
+
+   4.5.  State and representation cost.  [RESEARCH-PENDING -- and,
+         per the landed pass, THE hard part of ext-15]
+
+      Research input (LITREVIEW G5): the authority orders moves but
+      does not shrink their state; the YATA-move exploration
+      additionally required "remember[ing] all previous move
+      operations within the range," which is incompatible with our
+      compaction budget.  No published work gives a run/segment-
+      granular representation.  This decision, not concurrency, is
+      where ext-15's novelty and risk concentrate.
+
+      A register per CHARACTER is the naive cost.  Mitigations to be
+      validated: sparse registers (only moved elements pay,
+      Section 4.1); RUN-LENGTH GROUPING (one register write covering
+      a contiguous id run, expanded logically -- the wire batch then
+      carries O(runs) not O(chars)); or restricting v1 move
+      granularity (line/block boundaries).  The chosen representation
+      MUST keep the batch a pure function of committed state and
+      MUST keep Appendix A's wire shape stable or version it here
+      before acceptance.
+
+   4.6.  Compaction.
+
+      Snapshots (Section 12.5 / rga SnapshotOps) already re-anchor
+      live elements in visible order; under this extension the
+      snapshot MUST emit elements in RESOLVED order (position
+      registers applied) and MAY then drop superseded register
+      history, preserving element ids -- after which the moved order
+      IS the base order and the registers are empty again.  Epoch
+      barrier semantics are unchanged; Section 3.5's transparency
+      property gates conformance.
+
+5.  Capability Negotiation and Backward Compatibility
+
+   This extension adds a capability string to the ACP/1 introspection
+   endpoints, per the shared convention of EXT-1 Section 7:
+
+      GET /v1/healthz (and/or /v1/stats) responses gain:
+
+         "protocol": "acp/1",
+         "capabilities": [ ..., "crdt-text-move", ... ]
+
+   A daemon MUST advertise "crdt-text-move" only when it implements
+   Sections 4, 6, and 7 and the operator has enabled the Section 9
+   gate.  A daemon that does not advertise it MUST reject move
+   requests with 400 naming the capability -- never silently ignore
+   them.  A client MUST treat absence as "not supported" and fall
+   back to today's diff behavior (with its documented loss mode).
+   Documents containing move ops thereafter require a move-capable
+   daemon (downgrade unsupported until compacted, as EXT-14
+   Section 9).  This capability is independent of "crdtjson" /
+   "crdtjson-move": a text-only deployment may ship it alone.
+
+6.  Wire API Additions (DRAFT -- shapes provisional until 4.5 lands)
+
+   Summary:
+
+      New:
+         POST /v1/crdt/move        ; range move request (Appendix A):
+                                   ;   {doc, first, last, after,
+                                   ;    epoch?} -> {doc, total,
+                                   ;   epoch} | 400 | 409
+      Modified:
+         POST /v1/crdt/ops         ; the replicated stream gains the
+                                   ;   canonical position-register
+                                   ;   write op (leader-expanded;
+                                   ;   clients do not author it
+                                   ;   directly in v1)
+         GET  /v1/crdt/ops         ; returns those ops in canonical
+                                   ;   form to syncing clients
+         GET  /v1/healthz, /v1/stats + "crdt-text-move"
+
+   Auth/roles/headers/epoch/error conventions follow ACP/1 Sections
+   5-6 and Section 12; a move is a WRITE ("writer"+).  The move
+   request counts against rate limits by its EXPANDED batch size
+   (cf. EXT-5 Section 9.2's expanded-count rule).
+
+7.  Determinism and High Availability
+
+   o  The leader canonicalizes a move request against committed
+      state only: range resolution, fresh anchors, stamps, batch
+      grouping (Section 4.2).  Followers apply canonical ops
+      verbatim; nothing re-resolves; no clock/randomness in apply or
+      materialize (ACP/1 Section 17).
+
+   o  Position-register resolution is a pure function of the applied
+      op set (LWW over totally-ordered stamps; plus the Section 4.4
+      rule once fixed), so materialized text is byte-identical on
+      every replica -- the same argument, and the same conformance
+      method, as EXT-14 Section 7.
+
+   o  MIXED-VERSION HAZARD (identical to EXT-14's): a pre-move
+      follower silently no-ops the register-write op and diverges
+      permanently.  The leader MUST NOT admit move ops unless the
+      operator has asserted cluster-wide support (Section 9).
+
+   Conformance bar before advertising the capability: (a) the
+   Section 12 convergence/fuzz suite extended with concurrent moves
+   incl. overlapping ranges under shuffle+dup; (b) a cross-replica
+   determinism vector + leader-failover round-trip across a move;
+   (c) the SEMANTIC set: Figure-4 redirection, stays-put overlap
+   outcome (per the 4.4 rule chosen), no-duplication, no-loss,
+   compaction transparency.
+
+8.  Security Considerations
+
+   o  Amplification: one small request expands to a batch bounded by
+      range length; daemons MUST bound range size per request and
+      SHOULD count expanded size against rate budgets (Section 6).
+      Move-churn spam is ordinary write spam.
+
+   o  Spoofing: stamps, anchors, and batch membership are leader-
+      minted; clients cannot forge winners (ACP/1 Section 5.2).
+
+   o  No new read surface, no new isolation surface: space boundary
+      unchanged; audit via the ordinary op log (losing moves remain
+      visible until compaction, as EXT-14 Section 8.3).
+
+9.  Rollout Plan (Mixed-Version Clusters)
+
+   Identical in shape to EXT-14 Section 9, with its own flag:
+
+      Step 1 -- UPGRADE every node (feature dormant).
+      Step 2 -- ENABLE -enable-crdt-text-move on every node (the
+                operator's cluster-wide-support assertion; default
+                OFF; single-node MAY default on).
+      Step 3 -- ADVERTISE "crdt-text-move" + leader admits moves;
+                clients feature-detect.
+
+   While off: 400 on move requests; no move op ever enters a log a
+   current member cannot apply.  Reversibility and the compact-
+   before-downgrade rule follow EXT-14 Section 9 verbatim.
+
+   SEQUENCING (owner-set): EXT-14 ships first; this extension's
+   BUILD does not start before EXT-14 lands, and its acceptance
+   review does not start before the research pass and Section 4.4/
+   4.5 are resolved.
+
+10. Open Questions (= the research agenda for the in-flight pass)
+
+   o  [4.4] The overlap rule: does any 2024-2026 result give a
+      better-analyzed batch-conflict semantics than the (c)+(b)
+      draft position?  (Check: movable-list implementations -- Loro;
+      replay architectures -- EG-Walker; any successor to [K20]'s
+      open-problem statement.)
+
+   o  [4.5] Representation: run-length grouped registers vs sparse
+      per-element vs block-granular v1; measured state cost on
+      realistic documents.
+
+   o  Cross-text-doc range move (split/join of blocks, [K20]
+      Section 4's residual case): in-scope for a REVISION of this
+      ext, a separate ext, or the block-recipe documentation
+      forever?  Needs product signal (coboard/liquid-UI) as much as
+      research.
+
+   o  Client surface: explicit editor verb (acp crdt move) only, or
+      also a diff-side move DETECTOR (risk: heuristic misfires
+      moving the wrong range)?  v1 draft says verb-only.
+
+   o  Text-CRDT undo (EXT-11's reserved open question): position
+      registers make undo-of-move an LWW write-back here too;
+      confirm EXT-11's inverse table extends cleanly when EXT-11 is
+      promoted.
+
+   o  Whether "crdt-text-move" should also advertise a limits hint
+      (max range length) alongside the capability, per the EXT-4
+      limits convention.
+
+Appendix A.  New and Changed Data Types (DRAFT -- provisional until
+             Section 4.5 resolves; do not freeze)
+
+   TextMoveRequest (new -- body of POST /v1/crdt/move):
+      { "doc":   <string>,
+        "first": Id,               ; first element of the range
+        "last":  Id,               ; last element (order-checked)
+        "after": Id | null,        ; destination anchor element
+                                   ;   (null = document head); MUST
+                                   ;   NOT lie inside [first..last]
+        "epoch": <uint64>? }       ; optimistic; 409 on mismatch
+
+   TextMoveResult (new):
+      { "doc": <string>, "total": <uint64>, "epoch": <uint64>,
+        "moved": <int> }           ; elements in the batch
+
+   Op (Section 12 op stream -- ONE new canonical op type, leader-
+   authored only in v1):
+      { "t": "mv",
+        "id":     Id,              ; op id (leader-minted)
+        "elem":   Id,              ; the element whose position moves
+        "anchor": Id,              ; fresh destination anchor
+        "now":    <int64>,         ; leader stamp
+        "actor":  <string>,
+        "batch":  <string>? }      ; batch id (needed iff rule 4.4(b)
+                                   ;   is adopted; else omitted)
+      [RESEARCH-PENDING: if run-length grouping (4.5) is adopted,
+       "elem" generalizes to a run descriptor; revisit before freeze.]
+
+   Health/Stats (changed):
+      { ..., "capabilities": [ ..., "crdt-text-move", ... ],
+        "limits": { "crdt_text_move_max_range": <int> }? }
+
+Appendix B.  New Error Conditions (DRAFT)
+
+   400  Bad request: capability not enabled (error text MUST name
+        "crdt-text-move"); unknown/dead endpoint elements; endpoints
+        out of order; destination anchor inside the range; range
+        exceeds the advertised max.
+   403  Forbidden: role "reader" (move is a write); scope refusal
+        (EXT-7).
+   409  Conflict: epoch changed (resync, Section 12.5); or -- if
+        rule 4.4(c) is adopted -- range intersects a batch admitted
+        since the client's cursor ("rebase and retry", with current
+        state).
+   429  Too Many Requests: expanded batch exceeds the rate budget.
+
+Appendix C.  Worked Examples
+
+   C.1.  The motivating case ([K20] Figures 4-5): move a bullet
+         while a peer edits inside it.
+
+      Doc: "* Bacon\n* Milk\n".  B moves the range covering
+      "* Milk\n" before "* Bacon\n":
+         > POST /v1/crdt/move
+         > { "doc":"list.md", "first":<id of '*'>,
+         >   "last":<id of '\n'>, "after":null }
+         < 200 { "doc":"list.md", "moved":7, ... }
+      Concurrently A edits "Milk" -> "Soy milk" (ordinary diff ops
+      anchored to the 'M'/'i' element ids).
+      Converged, every replica: "* Soy milk\n* Bacon\n" -- the edit
+      REDIRECTED into the moved range (Section 4.3).  Today's
+      behavior (diff-only) strands "Soy m" near the old position:
+      the exact anomaly this extension removes.
+
+   C.2.  Concurrent moves of the same range -- one winner.
+
+      A moves lines 5-9 after line 20; B concurrently moves lines
+      5-9 after line 2 (both canonicalized against the same state).
+      Under draft rule 4.4(c): the later batch is refused 409 and B
+      rebases.  In the failover window where both committed, the
+      4.4(b) floor applies: the earlier-stamped batch wins wholly;
+      the later is ignored; the range appears ONCE, after line 20,
+      on every replica.  Nothing splits, duplicates, or vanishes.
+
+   C.3.  Capability check and fallback.
+
+      > GET /v1/healthz
+      < 200 { "capabilities":["channels","crdtjson"] }
+      No "crdt-text-move": the editor greys out structural drag for
+      text docs (or documents the lossy fallback); POSTing anyway
+      yields 400 naming the capability.  After the Section 9
+      procedure the capability appears.
+
+Appendix D.  Research Basis  [to be extended by the in-flight pass]
+
+   EVIDENCE IN HAND (grounding this draft; full extractions in
+   tickets/crdt-text-move-20260722/RESEARCH_SPIKE.md):
+
+   [K20]  Kleppmann.  "Moving Elements in List CRDTs."  PaPoC 2020.
+          DOI 10.1145/3380787.3393677.  Read in full; archived in
+          the design ticket.  Contributes: the single-element
+          algorithm (Section 4.1 here); the fresh-destination-
+          position rule; the duplication argument against
+          delete+reinsert; Figure 4/5 (the redirection requirement,
+          Section 4.3 here); the verbatim open-problem statement for
+          ranges ("At present, there is no known algorithm for
+          performing such moves of ranges of elements") with its
+          named edge cases -- which Section 4.2's authority argument
+          targets; and the proof that block-structuring does NOT
+          obviate range moves (split/join, Section 3.6(d)/Section 10
+          here).
+
+   [DK24] Da, Kleppmann.  "Extending JSON CRDTs with Move
+          Operations."  PaPoC 2024.  The JSON sibling's basis (see
+          EXT-14 Appendix D); its Algorithm-1-in-total-order insight
+          is what EXT-14 ports and what Section 4.4(b) would lift
+          from nodes to batches.  Does NOT treat text ranges.
+
+   [KMGB21] Kleppmann et al.  "A Highly-Available Move Operation for
+          Replicated Trees."  IEEE TPDS 33(7), 2021.  Unordered
+          trees; the stays-put lineage.  Does NOT treat sequences.
+
+   [B25]  Brocco.  "Introducing Support for Move Operations in Melda
+          CRDT."  arXiv:2503.04811.  Element relocation between
+          containers; corroborates identity preservation; does NOT
+          treat ranges.
+
+   Initial diligence (2026-07-23, shallow web pass recorded in the
+   ticket): no post-2020 solution to sequence-range move surfaced;
+   adjacent-but-different: Peritext (formatting spans over stable
+   character ids -- anchoring machinery, not relocation), EG-Walker/
+   replay architectures (no move), arXiv:2203.10285 (tree moves).
+
+   Deep-pass results (landed 2026-07-23; full record in
+   tickets/crdt-text-move-20260722/ -- LITREVIEW.md, OPTIONS_ext15.md,
+   extractions 1-7, CITATIONS.md, FORWARD_CITATIONS.md):
+
+      D.1  Forward-citation sweep: 15 works citing [K20], ~5 citing
+           [DK24]; NOT ONE delivers a contiguous-character-range
+           move.  Every "move" found is single-element (K20,
+           Rinberg21 Array-CRDTs), tree/structural (KMGB21, Nair22,
+           Grove'25, DK24, Melda-move'25), or grid row/column
+           (AegisSheet'26).  The frontier text CRDTs punt
+           explicitly: Peritext lists text move as future work;
+           Fugue "omit[s] operations to mutate or move elements";
+           Eg-walker is insert+delete only.  New sources over this
+           draft's first cut: Lord 2019 splicing (fixed boundary-id
+           endpoints "move around through other splices"; the
+           hash-id fix has exponential tombstones -- G2 evidence)
+           and Sypytkowski's YATA-move (Section 4.4's cancel/revert
+           quote; the unbounded in-range move-history state cost --
+           Section 4.5).
+      D.2  Implementation survey: PARTIAL [RESEARCH-PENDING].  The
+           YATA-move exploration is extracted (3-*.md); Loro's
+           movable list, Automerge's move status, and Yjs
+           discussions were NOT reached this pass and remain a
+           to-do before the design phase concludes (they are the
+           likeliest place a shipped element-move semantics exists;
+           no range move is expected there either, per D.1).
+      D.3  VERDICT: [K20]'s open-problem statement STILL STANDS in
+           2026 -- triangulated three ways (crdt.tech/papers
+           curated index; the D.1 sweep; the frontier papers'
+           explicit punts).  No literature-native range algorithm
+           exists to compare against; Section 4.2's authority-
+           native design is therefore novel work, with the
+           serverless open problem narrowed (per LITREVIEW) to the
+           Section 4.4 semantic CHOICE plus the Section 4.5 state
+           cost.
+      D.4  Options analysis folded: (c) block-recipe-now ranked
+           first as the immediate posture (zero protocol cost,
+           ext-14 §3.7(a) already documents it); (b) authority-
+           native range move = the recommended design-phase target
+           (this document's Section 4); (a) single-element retrofit
+           valuable only as (b)'s primitive layer; (d) literature-
+           native adoption unavailable.  The owner's chosen option
+           is recorded in Status of This Memo on acceptance.
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt), the ACP/EXT-14 structured-CRDT move extension
+   (its JSON sibling), and the reference implementation distributed
+   at https://github.com/ab0t-com/acp .
