@@ -32,6 +32,9 @@ First run creates under `-data`: `token` (shared bearer secret), `cert.pem`/`key
 
 - **Shared token (default):** one secret in `<data>/token`; every agent uses it; agent
   id comes from the (trusted) `X-ACP-Agent` header. Fine for two cooperating agents.
+  **Note: shared-token mode provides no agent-to-agent isolation** — any holder can act as
+  any agent id (read another agent's mail, take or release its leases, author events under
+  any actor). Use per-agent tokens whenever agents must be isolated from one another.
 - **Per-agent (recommended for >2 or any distrust):** run `coordd -data … -mkagent
   claudeA` and `-mkagent codexB`. This creates `<data>/agents.json` (token→agent) and
   switches the daemon to per-agent mode: identity is derived from the token (header
@@ -62,6 +65,29 @@ node down, ~1s failover, no committed-data loss). Bootstrap one node, `-join` tw
 clients are unchanged. Full steps + ops (rolling upgrade, backup, failover) are in the
 **`acp-cluster` skill** and `../../14_production_spec_2026-06-10.md`. Single-node mode
 (no `-raft-addr`) remains the default for dev/small setups.
+
+### Inter-node security (acp-1 §14.4) — configure a cluster CA
+
+A cluster has two node↔node channels: the **Raft transport** (all replicated data) and the
+**inter-node HTTP** channel (leader write-forwarding + membership join, which carries a
+cloned `Authorization` bearer token). Configure a cluster CA to harden both in one step:
+
+```bash
+coordd -init-cluster-ca -data /srv/acp          # once
+# copy BOTH cluster-ca.pem AND cluster-ca-key.pem to every node's -data dir
+```
+
+- **With a cluster CA:** both channels are **mutually authenticated** against the CA — peers
+  verify each other's node certificates and the bearer token is never exposed to a network
+  MITM. External agent clients are unaffected: they keep pinning the **same self-signed
+  `cert.pem`** (§4.1); only intra-cluster peers use the CA.
+- **Without a cluster CA:** the inter-node HTTP channel is unauthenticated — coordd logs a
+  loud startup warning, and you **MUST** run the node network on a **trusted private subnet**.
+  This is the §14.4 absent-a-CA model; **configuring a CA is strongly recommended for any
+  multi-host cluster.**
+
+> Note: under a cluster CA, blob GC ignores its grace window on cluster nodes (deletion is
+> driven deterministically through the replicated log, acp-1 §17) — this is expected.
 
 ## 3. Connect an agent
 

@@ -241,6 +241,19 @@ Table of Contents
       requires a separate SPACE.  This is normative and repeated in
       Security Considerations.
 
+      Normatively, a scoped grant is evaluated ONLY within the space in
+      which it was issued: an authority MUST bind every scope to its space
+      and MUST NOT honor a scope field as authorizing any action in a
+      different space.  A token presented against a space it was not issued
+      for is treated as unscoped-for-that-space and denied.  Scope narrows
+      authority strictly beneath the space boundary and can never widen,
+      cross, or substitute for it; an authority that cannot evaluate a
+      scope field under this rule MUST fail closed (deny), never open.
+
+      [This paragraph was added 2026-07-27 as a clarifying amendment; it
+      makes explicit the space-qualification of scope evaluation already
+      required by this principle, and relaxes nothing.]
+
    3.2.  Additive and negotiated -- but note the FAIL-OPEN direction.
 
       Every change is an OPTIONAL field or a NEW endpoint; the wire version

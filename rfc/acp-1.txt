@@ -577,6 +577,27 @@ Table of Contents
    that CA.  Absent a CA, inter-node traffic is unauthenticated and MUST
    run on a trusted private network.
 
+   14.4.1.  Inter-Node Channel Coverage
+
+   The mutual-authentication requirement of Section 14.4 applies to EVERY
+   channel between authority nodes, not only the Raft transport: any
+   node-to-node HTTP control traffic -- leader write-forwarding and
+   membership join/handshake -- MUST likewise be mutually authenticated
+   against the cluster CA when one is configured, and absent a CA MUST run
+   only on the trusted private network.  An authority that multiplexes
+   node-to-node HTTP onto a port also serving external clients MUST NOT
+   weaken the external client's transport to do so: external clients
+   continue to receive the daemon's client-pinned certificate unchanged
+   (Section 4.1), while node peers are served a cluster-CA certificate and
+   are required to present a cluster-CA client certificate.  (A
+   reserved-SNI selector on the shared listener is one conforming
+   mechanism; the normative requirement is that every inter-node channel
+   is mutually authenticated and no external channel is weakened.)
+
+   [This subsection was added 2026-07-27 as a clarifying amendment to
+   Section 14.4; it tightens, and does not relax, the existing
+   requirement, and introduces no change to the "acp/1" wire format.]
+
    14.5.  Single-Node
 
    An authority MAY run as a single node; writes are then applied

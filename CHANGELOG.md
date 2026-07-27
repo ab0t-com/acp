@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.1.6 — 2026-07-27
+Daemon + client release; the wire protocol version `acp/1` is unchanged. A stability and
+hardening release focused on bounded resource use and cluster correctness.
+- **Configurable retention across the durable stores.** The event log (`-event-retention`,
+  bounded by default) and the mailbox (`-mail-retention`, keeps all unread mail + the most
+  recent read messages per recipient) now have first-class retention; presence entries,
+  rate-limit state, and free-form event/message fields are size- and count-bounded. Storage
+  and memory stay flat under sustained load or churn.
+- **Cluster determinism (HA).** Background state changes — lease expiry, blob GC, and
+  event/mailbox/CRDT compaction — are now leader-driven and replicated through the log, so
+  every node reaches byte-identical state (acp-1 §17); compaction is bounded and gated so it
+  never floods the Raft log at scale.
+- **Inter-node security (HA).** Every node-to-node channel — the Raft transport and the HTTP
+  forward/join channel — is mutually authenticated against the cluster CA when one is
+  configured; external client cert-pinning is unchanged (acp-1 §14.4). Configure a cluster CA
+  for any multi-host deployment — see `docs/OPERATIONS.md`.
+- General input-validation and test-stability hardening.
+
 ## v0.1.5 — 2026-07-25
 Daemon + client release (the wire protocol version `acp/1` is unchanged — an op and a
 negotiated capability, per the extension model).

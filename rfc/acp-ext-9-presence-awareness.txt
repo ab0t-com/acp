@@ -51,6 +51,17 @@ Status of This Memo
    string remains "acp/1" and the feature is advertised via Section 5.
    Distribution is unlimited.
 
+   Revision note (26 July 2026): the protocol owner has APPROVED this
+   extension for implementation; it is NOT yet implemented.  This
+   revision, produced after a July 2026 production incident
+   (Section 1.4) and a supporting research review of industry
+   awareness protocols (the Yjs awareness protocol, Liveblocks
+   presence), adds: the incident motivation (Section 1.4), the
+   OPTIONAL per-actor SESSION discriminator for multi-connection
+   clients (Sections 2, 4), the document-field convention
+   (Section 4.2), and the interaction rules with EXT-5 documents and
+   EXT-11 undo/redo (Section 4.8).
+
 Copyright Notice
 
    Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
@@ -90,7 +101,7 @@ Table of Contents
    ACP/EXT-5, a co-edited text document (ACP/1 Section 12), or simply
    "who is looking at this workspace right now" all need AWARENESS:
    which actors are live, where their cursors and selections are, what
-   they are doing this second.  Three concrete problems motivate this
+   they are doing this second.  Four concrete problems motivate this
    extension:
 
    1.1.  Awareness abuses the durable log.
@@ -122,6 +133,28 @@ Table of Contents
       server-timestamped); the granularity, payload, and delivery are
       not.
 
+   1.4.  The anti-pattern in production (July 2026).
+
+      This gap is not hypothetical.  In July 2026 a production
+      deployment was taken down by exactly this failure: a
+      collaborative-board client, having no ephemeral primitive to
+      use, wrote its presence (cursor position, heartbeat timestamp,
+      activity status) into a durable structured-CRDT document
+      (EXT-5) as ordinary ops.  The document's op log grew to
+      ~60,000 ops (18.7 MB) -- 99.7% of them presence writes -- and,
+      because session-scoped presence keys are LIVE state from the
+      CRDT's point of view, compaction could not reclaim them (1,940
+      compaction epochs left the log the same size).  Under normal
+      realtime polling the write path then collapsed: multi-minute
+      tail latencies, edge timeouts, and a retry storm.  Every mature
+      realtime-collaboration stack keeps awareness on a separate,
+      TTL-expiring, broadcast channel for this reason -- the Yjs
+      awareness protocol (a distinct sub-protocol with a mandatory
+      30-second expiry) and Liveblocks (whose API split between
+      ephemeral Presence and durable Storage makes the mistake
+      inexpressible) are the reference designs.  This extension is
+      that channel for ACP; Section 4.8 makes the boundary normative.
+
    This extension closes the gap with the smallest additive surface: a
    per-space awareness store -- actor -> {state, expiry} -- written by
    its owner only, expiring on a short TTL, readable as a snapshot, and
@@ -144,9 +177,22 @@ Table of Contents
    corresponding extension memo.
 
    AWARENESS ENTRY:  The single ephemeral record the store holds for
-      one actor in one space: { actor, state, ttl, expires, updated }.
-      An actor has AT MOST one entry per space; a new write replaces
-      the previous entry wholesale.
+      one (actor, session) in one space:
+      { actor, session, state, ttl, expires, updated }.
+      An actor has AT MOST one entry per (space, session); a new
+      write to the same (actor, session) replaces the previous entry
+      wholesale.
+
+   SESSION:  An OPTIONAL, client-chosen, short opaque discriminator
+      (e.g. a browser-tab or connection id) that lets one
+      authenticated actor hold several simultaneous awareness entries
+      (multi-tab, multi-window).  Defaults to the empty string (one
+      entry per actor).  Identity and authority always remain the
+      token-derived ACTOR; the session is a display-level
+      discriminator, never an identity.  Sessions are exactly the
+      state whose durable storage caused the July 2026 incident
+      (Section 1.4): abandoned per-session keys accumulated forever
+      in a document, whereas here they simply TTL-expire.
 
    AWARENESS STATE:  The client-supplied JSON object inside an entry
       (cursor position, selection, status, display name, ...).  The
@@ -181,12 +227,16 @@ Table of Contents
 
    3.2.  Per-actor last-writer-wins, no merge.
 
-      An actor writes ONLY its own entry (the authority derives the
+      An actor writes ONLY its own entries (the authority derives the
       actor from the token, ACP/1 Section 5.2, and ignores any
-      client-supplied identity).  Because each entry has exactly one
-      writer, there is nothing to merge: the newest write by that actor
-      replaces its previous entry wholesale.  Awareness is a keyed
-      register per actor, not a CRDT.
+      client-supplied identity; the OPTIONAL session discriminator
+      subdivides an actor's entries but never crosses actors).
+      Because each (actor, session) entry has exactly one writer,
+      there is nothing to merge: the newest write to that entry
+      replaces it wholesale.  Awareness is a keyed register per
+      (actor, session), not a CRDT.  This matches the industry
+      reference design (the Yjs awareness protocol: a client "MUST
+      only modify its own entry").
 
    3.3.  Best-effort delivery, honestly stated.
 
@@ -219,8 +269,10 @@ Table of Contents
       gossip/relay fabric (a future extension MAY generalize the
       ephemeral tier; Section 10); server-side interpretation of the
       state object (cursor schemas are a client concern -- the protocol
-      carries opaque JSON); or awareness-derived authorization of any
-      kind.
+      carries opaque JSON); awareness-derived authorization of any
+      kind; or undo of awareness (awareness is not a document: it
+      forms no EXT-11 op groups and Ctrl-Z never reverts a cursor --
+      Section 4.8).
 
 4.  The Awareness Store
 
@@ -228,41 +280,63 @@ Table of Contents
 
       Per space, the authority keeps a volatile map
 
-         actor -> AwarenessEntry { actor, state, ttl, expires, updated }
+         (actor, session) -> AwarenessEntry
+             { actor, session, state, ttl, expires, updated }
 
-      keyed by the authenticated actor id.  The map is bounded by the
-      number of live agents in the space; entries leave it by explicit
-      clear or TTL expiry.  The store is per-space: awareness MUST
-      never be visible across spaces (ACP/1 Section 7).
+      keyed by the authenticated actor id plus the client-chosen
+      session discriminator (default "").  The map is bounded by the
+      number of live agents in the space times the per-actor session
+      bound (Section 4.2); entries leave it by explicit clear or TTL
+      expiry.  The store is per-space: awareness MUST never be
+      visible across spaces (ACP/1 Section 7).
 
    4.2.  Setting awareness: POST /v1/awareness.
 
       Request body:
 
-         { "state": <object>, "ttl_sec": <int>? }
+         { "state": <object>, "ttl_sec": <int>?, "session": <string>? }
 
       The authority MUST set the entry's actor to the authenticated
       identity (never from a client-supplied field, ACP/1 Section 5.2)
-      and MUST replace that actor's previous entry wholesale (no
+      and MUST replace that (actor, session) entry wholesale (no
       server-side merging of state objects).  "updated" and "expires"
       are stamped from the serving node's clock.
 
-      ttl_sec is OPTIONAL; the RECOMMENDED default is 30 seconds.  A
-      daemon SHOULD enforce a maximum TTL (RECOMMENDED 300 seconds) and
-      MUST reject a non-positive or over-maximum ttl_sec with 400.  A
-      daemon MUST bound the encoded size of "state" (RECOMMENDED
-      maximum 16 KiB) and reject an oversized state with 400; awareness
-      is display state, not a data channel.
+      "session" is OPTIONAL (default "" -- one entry per actor): a
+      short opaque discriminator that lets one actor maintain several
+      concurrent entries (multi-tab, multi-connection).  A daemon
+      MUST bound its length (RECOMMENDED maximum 64 bytes, 400
+      beyond) and SHOULD bound live sessions per actor (RECOMMENDED
+      8), evicting the stalest entry (emitting its "leave" delta)
+      when the bound is exceeded.
+
+      ttl_sec is OPTIONAL; the RECOMMENDED default is 30 seconds --
+      deliberately matching the proven convention of the Yjs
+      awareness protocol (30-second expiry, re-broadcast at least
+      every 15 seconds); Liveblocks' presence API likewise makes the
+      TTL explicit.  A daemon SHOULD enforce a maximum TTL
+      (RECOMMENDED 300 seconds) and MUST reject a non-positive or
+      over-maximum ttl_sec with 400.  A daemon MUST bound the encoded
+      size of "state" (RECOMMENDED maximum 16 KiB) and reject an
+      oversized state with 400; awareness is display state, not a
+      data channel.
+
+      When the awareness pertains to one document of a multi-document
+      space, the state object SHOULD carry a "doc" field naming it,
+      so consumers can filter client-side until a server-side filter
+      exists (Section 10).
 
       A write with "state": null (or an empty object and ttl_sec 0)
-      is an EXPLICIT LEAVE: the authority MUST drop the actor's entry
-      and emit a "leave" delta.  Clients SHOULD send an explicit leave
-      on orderly shutdown rather than letting the TTL lapse.
+      is an EXPLICIT LEAVE: the authority MUST drop that
+      (actor, session) entry and emit a "leave" delta.  Clients
+      SHOULD send an explicit leave on orderly shutdown rather than
+      letting the TTL lapse.
 
       The response is the stored entry (Appendix A).  Awareness writes
       MUST count against the sender's rate limit (ACP/1 Section 5.4);
       clients SHOULD throttle to a few writes per second and coalesce
-      rapid cursor movement client-side.
+      rapid cursor movement and status flips client-side (cursor
+      sampling on the order of 30-60 ms, not per input event).
 
    4.3.  Snapshot: GET /v1/awareness.
 
@@ -283,16 +357,17 @@ Table of Contents
 
          { "type": "join"|"update"|"leave", "entry": AwarenessEntry }
 
-      "join" is emitted when an actor with no live entry writes one;
-      "update" when an existing entry is replaced; "leave" when an
-      entry is explicitly cleared OR expires (the "entry" of a leave
-      MAY carry only the actor id).  The stream SHOULD begin with a
-      synthetic "join" for every currently-live entry, so a follower
-      needs no separate snapshot request; clients MUST nonetheless
-      tolerate receiving deltas for actors they have not seen join
-      (best-effort delivery, Section 3.3).
+      "join" is emitted when an (actor, session) with no live entry
+      writes one; "update" when an existing entry is replaced;
+      "leave" when an entry is explicitly cleared OR expires (the
+      "entry" of a leave MAY carry only the actor and session).  The
+      stream SHOULD begin with a synthetic "join" for every
+      currently-live entry, so a follower needs no separate snapshot
+      request; clients MUST nonetheless tolerate receiving deltas for
+      entries they have not seen join (best-effort delivery,
+      Section 3.3).
 
-      Deltas carry NO seq and NO ordering guarantee beyond per-actor
+      Deltas carry NO seq and NO ordering guarantee beyond per-entry
       write order as observed by the serving node.  There is no replay
       cursor: on reconnect a client simply re-primes (Section 4.3 or
       the synthetic joins) and continues.
@@ -325,6 +400,39 @@ Table of Contents
       the "awareness" capability (Section 5) before use, and when it is
       absent MUST degrade explicitly (no cursors shown) rather than
       polling a 404 endpoint.  Nothing else in ACP/1 changes.
+
+   4.8.  Relationship to the structured CRDT and undo (EXT-5, EXT-11).
+
+      Awareness is the designated home for the class of state that
+      does not belong in a durable EXT-5 document: cursors,
+      selections, heartbeats, liveness, transient activity status.
+      The boundary is normative in both directions:
+
+      o  Awareness never touches a document.  Awareness writes form
+         no EXT-5 ops and no EXT-11 op groups, appear in no document
+         materialization or op log, and are invisible to compaction
+         and undo.  (This restates Section 3.1 from the document
+         side.)
+
+      o  Documents SHOULD NOT carry awareness.  Once a daemon
+         advertises "awareness", clients SHOULD NOT store
+         per-heartbeat or per-cursor state in an EXT-5 document.
+         Beyond the unbounded-growth and write-path collapse of
+         Section 1.4, presence stored in a document poisons EXT-11
+         undo BY CONSTRUCTION: every heartbeat push becomes an op
+         group on the actor's undo stack, so a bounded stack (EXT-11
+         Section 8.3, RECOMMENDED depth 100) is fully displaced by
+         presence groups within seconds at heartbeat cadence -- undo
+         then reverts a cursor twitch instead of the user's last real
+         edit.  Keeping awareness here is what keeps EXT-11 undo
+         stacks meaningful.
+
+      o  The one legitimate durable residue is a SINGLE small
+         summary, such as a "last seen" timestamp per actor, written
+         at a coarse cadence (minutes, not heartbeats) as an ordinary
+         document or event write.  A client wanting durable presence
+         HISTORY appends events (ACP/1 Section 8); it does not stream
+         heartbeats into a CRDT.
 
 5.  Capability Negotiation and Backward Compatibility
 
@@ -421,8 +529,13 @@ Table of Contents
       The authority MUST set an entry's actor from the authenticated
       token (ACP/1 Section 5.2) and MUST ignore any actor-like field
       inside "state" for identity purposes.  An actor can therefore
-      only ever write, refresh, or clear ITS OWN entry; there is no
-      operation that mutates another actor's awareness.
+      only ever write, refresh, or clear ITS OWN (actor, session)
+      entries; there is no operation that mutates another actor's
+      awareness.  This deliberately closes the known gap in the Yjs
+      awareness protocol, which is unauthenticated by design ("a
+      malicious peer can claim arbitrary cursor or presence data"):
+      ACP awareness entries are always attributable to the
+      authenticated actor.
 
    8.2.  Visibility and roles.
 
@@ -441,12 +554,18 @@ Table of Contents
 
       Awareness is the highest-frequency write surface in ACP.  A
       daemon MUST charge awareness writes against the sender's rate
-      limit (ACP/1 Section 5.4), MUST bound the state size
-      (Section 4.2), and SHOULD bound the per-space entry count (one
-      per live actor is the natural bound).  The delta stream SHOULD
-      coalesce bursts per actor (delivering the newest state rather
-      than every intermediate) when a consumer falls behind; dropping
-      superseded intermediates is always safe (Section 3.2).
+      limit (ACP/1 Section 5.4), MUST bound the state size and the
+      session count and length (Section 4.2), and SHOULD bound the
+      per-space entry count (live actors times the per-actor session
+      bound is the natural limit).  The delta stream SHOULD coalesce
+      bursts per entry (delivering the newest state rather than every
+      intermediate) when a consumer falls behind; dropping superseded
+      intermediates is always safe (Section 3.2).  Because awareness
+      is volatile and bounded on every axis (state size, sessions,
+      TTL, rate), a misbehaving client can degrade only its own
+      display presence -- it can no longer convert presence churn
+      into durable-log growth or write-path load (the Section 1.4
+      failure mode).
 
    8.4.  No durable record -- by design and as a privacy property.
 
@@ -468,17 +587,30 @@ Table of Contents
 
    This is a single, self-contained feature and ships as one phase:
 
-      Phase 1 -- "awareness".  The volatile per-space store; POST set
-         with TTL and size bounds; GET snapshot; NDJSON follow stream
-         with join/update/leave deltas and synthetic joins; periodic
+      Phase 1 -- "awareness".  The volatile per-space store keyed by
+         (actor, session); POST set with TTL, size, and session
+         bounds; GET snapshot; NDJSON follow stream with
+         join/update/leave deltas and synthetic joins; periodic
          expiry sweep; leader-served in cluster mode; the "awareness"
          capability and limits hints.
+
+      Gate -- the ephemerality property tests.  Implementation MUST
+         NOT advertise the capability until tests prove: (a) under
+         sustained simulated cursor/heartbeat/status churn routed
+         through awareness, every durable artifact (event log, CRDT
+         op logs, snapshots) stays FLAT -- the direct reproduction of
+         the Section 1.4 incident, now bounded; (b) a killed client's
+         entries vanish within one TTL with "leave" deltas; (c) no
+         awareness content is ever observable through any durable
+         read path; (d) an actor cannot write another actor's entry.
 
    The phase is additive and reversible: a daemon may drop the
    capability without breaking ACP/1 peers (clients degrade to no
    cursors; the durable protocol is untouched).  The natural first
-   consumer is a browser/editor SDK; implementations SHOULD land the
-   two together so the feature ships with a real user.
+   consumer is a collaborative-board or editor client migrating its
+   presence OFF a durable document (Section 1.4); implementations
+   SHOULD land the two together so the feature ships with a real
+   user and the incident's workload as its acceptance test.
 
 10. Open Questions
 
@@ -492,8 +624,8 @@ Table of Contents
       concurrently-edited docs may want "awareness for doc X" rather
       than the whole space (the EXT-1 channel-filter grammar is the
       obvious shape: ?channel=...).  This proposal keeps v1 space-wide
-      and defers the filter; the state object can carry a "doc" field
-      that clients filter on client-side meanwhile.
+      and defers the filter; the RECOMMENDED "doc" convention of
+      Section 4.2 covers the interim, client-side.
 
    o  Follower-served reads.  Whether followers may serve snapshot/
       follow from a locally-relayed copy (weaker consistency, better
@@ -507,15 +639,248 @@ Table of Contents
       Section 4.2.  This proposal keeps the surface to one POST.
 
 
+11. Amendment 1 (2026-07-27): Realtime WebSocket Binding, Server-Side
+    Coalescing, and Optional Cross-Node Fan-out
+
+   This section is ADDITIVE.  Sections 1-10 and Appendices A-C are
+   unchanged; every mechanism here is OPTIONAL and separately
+   capability-negotiated, and the load-bearing invariant of Section 3.1
+   (awareness is ephemeral, un-replicated, never in the durable log or
+   snapshots) continues to hold WITHOUT exception.  The amendment adds a
+   transport tuned for the highest-frequency awareness case -- live
+   cursors -- and turns the fan-out question left open in Sections 7 and
+   10 into a concrete, optional design.  It is motivated by the July 2026
+   collaborative-board workload (Section 1.4): coarse liveness rides POST
+   /v1/agents/beat, but sub-second cursor motion wants a bidirectional,
+   rate-bounded channel of the kind Figma, Miro, Liveblocks, and the Yjs
+   awareness protocol use.
+
+   11.1.  What this amendment adds (and does not).
+
+      Adds, all OPTIONAL:
+        o  a server-side COALESCING TICK (Section 11.2) that bounds delta
+           fan-out by a fixed rate rather than by client input rate,
+           applicable to BOTH the existing NDJSON stream and the new
+           WebSocket binding;
+        o  a bidirectional WEBSOCKET BINDING (Section 11.3) that carries
+           the caller's own writes AND the delta stream over one
+           connection;
+        o  an OPTIONAL CROSS-NODE FAN-OUT (Section 11.4) that lets any
+           node serve cluster-wide awareness by best-effort gossip,
+           relaxing the Section 7 leader-served baseline and advancing the
+           Section 10 "scaling the fan-out" question.
+
+      Does NOT change: the awareness DATA MODEL (Sections 4.1-4.2 -- a
+      keyed per-(actor,session) last-writer-wins register of opaque,
+      bounded state with TTL expiry), the meaning of a delta
+      (Section 4.4), the security posture (Section 8), or the durable
+      subsystems (untouched).  A daemon MAY implement none, some, or all
+      of these; the POST + NDJSON follow of Section 4 and the leader-
+      served topology of Section 7 remain the REQUIRED baseline whenever
+      the amendment's capabilities are absent.
+
+   11.2.  Server-side coalescing: the tick.
+
+      Section 8.3 already permits coalescing bursts per entry when a
+      consumer falls behind.  This amendment promotes that to a first-
+      class, always-available property with a fixed rate.
+
+      A daemon MAY serve awareness deltas on a fixed COALESCING TICK.
+      Within one tick interval it MUST retain only the NEWEST state per
+      (actor, session) and MUST emit AT MOST ONE delta per (actor,
+      session) per tick (newest-wins; superseded intermediates are
+      dropped -- always safe, Section 3.2).  The RECOMMENDED tick rate is
+      10-20 Hz (50-100 ms), matching the proven convention of the Yjs
+      awareness protocol and the Liveblocks presence throttle (default
+      100 ms).  "leave" deltas (explicit or TTL, Section 4.5) SHOULD be
+      emitted promptly and are NOT withheld for coalescing.
+
+      The tick is a property of the STORE's emission, so it applies
+      IDENTICALLY to the NDJSON follow stream (Section 4.4) and the
+      WebSocket binding (Section 11.3): the transport changes only how a
+      delta is framed, never which deltas are emitted.  Because the tick
+      caps emission at (live entries x tick rate x subscribers)
+      regardless of how fast clients write, it BOUNDS awareness fan-out
+      by construction -- the ephemeral-tier analogue of the durable-store
+      bounds ACP applies elsewhere.  A daemon that ticks SHOULD advertise
+      the rate (Section 11.5) so clients can pace input accordingly; the
+      client-side sampling advice of Section 4.2 (30-60 ms) still applies.
+
+   11.3.  The WebSocket binding (OPTIONAL).
+
+      A daemon MAY offer awareness over a WebSocket in addition to the
+      Section 4 HTTP surface:
+
+         GET /v1/awareness?transport=ws        ; HTTP Upgrade: websocket
+
+      The Upgrade request carries the standard bearer auth and headers
+      (Section 6); the daemon MUST authenticate it exactly as it
+      authenticates POST /v1/awareness, MUST scope it to the caller's
+      space, and MUST apply the same role policy (Section 8.2).  On a
+      daemon without the binding the path is 404 (Section 4.7); clients
+      discover it via the "awareness-ws" capability (Section 11.5).
+
+      The connection is BIDIRECTIONAL and carries text frames, each a
+      single JSON object with an "op" discriminator:
+
+        client -> server:
+          { "op": "set", "state": <object>|null,
+            "ttl_sec": <int>?, "session": <string>? }
+              ; identical semantics, bounds, and errors to the
+              ; POST /v1/awareness body (Section 4.2); "state": null is
+              ; an explicit leave.  The actor is ALWAYS token-derived
+              ; (Section 8.1); a client-supplied actor is ignored.
+          { "op": "ping" }                      ; OPTIONAL keepalive
+
+        server -> client:
+          { "op": "delta", "type": "join"|"update"|"leave",
+            "entry": AwarenessEntry }
+              ; the Section 4.4 delta, one per frame; the stream SHOULD
+              ; open with a synthetic "join" per live entry, exactly as
+              ; the NDJSON follow does, so no separate snapshot is needed.
+          { "op": "pong" }                      ; answer to a ping
+
+      One socket therefore both PUBLISHES the caller's own awareness and
+      SUBSCRIBES to everyone's -- the property the POST + separate-follow
+      split cannot provide at cursor frequency.  Deltas emitted on the
+      socket obey the coalescing tick (Section 11.2) when the daemon
+      ticks.  Writes over the socket MUST count against the sender's rate
+      limit (Section 8.3) exactly as POST writes do.
+
+      Liveness: a daemon MAY treat an open, responsive socket as
+      refreshing that connection's entries at the socket's own keepalive
+      cadence (WebSocket ping/pong or transport keepalive), so a client
+      on the socket need not re-POST to avoid TTL expiry; a daemon that
+      does so MUST document the effective refresh and MUST still expire an
+      entry whose socket has gone silent past its TTL.  A clean close (or
+      a "set" with "state": null) MUST emit "leave" for that connection's
+      entries.  Delivery remains best-effort (Section 3.3): a slow
+      consumer's superseded frames are dropped (keep-latest), never
+      buffered without bound.
+
+   11.4.  Cross-node fan-out (OPTIONAL): from leader-served to gossip.
+
+      Section 7 specifies LEADER-SERVED awareness as the cluster
+      baseline: correct and simple, but it bottlenecks fan-out at the
+      leader and loses the map on leader change (rebuilt within one TTL).
+      Section 10 left "scaling the fan-out" open.  This amendment defines,
+      as an OPTIONAL capability, a spectrum a deployment MAY choose from:
+
+        T1  Leader-served (Section 7).  The unchanged baseline; REQUIRED
+            to remain available when the cluster capability is absent.
+
+        T2  Node-local with affinity.  Each node serves awareness from
+            its OWN volatile store, and the deployment pins all clients of
+            a given space (or a document within it) to one node via
+            session affinity at the load balancer.  Simplest horizontal
+            spread; correct because a space's editors then share one
+            store.  Its limitation -- editors of one space split across
+            nodes do not see each other -- is what T3 removes.
+
+        T3  Best-effort gossip fan-out.  Each node forwards the awareness
+            deltas it ORIGINATES to its peer nodes over a VOLATILE side
+            channel, and peers merge them into their local store as remote
+            entries governed by the SAME TTL.  Every node then has a
+            cluster-wide view without a leader bottleneck and without a
+            single point of loss: it is eventually consistent, has no
+            authoritative global process, and a node (or leader) failure
+            drops only that node's originations, rebuilt within one TTL.
+            This is the design proven by Phoenix Presence -- a per-node
+            tracker that replicates presence by CRDT + heartbeat gossip
+            over pub/sub, with NO datastore.
+
+      The Section 3.1 invariant is preserved WITHOUT exception under all
+      three: the gossip of T3 is VOLATILE and BEST-EFFORT, carried on a
+      side channel that is NOT the consensus log and NOT any snapshot;
+      awareness is still never proposed as a state-machine command, never
+      assigned a seq, never durable.  Cross-node gossip that spreads
+      awareness MUST NOT flow through Raft -- that would reintroduce both
+      the Section 7 determinism constraint (a wall-clock-expiring, high-
+      churn record has no place in the deterministic apply path, ACP/1
+      Section 17) and the Section 1.4 log growth.  It is a peer-to-peer
+      volatile exchange only.
+
+      A daemon offering T3 advertises "awareness-cluster" (Section 11.5).
+      This RELAXES the Section 7 "gossip is a non-goal" disposition to an
+      OPTIONAL feature and RESOLVES the first Section 10 open question;
+      Sections 7 and 10 are otherwise unchanged and describe the still-
+      valid baseline.
+
+   11.5.  Capability and limits additions.
+
+      A daemon advertises each OPTIONAL mechanism it implements in the
+      shared "capabilities" list (Section 5, Appendix A):
+
+        "awareness-ws"       ; the Section 11.3 WebSocket binding
+        "awareness-cluster"  ; the Section 11.4 T3 cross-node fan-out
+
+      and MAY extend the "limits" hint with the coalescing tick:
+
+        "limits": { ..., "awareness_tick_hz": <int> }   ; Section 11.2
+
+      "awareness-ws" MUST be advertised only when the binding implements
+      all of Section 11.3 (bidirectional set + delta, synthetic joins,
+      leave on close, auth and bounds parity with Section 4).
+      "awareness-cluster" MUST be advertised only when cross-node deltas
+      are actually exchanged (T3).  A client MUST treat the absence of
+      "awareness-ws" as "use the Section 4 HTTP surface", and MUST NOT
+      assume cluster-wide visibility unless "awareness-cluster" is
+      present.
+
+   11.6.  Wire API additions (summary).
+
+        New (OPTIONAL):
+          GET /v1/awareness?transport=ws   ; WebSocket Upgrade (11.3)
+
+        Frames (11.3):  { "op": "set"|"delta"|"ping"|"pong", ... }
+        New capabilities (11.5): "awareness-ws", "awareness-cluster"
+        New limits hint (11.5):  "awareness_tick_hz"
+
+      No durable ACP/1 type changes; the AwarenessEntry / AwarenessDelta /
+      AwarenessSet shapes of Appendix A are reused verbatim inside the
+      WebSocket frames.
+
+   11.7.  Security (delta over Section 8).
+
+      The WebSocket binding inherits Section 8 in full: actor is token-
+      derived (8.1), space-scoped visibility (8.2), rate-limited writes
+      and bounded state/session/TTL (8.3), no durable record (8.4),
+      opaque untrusted state (8.5).  Two additions specific to the long-
+      lived socket and the gossip tier:
+
+        o  A daemon MUST bound the number of concurrent awareness
+           WebSocket connections (per space and per actor) and reject or
+           evict beyond the bound, so an attacker cannot exhaust
+           connection state -- the socket analogue of the Section 4.2
+           entry bounds -- and a per-connection write-rate cap MUST apply
+           (Section 8.3).
+        o  T3 gossip (Section 11.4) crosses the trust boundary between
+           nodes and therefore MUST be authenticated and confidential on
+           the wire (ACP/1 Section 14.4 mTLS, or a trusted private network
+           absent a CA); a receiving node MUST attribute a gossiped entry
+           to the ORIGINATING node's authenticated actor, never to a
+           client-settable field.
+
+   11.8.  Backward compatibility.
+
+      Every addition is OPTIONAL and negotiated.  A daemon implementing
+      none of Section 11 is a fully conformant ext-9 daemon.  A client
+      that finds neither "awareness-ws" nor "awareness-cluster" uses the
+      Section 4 HTTP surface against the Section 7 leader-served topology,
+      exactly as before.  The protocol version string remains "acp/1".
+
+
 Appendix A.  New and Changed Data Types (JSON)
 
    AwarenessSet (new -- the POST /v1/awareness body):
       { "state":   <object> | null,   ; null = explicit leave
-        "ttl_sec": <int>? }           ; default 30, bounded by daemon
+        "ttl_sec": <int>?,            ; default 30, bounded by daemon
+        "session": <string>? }        ; default "", bounded by daemon
 
    AwarenessEntry (new -- one live entry; the POST response and the
    snapshot/stream element):
       { "actor":   <string>,          ; token-derived, never client-set
+        "session": <string>,          ; client-chosen discriminator
         "state":   <object>,
         "ttl_sec": <int>,
         "updated": <rfc3339>,
@@ -545,7 +910,8 @@ Appendix B.  New Error Conditions
 
    400  Bad request: "state" missing (and not an explicit leave), not
         a JSON object, or exceeding the size bound; ttl_sec
-        non-positive or above the daemon maximum.
+        non-positive or above the daemon maximum; "session" exceeding
+        the daemon's length bound (Section 4.2).
    401  Unauthorized: missing or invalid bearer token (ACP/1).
    403  Forbidden: the caller's role does not permit awareness writes
         under the daemon's policy (Section 8.2), or a scoped token
@@ -576,16 +942,19 @@ Appendix C.  Worked Examples
       Authorization: Bearer <tok>
       { "state": { "doc": "boards/q3", "cursor": { "node": "n7" },
                    "status": "editing" },
-        "ttl_sec": 30 }
+        "ttl_sec": 30, "session": "tab-1" }
 
       < 200 OK
-      < { "actor": "pod-b", "state": { "doc": "boards/q3",
+      < { "actor": "pod-b", "session": "tab-1",
+      <   "state": { "doc": "boards/q3",
       <     "cursor": { "node": "n7" }, "status": "editing" },
       <   "ttl_sec": 30, "updated": "2026-07-13T10:00:00Z",
       <   "expires": "2026-07-13T10:00:30Z" }
 
       The actor is derived from the token; a client-supplied actor
-      would be ignored.
+      would be ignored.  A second tab writes session "tab-2" and both
+      cursors render; "session" may be omitted entirely by
+      single-connection agents (default "").
 
    C.3.  Follow the deltas.
 

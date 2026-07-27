@@ -28,10 +28,10 @@ daemon host itself is trusted (state is plaintext on its disk).
 
 ## Cluster mode (HA) — additional surface
 - **Intra-cluster traffic:** with a **cluster CA** (`coordd -init-cluster-ca`), the Raft
-  transport (which carries all replicated data) is **mutually authenticated + encrypted
-  (mTLS)** — T22, done. The inter-node HTTP forward/join channel stays TLS + bearer
-  token. Without the CA, the raft transport is plain TCP — run nodes on a trusted
-  private subnet.
+  transport (which carries all replicated data) **and** the inter-node HTTP forward/join
+  channel (which carries a cloned bearer token) are both **mutually authenticated +
+  encrypted (mTLS)** against the CA — T22. Without the CA, inter-node traffic is
+  unauthenticated — run nodes on a trusted private subnet.
 - **Encryption at rest:** blob (file) contents are **AES-256-GCM encrypted** when
   `ACP_DATA_KEY`/`-data-key-file` is set (T22). Keyed by plaintext hash (dedup intact);
   wrong key fails closed. Metadata (event/mailbox/lease/manifest/raft logs) is not yet
