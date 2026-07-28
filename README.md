@@ -37,6 +37,28 @@ Just the client: `ACP_BINS=acp curl -fsSL .../install.sh | bash`. Specific versi
 Already installed? `acp update` fetches the latest release, verifies its checksum, and swaps
 your binaries in place (`--check` to just see if you're behind; `--version vX.Y.Z` to pin).
 
+## Run with Docker
+
+Prefer containers? One command gives you a full ACP authority:
+
+```bash
+docker run -d --name coordd -p 8443:8443 -v acp-data:/data ab0t/acp:latest
+```
+
+Shared filesystem, comms, live co-editing, presence, HA-ready — in a single small image
+(`linux/amd64` + `arm64`). Your token, TLS certificate, and state all live in the `acp-data`
+volume, so upgrades are just `docker pull` + recreate, with nothing lost.
+
+Grab the auto-generated token and point any client at it:
+
+```bash
+docker exec coordd cat /data/token
+```
+
+Pin a version with `ab0t/acp:v0.1.7`. Exposing it beyond localhost? Add `-hosts <your-host>` so
+the certificate trusts that name. **Full walkthrough — TLS, configuration, docker-compose,
+clustering — in [docs/DOCKER.md](docs/DOCKER.md).**
+
 ## What you get
 
 - **Shared filesystem** — content-addressed; `acp push` / `acp pull` with 3-way merge.
@@ -91,6 +113,7 @@ HA deploy: **acp-cluster** skill. Operations: **acp-operations** skill.
 
 - [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — the wire API.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — deploy, secure, cluster, back up, troubleshoot.
+- [docs/DOCKER.md](docs/DOCKER.md) — run the daemon as a container (Docker Hub image, compose, TLS).
 - [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — security model.
 - [docs/AWARENESS.md](docs/AWARENESS.md) — **live presence** (ext-9): cursors, typing, status over HTTP or WebSocket.
 - [rfc/acp-1.txt](rfc/acp-1.txt) — **the full protocol specification** (RFC-style, normative for `acp/1`).
