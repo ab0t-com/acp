@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.1.7 — 2026-07-28
+Daemon + client release; the wire protocol version `acp/1` is unchanged — every feature is an
+additive, capability-negotiated endpoint or field. This release adds a live presence tier,
+finishes least-privilege tenancy, and coalesces durable appends for far higher write throughput.
+- **Awareness — the ephemeral presence tier (ext-9; capabilities `awareness`, `awareness-ws`).**
+  A live, self-expiring channel for *who is here and what they are doing right now* — cursor
+  positions, selections, typing/status — kept separate from the durable event log. Each agent
+  publishes a small JSON state keyed by `(actor, session)` that expires on a TTL (default 30 s)
+  or an explicit leave; everyone else reads a snapshot and follows a delta stream. Two transports:
+  `GET /v1/awareness?follow=true` (NDJSON, like the event stream) and an OPTIONAL bidirectional
+  **WebSocket** (`?transport=ws`) with a 15 Hz server-side coalescing tick, so a hundred cursor
+  moves a second cost a follower at most fifteen frames. **Awareness never touches durable
+  storage** — it is never written to the event log, CRDT, or snapshots (guaranteed, not
+  incidental), so live presence can never bloat or corrupt the durable record. Surfaces: SDK
+  (`SetAwareness`/`Awareness`/`FollowAwareness`/`ClearAwareness`), CLI (`acp awareness
+  set|get|watch|clear`), MCP (`acp_awareness_set|get|clear`), and a runnable
+  `examples/awareness-cursors/`. Guide: `docs/AWARENESS.md`. This is the missing middle tier
+  between the durable log (facts, forever) and the coarse heartbeat roster (alive, hour-scale).
+- **Least-privilege tenancy, finished (ext-7; capabilities `tenancy`, `tenancy.subscope`).**
+  Completes scoped tokens with **sub-scope project labels** — a lightweight partition *within* a
+  space for scoping and accounting (NOT a new isolation boundary; a separate space remains the
+  only hard boundary). A grant may be pinned to a `sub_scope` and/or an allowlist of `spaces`
+  (server-forced and unforgeable), carried in a versioned, fail-closed grant file — an older
+  binary refuses a scoped grant file rather than run it without the scope. Adds `/v1/subscopes`
+  discovery, `max_docs` as a per-space replicated quota (a document past the cap → `507` with
+  `{used, limit}`), per-sub-scope quotas (the tighter bound governs), and a scope `deny` list
+  (for example, a token that may read but never publish presence). SDK/CLI/MCP carry `sub_scope`
+  and the quota signal. `tenancy` is advertised only when scoped tokens **and** quotas are
+  enforced; `tenancy.subscope` additionally when sub-scopes are.
+- **Group commit (ext-10; flag `-group-commit`, default on).** Concurrent durable appends — event
+  log and mailbox — now share a single `fsync` per batching window instead of one per append.
+  Durability is unchanged (an acknowledged write still survives a crash, verified by a
+  crash-injection gate), a lone writer's latency stays within ~1% of before, and burst throughput
+  under concurrency improves **15–58×**. Set `-group-commit=false` for the previous
+  one-fsync-per-append behavior — an instant, per-daemon rollback.
+- **Data-directory lockfile.** A second `coordd` started against a `-data` directory already in
+  use now refuses to start with a clear error, instead of two daemons silently corrupting shared
+  state.
+- **Fixed.** Several cluster-determinism edge cases in the replicated state machine (HA
+  correctness) and a connection-handling gap on the new WebSocket upgrade path.
+- **Compatibility.** Wire stays `acp/1`; every feature is capability-negotiated, so a client and
+  daemon at different feature levels interoperate unchanged. The scoped-grant file gains a new
+  version only when sub-scope/`deny` grants exist (older binaries refuse it by design — re-mint to
+  downgrade). A document-create refused by a quota now returns `507`. Specs:
+  `rfc/acp-ext-9-presence-awareness.txt`, `rfc/acp-ext-7-scoped-tokens-quotas-subtenancy.txt`,
+  `rfc/acp-ext-10-storage-engine.txt`.
+
 ## v0.1.6 — 2026-07-27
 Daemon + client release; the wire protocol version `acp/1` is unchanged. A stability and
 hardening release focused on bounded resource use and cluster correctness.

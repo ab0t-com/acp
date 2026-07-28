@@ -76,11 +76,42 @@ Convention: lease the resource `file:<path>` to make a commit to that path exclu
 `Op = {t:"ins"|"del", id:{c,r}, o?:{c,r}, v?:"<rune>"}`. Ops commute; clients track a
 per-doc cursor (the `total` they've consumed).
 
+## Awareness — ephemeral presence (capability `awareness`; `awareness-ws` for WebSocket)
+Live, self-expiring presence keyed by `(actor, session)`; **never durable** (not in the log,
+CRDT, or snapshots). See `docs/AWARENESS.md`.
+| Method | Path | Body / Query | Returns |
+|--------|------|-------------|---------|
+| POST | `/v1/awareness` | `{state:{…}, ttl_sec?}` | your entry (set/refresh; TTL default 30 s) |
+| POST | `/v1/awareness` | `{ttl_sec:0}` (no state) | `{ok:true}` — a **leave** (removes your entry) |
+| GET | `/v1/awareness` | — | snapshot: `[]{actor, session, state, expires}` (live entries) |
+| GET | `/v1/awareness?follow=true` | — | NDJSON: snapshot then `join`/`update`/`leave` deltas |
+| GET | `/v1/awareness?transport=ws` | Upgrade: websocket | bidirectional; server coalescing tick (15 Hz) |
+
+`session` is the `X-ACP-Session` header (per-tab/connection). In a cluster the follow stream and
+WebSocket are served by the leader (followers redirect).
+
 ## Admin (role: admin)
 | Method | Path | Query | Returns |
 |--------|------|-------|---------|
 | POST | `/v1/admin/gc` | `grace_sec` (default 600) | `{removed, bytes}` — deletes unreferenced blobs older than grace |
 | POST | `/v1/admin/compact` | `doc` (optional) | `{dropped}` — compacts a CRDT doc's op-log (or all docs), GC-ing tombstones |
+
+## Tenancy — scoped tokens, quotas, sub-scopes (capabilities `tenancy`, `tenancy.subscope`)
+Least-privilege *within* a space; a separate **space** remains the only hard isolation boundary.
+Scoped grants live in `agents.json` (versioned, fail-closed) with optional `path_prefix`, an
+allowlist of `spaces`, a `sub_scope` pin, and a `deny` list (e.g. `deny:["awareness"]`).
+| Method | Path | Body / Query | Returns |
+|--------|------|-------------|---------|
+| GET | `/v1/whoami` | — | `{name, role, scope}` — the caller's own grant (no token echoed) |
+| GET | `/v1/subscopes` | — | `[]{name, …counters}` — sub-scope labels seen in the space |
+| PUT | `/v1/admin/quota` | `{space?, sub_scope?, max_events?, max_blob_bytes?, max_leases?, max_docs?}` | the stored quota |
+| GET | `/v1/admin/quota` | `space?` | the current quota + usage |
+
+A `sub_scope` label may ride `POST /v1/events`, `POST /v1/mail`, `POST /v1/lease/acquire`, and
+`POST /v1/commit`. A write over a per-space or per-sub-scope quota returns **507** with
+`{used, limit}` (retained-state quotas: `max_events`, `max_blob_bytes`, `max_docs`); a transient
+cap (`max_leases`) returns **429** + `Retry-After`. `GET /v1/stats` reports `{used, limit}` per
+configured quota. `tenancy` is advertised only when scoped tokens **and** quotas are enforced.
 
 ## Roles (per-agent mode)
 `agents.json` maps token → `{name, role}`. Roles: **admin** (everything), **writer**
