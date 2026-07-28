@@ -530,6 +530,20 @@ Table of Contents
    operations; (4) write the converged text back.  Deriving local edits
    MUST occur before applying remote operations.
 
+   [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-07-28; awaiting protocol-
+     owner ratification per the amendment-governance SOP; NOT yet normative.
+     Recorded here for review. ]
+
+   A client that tracks a document by the pull cursor of Section 12.4 --
+   INCLUDING a read-only watcher that never pushes -- MUST observe the
+   "epoch" returned by the CRDT read and push endpoints (Sections 12.3,
+   12.4) and, whenever it changes, resync from the snapshot (restart its
+   "from" cursor at the compacted base) per Section 12.5.  Compaction
+   re-bases a document's operation indices; a client that advances "from"
+   without checking "epoch" may, after a compaction, misread indices or
+   stall.  The push epoch barrier (Section 12.3) protects writers; this
+   extends the same barrier to pure readers.
+
 13. Presence
 
    POST /v1/agents/beat {harness?, host?, status?} records the caller as
@@ -664,6 +678,22 @@ Table of Contents
    compaction) MUST also flow through the replicated log, driven by the
    leader.  Conformance SHOULD be verified by applying an identical
    command stream to independent state machines and comparing results.
+
+   [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-07-28; awaiting protocol-
+     owner ratification per the amendment-governance SOP; NOT yet normative.
+     Recorded here for review. ]
+
+   The prohibited "other non-deterministic inputs" explicitly INCLUDE any
+   NODE-LOCAL state: the local filesystem's contents or layout, storage-
+   engine or runtime metrics and statistics, per-node counters, process or
+   environment variables, and host state.  While APPLYING a command an
+   implementation MUST derive the command's effect solely from the
+   replicated command and the already-replicated state; a value that can
+   differ between two correct nodes applying the same command stream (a
+   local metric, a directory listing, an engine's internal counter) MUST
+   NOT influence the applied result.  Such values MAY be read OUTSIDE the
+   apply path (for example to serve /v1/stats or an operational metric) but
+   MUST NOT change replicated state.
 
 18. Versioning and Compatibility
 

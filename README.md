@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-7C6CF0"></a>
-  <img alt="release v0.1.1" src="https://img.shields.io/badge/release-v0.1.1-2DD4BF">
+  <img alt="release v0.1.7" src="https://img.shields.io/badge/release-v0.1.7-2DD4BF">
   <img alt="protocol acp/1" src="https://img.shields.io/badge/protocol-acp%2F1-FF9466">
 </p>
 
@@ -42,6 +42,7 @@ your binaries in place (`--check` to just see if you're behind; `--version vX.Y.
 - **Shared filesystem** — content-addressed; `acp push` / `acp pull` with 3-way merge.
 - **Live co-editing** — `acp crdt sync` lets agents edit the *same* file and auto-merge (CRDT).
 - **Comms** — directed mailbox (`send`/`inbox`) + a totally-ordered event log (`watch`).
+- **Live presence** — ephemeral awareness (cursors, typing, status) that self-expires in seconds and never touches durable storage; optional WebSocket.
 - **Safe concurrency** — TTL leases with fencing tokens; never lose work.
 - **Multi-tenant** — isolated **spaces** on one daemon; per-agent identity + roles.
 - **HA** — run a 3-node **Raft** cluster (auto failover); **mTLS** between nodes; **encryption at rest**.
@@ -58,6 +59,8 @@ can feature-detect instead of trial-and-erroring requests:
 - `crdtjson-move` — identity-preserving `mv` op for the JSON CRDT: reorder/relocate a node or array element without losing a peer's concurrent edit to it (safe drag-to-reorder, move-between-columns, reparent).
 - `scopedtokens` — narrower-than-admin token grants.
 - `quotas` — per-space resource limits.
+- `tenancy`, `tenancy.subscope` — scoped tokens + quotas + sub-scope project labels within a space (least-privilege; a space remains the only hard isolation boundary).
+- `awareness`, `awareness-ws` — live, self-expiring presence (cursors, typing, status), never written to durable storage; optional WebSocket transport with a 15 Hz server-side coalescing tick.
 
 Extension proposals live in [rfc/](rfc/) as RFC-2119 documents; a capability only appears in
 `healthz` once its extension is accepted and implemented.
@@ -89,6 +92,7 @@ HA deploy: **acp-cluster** skill. Operations: **acp-operations** skill.
 - [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — the wire API.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — deploy, secure, cluster, back up, troubleshoot.
 - [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — security model.
+- [docs/AWARENESS.md](docs/AWARENESS.md) — **live presence** (ext-9): cursors, typing, status over HTTP or WebSocket.
 - [rfc/acp-1.txt](rfc/acp-1.txt) — **the full protocol specification** (RFC-style, normative for `acp/1`).
 - [rfc/acp-ext-1-channels-groups-pubsub.txt](rfc/acp-ext-1-channels-groups-pubsub.txt) — **extension proposal**: channels, groups & topic-filtered pub/sub (additive to `acp/1`).
 - [Skills/](Skills/) — agent skills: acp-client, acp-operations, acp-cluster.

@@ -96,6 +96,22 @@ Status of This Memo
    set; the base protocol version string remains "acp/1".
    Distribution is unlimited.
 
+   [ PROPOSED AMENDMENT -- UNSIGNED (owner ratification).  Dated 2026-07-28;
+     awaiting the protocol owner's signature per the amendment-governance
+     SOP; until signed, this memo remains a PROPOSAL of record. ]
+
+   Amendment (2026-07-28) -- OWNER RATIFICATION (proposed).  The move
+   operation of this document is IMPLEMENTED in the reference
+   implementation and advertised as the capability string "crdtjson-move";
+   it is enforced whenever the structured (EXT-5) store is present.  On the
+   owner's acceptance this Status changes from "PROPOSAL / not implemented"
+   to ACCEPTED AND IMPLEMENTED, matching the EXT-4 / EXT-5 accepted-and-
+   implemented precedent; the provisional extension number 14 is confirmed
+   as final; and the owner selects the family "Updates:" convention raised
+   in review note F9.  Until the owner signs this block the memo remains a
+   PROPOSAL of record; the implementation's advertised capability is the
+   honest state either way.
+
 Copyright Notice
 
    Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same

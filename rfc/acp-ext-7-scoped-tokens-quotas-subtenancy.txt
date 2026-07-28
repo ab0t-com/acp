@@ -317,6 +317,42 @@ Table of Contents
       An absent or empty scope means "no additional constraint" -- exactly
       today's grant.  All constraints in a scope are ANDed.
 
+   4.1.1.  Amendment (2026-07-28) -- the "spaces" field, and the
+           withdrawal of "read_only" / "actor".
+
+      [ PROPOSED AMENDMENT -- UNSIGNED.  Awaiting protocol-owner
+        ratification per the amendment-governance SOP; NOT yet part of the
+        accepted Sections 4.1-4.7.  Recorded here for review. ]
+
+      (a) The Scope of Section 4.1 gains an OPTIONAL
+
+             "spaces": [<string>]?   ; allowlist of space names this
+                                     ;   grant may select; absent or
+                                     ;   empty = any space (today's
+                                     ;   behavior)
+
+          When present, "spaces" is an EXACT-NAME allowlist: the authority
+          MUST deny any request whose target space is not listed, and a
+          space-scoped grant enumerates only its listed spaces at GET
+          /v1/spaces.  Unlike "path_prefix", which narrows WRITE resource
+          names only (Section 4.2), "spaces" narrows SPACE SELECTION for
+          both reads and writes -- strictly beneath the space boundary and
+          consistent with Section 3.1 (a scope only narrows, and can never
+          widen, cross, or substitute for, the space boundary).  An absent
+          or empty list preserves ACP/1 behavior exactly.  "spaces" is
+          carried in the same versioned, fail-closed grant envelope as the
+          rest of the scope; an authority that cannot evaluate it MUST fail
+          closed (deny), never open.
+
+      (b) "read_only" and "actor" (Sections 4.3, 4.4) are WITHDRAWN as
+          redundant, per Status-of-This-Memo refinement 7: ACP/1 role
+          "reader" already is read-only, and a per-agent grant already
+          pins the actor (ACP/1 Section 5.2).  They are retained in the
+          Section 4.1 and Appendix A grammar as RESERVED / historical
+          only.  The ENFORCED scope surface is "path_prefix" and "spaces"
+          (plus the PROPOSED "read_prefix" of Section 4.8 and "sub_scope"
+          of Section 6, each subject to its own status).
+
    4.2.  path_prefix -- constraining WRITE resource names.
 
       When path_prefix is present, every WRITE op whose target has a
@@ -638,6 +674,25 @@ Table of Contents
    broker-side.  This fail-open direction is the single most important
    interoperability rule in this document.
 
+   [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-07-28; awaiting protocol-
+     owner ratification per the amendment-governance SOP; NOT yet normative.
+     Recorded here for review. ]
+
+   Amendment (2026-07-28) -- capability reconciliation.  The Status of
+   This Memo records that enforcement shipped under GRANULAR capability
+   strings: "scopedtokens" for Section 4 (scoped tokens) and "quotas" for
+   Section 5 (per-space quotas).  The single "tenancy" capability named in
+   the body of this document (Sections 3.2, 4.7, 7, 10.1, and example C.4)
+   is RESERVED for a daemon that enforces Sections 4, 5, AND 6 (sub-scopes)
+   together, and MUST NOT be advertised until Section 6 ships -- advertising
+   it earlier would assert unshipped sub-scoping.  Accordingly, wherever the
+   body directs a principal to probe "tenancy" before RELYING ON A SCOPE as
+   a security control, the normative probe target is "scopedtokens" (and,
+   for reliance on quotas, "quotas").  This resolves the "reconcile on the
+   next revision" note in the Status of This Memo; the fail-open rule of
+   Section 3.2 is unchanged in substance -- only the capability STRING a
+   relying party checks is corrected.
+
 
 8.  Wire API Additions
 
@@ -807,9 +862,10 @@ Appendix A.  New and Changed Data Types (JSON)
         "scope": Scope? }
 
    Scope (new):
-      { "read_only":   <bool>?,
+      { "read_only":   <bool>?,     ; RESERVED/withdrawn -- see Section 4.1.1
         "path_prefix": [<string>]?,
-        "actor":       <string>?,
+        "actor":       <string>?,   ; RESERVED/withdrawn -- see Section 4.1.1
+        "spaces":      [<string>]?, ; PROPOSED (UNSIGNED) -- Section 4.1.1
         "sub_scope":   <string>? }
 
    Quota (new -- Section 5.1):
