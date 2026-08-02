@@ -5,7 +5,7 @@ Category: Extension Proposal (core architecture)                   ISSN: n/a
 
 
         ACP Extension Proposal 10: Pluggable Storage Engine
-              (the Store Interface and the Pebble Backend)
+             (the Store Interface and the Database Backend)
 
 
 Abstract
@@ -26,9 +26,11 @@ Abstract
    no clock or randomness below the interface; gap-free sequence
    assignment; per-space namespacing; engine-level snapshot/restore).
    Second, the first alternative BACKEND behind that interface: an
-   embedded log-structured merge (LSM) engine (Pebble), replacing
+   embedded log-structured merge (LSM) database engine, replacing
    fsync-per-append JSONL files with batched group commits, atomic
    multi-key batches, checkpoint-based snapshots, and range deletes.
+   (The specific embedded engine is an implementation detail and is
+   deliberately not named here; on the wire it is simply "db".)
 
    Nothing on the wire changes: no new endpoint, no new type, no
    capability string, and byte-identical document materializations.
@@ -46,9 +48,74 @@ Status of This Memo
    describes exists as compiled interface code (T34); no backend other
    than the current file format is implemented at the time of writing.
    Companion (non-normative) documents: the storage-engine research
-   pack (wave 2, 2026-07-26) and the implementation ticket pack
-   (storage-engine-pebble-20260726), which carry the evidence,
-   benchmarks, and milestone plan.  Distribution is unlimited.
+   pack (wave 2, 2026-07-26) and the storage-engine implementation
+   ticket pack, which carry the evidence, benchmarks, and milestone
+   plan.  Distribution is unlimited.
+
+====== BEGIN UNSIGNED AMENDMENT · id=ext10-storage-engine-status · proposed 2026-07-31 · NOT normative until ratified ======
+   [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-07-31; awaiting protocol-
+     owner ratification per the amendment-governance SOP; NOT yet normative.
+     It supersedes this memo's implementation-status claim and records the
+     protocol-level results now that the Store interface and a second
+     backend exist.  It changes no "acp/1" wire format. ]
+
+   Amendment 1 (2026-07-31) -- implementation status and results.
+
+   The Status above ("the Store interface exists as compiled interface code
+   ... no backend other than the file format is implemented") is
+   SUPERSEDED.  The Store interface (Section 4) is now fully realized, and
+   the reference implementation ships TWO conformant profiles from one
+   codebase, selected at BUILD time, both speaking "acp/1" unchanged and
+   mutually indistinguishable to a client (Section 6 stays empty):
+
+   o  a LEAN profile whose engine is the original file format (the default
+      build; no added dependency); and
+   o  a SERVER profile whose engine is an embedded ordered-KV (LSM) engine.
+
+   Engine-neutral refinements adopted while realizing Section 4 (every
+   backend MUST honor them; stated here as protocol behavior, not as any
+   one implementation's internals):
+
+   o  ENUMERATION of the dynamic log set -- an operation to list the log
+      names present under a namespace prefix WITHOUT creating any (the CRDT
+      op-logs are a set discovered at runtime).  A log is enumerable once it
+      HAS content; an opened-but-never-written log need not appear.
+   o  a STAGED-APPEND / BARRIER split -- an append is expressed as "stage
+      the records" then "one durability barrier," so the group-commit
+      coalescer sits ABOVE the interface and a backend performs exactly one
+      sync per window (Section 4 durable-before-return, unchanged in effect).
+   o  a METADATA slot on the atomic log replace -- the home for a compacted
+      document's epoch (Section 4 snapshot compaction).
+   o  an engine-neutral LOGICAL SNAPSHOT as the canonical CROSS-ENGINE
+      transfer format.  A logical snapshot taken on either profile restores
+      losslessly on either profile and is the ONLY cross-engine path.  A
+      backend's own PHYSICAL image (a checkpoint, or a tar of the state
+      directory) is SINGLE-ENGINE and MUST NOT be restored into a different
+      backend; a daemon MUST refuse such a restore rather than come up with
+      missing state.  This is the mechanism behind cluster snapshot install
+      and the migration of Appendix C.
+
+   Introspection (Section 5): GET /v1/stats "storage" reports "engine",
+   "format_version" (now 2), and an OPTIONAL engine-specific "metrics"
+   object.  The engine NAME remains operator introspection ONLY, never a
+   wire capability (ACP/1 Section 3.1).
+
+   Migration (Appendix C): offline, copy-based, source-untouched migration
+   is implemented in BOTH directions and proven logical-state-lossless
+   (whole state, including the lease fencing counter and manifest version).
+   Reverse conversion (server profile -> lean file profile) is the
+   NO-LOCK-IN guarantee of the reference implementation.  Whether to raise
+   it from OPTIONAL to REQUIRED in this memo is DEFERRED to acceptance
+   (Section 10), not settled here: it is premature to bind every future
+   implementation to it before the server profile has shipped and been
+   exercised in the field.
+
+   Non-normative measured note: the server profile's value is BOUNDED
+   resident memory under large retained history plus incremental compaction
+   of large logs; its cold-start (rebuilding in-memory state at open) is a
+   bounded regression versus the lean profile's sequential replay, not a
+   win.  The default remains the lean file profile (Section 9.2).
+====== END UNSIGNED AMENDMENT · id=ext10-storage-engine-status ======
 
 Copyright Notice
 
@@ -120,9 +187,9 @@ Table of Contents
    established the external evidence: the interface shape matches
    what production CRDT systems independently converged on; the
    merge/semantics layer must stay in the daemon while only the
-   byte-store is delegated; and Pebble -- a pure-Go LSM proven for
-   five-plus years under CockroachDB -- is the primary backend
-   candidate, adopted only behind named benchmark gates.
+   byte-store is delegated; and an embedded, pure-Go LSM engine of a
+   class proven for years in production-grade databases is the primary
+   backend candidate, adopted only behind named benchmark gates.
 
 2.  Conventions and Terminology
 
@@ -146,8 +213,8 @@ Table of Contents
       filesystem's blobs).  Unchanged by this proposal.
 
    BACKEND:  A concrete implementation of the Engine and its stores:
-      "file" (the current formats, byte-identical) or "pebble" (the
-      embedded LSM), selected by daemon configuration.
+      "file" (the current formats, byte-identical) or "db" (the
+      embedded LSM database engine), selected by daemon configuration.
 
    PARITY SUITE:  The storage-level test suite executed against every
       backend; a backend is conformant only when the suite passes
@@ -254,7 +321,7 @@ Table of Contents
                          CAS and the 409/rebase flow is unchanged
       blobs           -> BlobStore (content-addressed files; later S3)
 
-   4.4.  The Pebble backend (informative sketch; normative bounds).
+   4.4.  The database backend (informative sketch; normative bounds).
 
       Keyspace (all keys prefixed by space):
 
@@ -277,7 +344,7 @@ Table of Contents
    because nothing observable changes.  For operators, the daemon
    SHOULD report the active backend and its health in GET /v1/stats:
 
-      "storage": { "engine": "file" | "pebble",
+      "storage": { "engine": "file" | "db",
                    "format_version": <int>,
                    "metrics": { ... engine counters ... } }
 
@@ -309,7 +376,7 @@ Table of Contents
       enforces this mechanically for every backend.
 
    o  Cluster snapshot/install uses Engine.Snapshot()/Restore().
-      Under the Pebble backend this is a checkpoint (hard-linked
+      Under the database backend this is a checkpoint (hard-linked
       consistent image) and sstable ingestion on install -- replacing
       the directory tar.  Restore MUST validate all paths within the
       target directory (this applies to any archive-shaped
@@ -327,8 +394,8 @@ Table of Contents
       NOT restore a snapshot image into a different backend's
       directory -- install always goes through Engine.Restore.
 
-   o  On restart, recovery is the engine's (WAL replay under Pebble;
-      file replay under the file backend); the contract to the rest
+   o  On restart, recovery is the engine's (WAL replay under the
+      database backend; file replay under the file backend); the contract to the rest
       of the daemon is identical: everything acknowledged is present.
 
 8.  Security Considerations
@@ -338,7 +405,7 @@ Table of Contents
       Checkpoint/ingest narrows this surface but does not remove the
       requirement.
 
-   8.2.  Single-process store.  The Pebble store directory is owned
+   8.2.  Single-process store.  The database store directory is owned
       by one daemon process (lock file).  Operators lose direct
       grep-on-the-live-file; the read-only dump tool over a
       checkpoint restores that capability without a second live
@@ -432,12 +499,12 @@ Appendix A.  New and Changed Data Types (JSON)
    Health/Stats (changed -- OPTIONAL operator introspection only):
       { ...existing fields...,
         "storage": {
-          "engine":         "file" | "pebble",
+          "engine":         "file" | "db",
           "format_version": <int>,
           "metrics":        <object>? } }   ; unstable schema (Q3)
 
    No wire types are added or changed.  No stored ACP record type
-   changes meaning; the Pebble backend re-encodes location (keys),
+   changes meaning; the database backend re-encodes location (keys),
    never content (values are today's record bytes).
 
 Appendix B.  New Error Conditions
@@ -457,20 +524,20 @@ Appendix C.  Worked Example (Operator Migration)
 
    C.2.  Convert (offline, copy-based; source untouched).
       $ systemctl stop coordd
-      $ acp admin migrate-store --from /srv/acp --to /srv/acp-pebble
-      $ coordd -state /srv/acp-pebble -storage pebble ...
+      $ acp admin migrate-store --from /srv/acp --to /srv/acp-db
+      $ coordd-server -state /srv/acp-db ...    ; the server-mode binary
       GET /v1/stats
-      -> { ..., "storage": { "engine": "pebble",
+      -> { ..., "storage": { "engine": "db",
                              "format_version": 1 } }
 
    C.3.  Inspect without stopping (the greppability answer).
-      $ acp admin dump --state /srv/acp-pebble --space company_x \
+      $ acp admin dump --state /srv/acp-db --space company_x \
             --stream crdt/board --from 58000 | grep presence
 
    C.4.  Roll back.
       $ systemctl stop coordd
-      $ coordd -state /srv/acp -storage file ...   ; original dir
-      (If writes landed on pebble meanwhile: acp admin migrate-store
+      $ coordd -state /srv/acp ...   ; the original dir + local binary
+      (If writes landed on the db meanwhile: acp admin migrate-store
        --reverse first; lossless by the op-log-is-truth property.)
 
 

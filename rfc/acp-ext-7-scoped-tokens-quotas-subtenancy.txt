@@ -317,6 +317,7 @@ Table of Contents
       An absent or empty scope means "no additional constraint" -- exactly
       today's grant.  All constraints in a scope are ANDed.
 
+====== BEGIN UNSIGNED AMENDMENT · id=ext7-4.1.1-spaces-field · proposed 2026-07-28 · NOT normative until ratified ======
    4.1.1.  Amendment (2026-07-28) -- the "spaces" field, and the
            withdrawal of "read_only" / "actor".
 
@@ -352,6 +353,7 @@ Table of Contents
           only.  The ENFORCED scope surface is "path_prefix" and "spaces"
           (plus the PROPOSED "read_prefix" of Section 4.8 and "sub_scope"
           of Section 6, each subject to its own status).
+====== END UNSIGNED AMENDMENT · id=ext7-4.1.1-spaces-field ======
 
    4.2.  path_prefix -- constraining WRITE resource names.
 
@@ -674,6 +676,7 @@ Table of Contents
    broker-side.  This fail-open direction is the single most important
    interoperability rule in this document.
 
+====== BEGIN UNSIGNED AMENDMENT · id=ext7-7-tenancy-capability · proposed 2026-07-28 · NOT normative until ratified ======
    [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-07-28; awaiting protocol-
      owner ratification per the amendment-governance SOP; NOT yet normative.
      Recorded here for review. ]
@@ -692,6 +695,7 @@ Table of Contents
    next revision" note in the Status of This Memo; the fail-open rule of
    Section 3.2 is unchanged in substance -- only the capability STRING a
    relying party checks is corrected.
+====== END UNSIGNED AMENDMENT · id=ext7-7-tenancy-capability ======
 
 
 8.  Wire API Additions

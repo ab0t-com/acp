@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.0 — 2026-08-01
+Minor release. Introduces the opt-in **server DB storage mode** and ships a broad security +
+resource hardening pass across the data plane. Wire protocol `acp/1` is unchanged (additive).
+- **Server DB storage mode (ext-10; opt-in, default `file`).** A second build profile embeds a
+  write-optimized storage engine for higher write throughput and faster cold start, with a
+  bounded, configurable memory footprint (`-mem-budget`). The default file-backed profile is
+  unchanged — most deployments keep running it. The server profile ships as separate `acp-server` /
+  `coordd-server` / `acp-mcp-server` artifacts (CGO-free/static); storage is byte-identical across
+  profiles and migration is lossless both ways.
+- **CRDT document delete + reclaim.** `DeleteDoc` frees a document's `-max-docs` slot and reclaims
+  its on-disk storage. A per-document generation fence prevents a delete/recreate race from
+  silently dropping an in-flight edit. Cluster fence enforcement is controlled by
+  `-cluster-crdt-delete-fence` (default on); see `docs/OPERATIONS.md` for rolling-upgrade behavior.
+- **Security + resource hardening (data plane).** A broad pass: tightened durable-state file
+  permissions, bounded memory / file-descriptor / rate-limit growth axes, hardened CRDT compaction
+  and snapshot handling, fail-closed lease and blob consumer paths, safer offline admin tooling, a
+  bounded raft commit-wait, and checksum-verified release artifacts. No wire/API change; no user
+  action required.
+
 ## v0.1.7 — 2026-07-28
 Daemon + client release; the wire protocol version `acp/1` is unchanged — every feature is an
 additive, capability-negotiated endpoint or field. This release adds a live presence tier,

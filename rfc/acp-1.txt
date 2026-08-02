@@ -530,6 +530,7 @@ Table of Contents
    operations; (4) write the converged text back.  Deriving local edits
    MUST occur before applying remote operations.
 
+====== BEGIN UNSIGNED AMENDMENT · id=acp1-12.6-readwatcher-epoch · proposed 2026-07-28 · NOT normative until ratified ======
    [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-07-28; awaiting protocol-
      owner ratification per the amendment-governance SOP; NOT yet normative.
      Recorded here for review. ]
@@ -543,6 +544,7 @@ Table of Contents
    without checking "epoch" may, after a compaction, misread indices or
    stall.  The push epoch barrier (Section 12.3) protects writers; this
    extends the same barrier to pure readers.
+====== END UNSIGNED AMENDMENT · id=acp1-12.6-readwatcher-epoch ======
 
 13. Presence
 
@@ -679,6 +681,7 @@ Table of Contents
    leader.  Conformance SHOULD be verified by applying an identical
    command stream to independent state machines and comparing results.
 
+====== BEGIN UNSIGNED AMENDMENT · id=acp1-17-node-local-state · proposed 2026-07-28 · NOT normative until ratified ======
    [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-07-28; awaiting protocol-
      owner ratification per the amendment-governance SOP; NOT yet normative.
      Recorded here for review. ]
@@ -694,6 +697,7 @@ Table of Contents
    NOT influence the applied result.  Such values MAY be read OUTSIDE the
    apply path (for example to serve /v1/stats or an operational metric) but
    MUST NOT change replicated state.
+====== END UNSIGNED AMENDMENT · id=acp1-17-node-local-state ======
 
 18. Versioning and Compatibility
 

@@ -96,6 +96,7 @@ Status of This Memo
    set; the base protocol version string remains "acp/1".
    Distribution is unlimited.
 
+====== BEGIN UNSIGNED AMENDMENT · id=ext14-status-accepted · proposed 2026-07-28 · NOT normative until ratified ======
    [ PROPOSED AMENDMENT -- UNSIGNED (owner ratification).  Dated 2026-07-28;
      awaiting the protocol owner's signature per the amendment-governance
      SOP; until signed, this memo remains a PROPOSAL of record. ]
@@ -111,6 +112,7 @@ Status of This Memo
    in review note F9.  Until the owner signs this block the memo remains a
    PROPOSAL of record; the implementation's advertised capability is the
    honest state either way.
+====== END UNSIGNED AMENDMENT · id=ext14-status-accepted ======
 
 Copyright Notice
 
