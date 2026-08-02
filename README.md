@@ -42,12 +42,19 @@ your binaries in place (`--check` to just see if you're behind; `--version vX.Y.
 Prefer containers? One command gives you a full ACP authority:
 
 ```bash
-docker run -d --name coordd -p 8443:8443 -v acp-data:/data ab0t/acp:latest
+docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data ab0tcom/acp:latest
 ```
 
 Shared filesystem, comms, live co-editing, presence, HA-ready — in a single small image
 (`linux/amd64` + `arm64`). Your token, TLS certificate, and state all live in the `acp-data`
 volume, so upgrades are just `docker pull` + recreate, with nothing lost.
+
+Want **server DB mode (ACPDB)** — the same protocol backed by an embedded database for bounded, flat
+memory and fast restarts at scale? Same command, the `:server` tag (it runs `coordd-server` for you):
+
+```bash
+docker run -d --name acpdb --restart on-failure:5 -p 8443:8443 -v acpdb-data:/data ab0tcom/acp:server
+```
 
 Grab the auto-generated token and point any client at it:
 
@@ -55,7 +62,7 @@ Grab the auto-generated token and point any client at it:
 docker exec coordd cat /data/token
 ```
 
-Pin a version with `ab0t/acp:v0.1.7`. Exposing it beyond localhost? Add `-hosts <your-host>` so
+Pin a version with `ab0tcom/acp:v0.2.0`. Exposing it beyond localhost? Add `-hosts <your-host>` so
 the certificate trusts that name. **Full walkthrough — TLS, configuration, docker-compose,
 clustering — in [docs/DOCKER.md](docs/DOCKER.md).**
 
@@ -68,6 +75,7 @@ clustering — in [docs/DOCKER.md](docs/DOCKER.md).**
 - **Safe concurrency** — TTL leases with fencing tokens; never lose work.
 - **Multi-tenant** — isolated **spaces** on one daemon; per-agent identity + roles.
 - **HA** — run a 3-node **Raft** cluster (auto failover); **mTLS** between nodes; **encryption at rest**.
+- **Storage modes** — file-backed by default, or **server DB mode (ACPDB)**: `coordd-server` embeds a real database for bounded, flat memory and fast restarts at scale. Same protocol, lossless conversion either way, no sidecar — *in server mode, ACP is the database*. → [docs/STORAGE-MODES.md](docs/STORAGE-MODES.md)
 - **MCP bridge** — `acp-mcp` exposes ACP as tools to any MCP harness (Claude Code, Codex).
 
 ## Capabilities & extensions
@@ -116,6 +124,7 @@ HA deploy: **acp-cluster** skill. Operations: **acp-operations** skill.
 - [docs/DOCKER.md](docs/DOCKER.md) — run the daemon as a container (Docker Hub image, compose, TLS).
 - [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — security model.
 - [docs/AWARENESS.md](docs/AWARENESS.md) — **live presence** (ext-9): cursors, typing, status over HTTP or WebSocket.
+- [docs/STORAGE-MODES.md](docs/STORAGE-MODES.md) — **storage modes**: file-backed default vs server DB mode (ACPDB) — crossover, memory tuning, lossless migration.
 - [rfc/acp-1.txt](rfc/acp-1.txt) — **the full protocol specification** (RFC-style, normative for `acp/1`).
 - [rfc/acp-ext-1-channels-groups-pubsub.txt](rfc/acp-ext-1-channels-groups-pubsub.txt) — **extension proposal**: channels, groups & topic-filtered pub/sub (additive to `acp/1`).
 - [Skills/](Skills/) — agent skills: acp-client, acp-operations, acp-cluster.
