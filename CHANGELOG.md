@@ -1,11 +1,29 @@
 # Changelog
 
+## Unreleased — target v0.2.1 · HELD (built, NOT yet published)
+> ⚠️ **This version is BUILT but NOT RELEASED.** It is intentionally held to batch
+> more features before a public cut — the version number **v0.2.1 is still active
+> for work** (more entries may be added below before it ships). `releases/latest.txt`
+> stays at **v0.2.0** until `release-public`. Do not treat these notes as shipped.
+
+- **Go SDK made externally-consumable (ext-23).** The `pkg/client` Go SDK's method
+  signatures now use public wire-type packages (`pkg/wire`, `pkg/crdt`, `pkg/crdtjson`)
+  instead of internal ones, so it can be used from a separate Go module — a typed,
+  in-process client for the existing coordination surface (events, files, leases, CRDT
+  co-editing, presence, mailbox). **No wire/protocol change** (`acp/1` unchanged) and
+  **no new capability** — a packaging fix, not a new feature.
+  *(Distribution is under evaluation and may stay private/partner: `go get`-ing the SDK
+  would require the Go module source in the public repo, which is a separate owner
+  policy decision. Unless/until that is decided, the public client surfaces remain the
+  `acp` CLI and `acp-mcp`. The drafted SDK docs/skill are in the owner sign-off queue,
+  not yet public.)*
+
 ## v0.2.0 — 2026-08-01
 Minor release. Introduces the opt-in **server DB storage mode** and ships a broad security +
 resource hardening pass across the data plane. Wire protocol `acp/1` is unchanged (additive).
 - **Server DB storage mode (ext-10; opt-in, default `file`).** A second build profile embeds a
-  write-optimized storage engine for higher write throughput and faster cold start, with a
-  bounded, configurable memory footprint (`-mem-budget`). The default file-backed profile is
+  storage engine that keeps the daemon's memory footprint **bounded and predictable** at scale via a
+  configurable budget (`-mem-budget`), instead of growing with the data. The default file-backed profile is
   unchanged — most deployments keep running it. The server profile ships as separate `acp-server` /
   `coordd-server` / `acp-mcp-server` artifacts (CGO-free/static); storage is byte-identical across
   profiles and migration is lossless both ways.

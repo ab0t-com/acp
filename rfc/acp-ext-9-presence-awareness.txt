@@ -758,6 +758,40 @@ Table of Contents
       consumer's superseded frames are dropped (keep-latest), never
       buffered without bound.
 
+====== BEGIN UNSIGNED AMENDMENT · id=ext9-11.3-browser-upgrade-auth · proposed 2026-08-12 · NOT normative until ratified ======
+   [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-08-12; awaiting protocol-
+   owner ratification.  Classification: SPEC GAP (Section 11.3 interop). ]
+
+   Amendment (2026-08-12) -- Section 11.3 browser reachability of the
+   WebSocket upgrade.
+
+      Section 11.3 authenticates the Upgrade request via the standard
+      bearer header (Section 6).  The browser WebSocket API provides NO
+      mechanism to set request headers on an Upgrade, so a conformant
+      BROWSER client cannot authenticate to this binding directly --
+      although Section 11.3's origin policy explicitly contemplates
+      browser peers.  An independent implementer targeting browsers
+      needs this stated:
+
+      o  A browser client MUST reach the Section 11.3 socket through an
+         intermediary that injects the credential (a same-origin gateway
+         or reverse proxy holding the token), OR use the Section 4 HTTP
+         surface (POST + NDJSON follow), which is fully equivalent in
+         semantics (Section 11.3 changes transport only).
+
+      o  A browser-native in-band authentication mechanism for WebSocket
+         upgrades (an authenticating first frame) is specified by draft
+         extension EXT-25 for the durable-surface socket; on its
+         acceptance, a daemon MAY offer the same mechanism on this
+         binding.  Until then, header auth is the only in-protocol
+         upgrade authentication, and deployments MUST NOT work around it
+         by placing bearer tokens in the URL query string (tokens in
+         URLs leak into logs and intermediaries).
+
+      This amendment adds no wire surface and changes no frame; it
+      states an interoperability constraint the section already implies.
+====== END UNSIGNED AMENDMENT · id=ext9-11.3-browser-upgrade-auth ======
+
    11.4.  Cross-node fan-out (OPTIONAL): from leader-served to gossip.
 
       Section 7 specifies LEADER-SERVED awareness as the cluster

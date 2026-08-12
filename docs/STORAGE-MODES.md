@@ -6,7 +6,7 @@ data on disk. You pick the mode by choosing which server binary you run.
 
 > **TL;DR** — Start with **local mode** (the default: one binary, zero dependencies, files you can
 > read). Move to **server mode (ACPDB)** when a deployment keeps a large, long-lived history and you
-> want **bounded, tunable memory** and **fast restarts** at that scale. You can convert between the
+> want **bounded, tunable memory** at that scale. You can convert between the
 > two at any time, losslessly, in either direction.
 
 ## Which mode should I use?

@@ -7,7 +7,7 @@ you from `docker run` to a connected client.
 > Image: `ab0tcom/acp` on Docker Hub. Two modes, same repo:
 > - **Local (default)** — `:latest`, `:vX.Y.Z` → `coordd`, file-backed storage. What most run.
 > - **Server DB mode (ACPDB)** — `:server`, `:vX.Y.Z-server` → `coordd-server`, an embedded database
->   for bounded/flat memory and fast restarts at scale. Same protocol, same flags.
+>   for bounded/flat memory at scale. Same protocol, same flags.
 >
 > `:latest` / `:server` track the newest release; the pinned `:vX.Y.Z` tags match the binary release.
 

@@ -50,7 +50,7 @@ Shared filesystem, comms, live co-editing, presence, HA-ready — in a single sm
 volume, so upgrades are just `docker pull` + recreate, with nothing lost.
 
 Want **server DB mode (ACPDB)** — the same protocol backed by an embedded database for bounded, flat
-memory and fast restarts at scale? Same command, the `:server` tag (it runs `coordd-server` for you):
+memory at scale? Same command, the `:server` tag (it runs `coordd-server` for you):
 
 ```bash
 docker run -d --name acpdb --restart on-failure:5 -p 8443:8443 -v acpdb-data:/data ab0tcom/acp:server
@@ -75,7 +75,7 @@ clustering — in [docs/DOCKER.md](docs/DOCKER.md).**
 - **Safe concurrency** — TTL leases with fencing tokens; never lose work.
 - **Multi-tenant** — isolated **spaces** on one daemon; per-agent identity + roles.
 - **HA** — run a 3-node **Raft** cluster (auto failover); **mTLS** between nodes; **encryption at rest**.
-- **Storage modes** — file-backed by default, or **server DB mode (ACPDB)**: `coordd-server` embeds a real database for bounded, flat memory and fast restarts at scale. Same protocol, lossless conversion either way, no sidecar — *in server mode, ACP is the database*. → [docs/STORAGE-MODES.md](docs/STORAGE-MODES.md)
+- **Storage modes** — file-backed by default, or **server DB mode (ACPDB)**: `coordd-server` embeds a real database for bounded, flat memory at scale. Same protocol, lossless conversion either way, no sidecar — *in server mode, ACP is the database*. → [docs/STORAGE-MODES.md](docs/STORAGE-MODES.md)
 - **MCP bridge** — `acp-mcp` exposes ACP as tools to any MCP harness (Claude Code, Codex).
 
 ## Capabilities & extensions
