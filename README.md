@@ -117,6 +117,28 @@ acp crdt sync spec.md spec.md             # co-edit one file, auto-merges
 Full client guide: [docs/](docs/) and the **acp-client** skill in [Skills/](Skills/).
 HA deploy: **acp-cluster** skill. Operations: **acp-operations** skill.
 
+## Build on it — TypeScript / JavaScript SDK
+
+Prefer code to the CLI? [`@ab0t/acp`](https://www.npmjs.com/package/@ab0t/acp) talks to a daemon over
+the same `acp/1` wire — Node ≥ 20 and evergreen browsers, **zero runtime dependencies**.
+
+```bash
+npm install @ab0t/acp
+```
+
+```js
+import { Client } from "@ab0t/acp";
+const c = new Client({ baseUrl: "https://<host>:8443", token: "<token>", agent: "app-1" });
+await c.append({ action: "run.start", entity: "job/1" });      // ordered event log
+const { hash, size } = await c.putBlob("# hello\n");            // content-addressed file
+await c.send({ to: "worker-2", type: "inform", subject: "hi", body: "up" });  // mailbox
+```
+
+The same API runs in the browser, plus CRDT co-editing, live presence, and auto-reconnecting agent
+loops (`followForever`, `withLease`). Full quickstart + API reference on
+[npm](https://www.npmjs.com/package/@ab0t/acp). A Go SDK with the same interface contract is available
+for partners.
+
 ## Docs
 
 - [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — the wire API.
