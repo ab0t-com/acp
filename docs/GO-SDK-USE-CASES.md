@@ -122,11 +122,12 @@ c.Follow(0, func(e wire.Event) error {
 
 ## Availability
 
-The Go SDK is delivered by ACP/EXT-23 and consumed as a Go module
-(`go get github.com/ab0t-com/acp/pkg/client`), which requires the module source to
-be published in the public repository (a release step). Until then, the **`acp`
-CLI** and **`acp-mcp`** are the client surfaces — see the `acp-client` skill. When
-the SDK release lands, everything on this page applies as written.
+The Go SDK is published and `go get`-able today — a nested module in this public
+repository under `sdk/go/`: `go get github.com/ab0t-com/acp/sdk/go/pkg/client`. It is
+engine-clean client code over the frozen `acp/1` wire (it needs a running `coordd`;
+the daemon and storage engine are a separate product, not in this module). The **`acp`
+CLI** and **`acp-mcp`** remain the other client surfaces. Everything on this page
+applies as written.
 
 ---
 

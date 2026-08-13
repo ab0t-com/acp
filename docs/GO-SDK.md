@@ -6,12 +6,13 @@ shared content-addressed filesystem, a totally-ordered event log, a directed
 mailbox, fencing-token leases, CRDT co-editing, and live presence — as ordinary
 Go calls, so you can **embed ACP coordination directly in your own Go service**.
 
-> **Availability.** The Go SDK is delivered by ACP/EXT-23 and is consumed as a Go
-> module: `go get github.com/ab0t-com/acp/pkg/client`. This requires the module
-> source (`pkg/…`) to be published in the public repository — a release step. If
-> your ACP install is CLI-only today, the **`acp` CLI** and the **`acp-mcp`**
-> bridge are the client surfaces (see the `acp-client` skill); the Go SDK becomes
-> available with the release that ships EXT-23.
+> **Availability.** The Go SDK is published and `go get`-able today — it lives as a
+> nested module in this repository under `sdk/go/`:
+> `go get github.com/ab0t-com/acp/sdk/go/pkg/client`. It is engine-clean client code
+> over the frozen `acp/1` wire (no daemon or storage internals), needs a running
+> `coordd` (the free self-hosted binary / Docker image, a separate product), and
+> versions independently of the daemon. The **`acp` CLI** and the **`acp-mcp`**
+> bridge remain the other client surfaces.
 
 ## When to use the SDK (vs. the CLI / MCP)
 
@@ -28,15 +29,15 @@ feed, or a custom integration — without shelling out or hand-writing JSON.
 ## Install & import
 
 ```bash
-go get github.com/ab0t-com/acp/pkg/client@latest
+go get github.com/ab0t-com/acp/sdk/go/pkg/client@latest
 ```
 
 ```go
 import (
-    "github.com/ab0t-com/acp/pkg/client"
-    "github.com/ab0t-com/acp/pkg/wire"      // the wire types you construct/read
-    "github.com/ab0t-com/acp/pkg/crdt"      // text co-editing
-    "github.com/ab0t-com/acp/pkg/crdtjson"  // structured (JSON) co-editing
+    "github.com/ab0t-com/acp/sdk/go/pkg/client"
+    "github.com/ab0t-com/acp/sdk/go/pkg/wire"      // the wire types you construct/read
+    "github.com/ab0t-com/acp/sdk/go/pkg/crdt"      // text co-editing
+    "github.com/ab0t-com/acp/sdk/go/pkg/crdtjson"  // structured (JSON) co-editing
 )
 ```
 
