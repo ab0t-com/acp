@@ -1,0 +1,1209 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-33                                     ab0t.com
+Updates: ACP/1                                                 September 2026
+Supersedes: ACP/EXT-30 (folded)                                   ISSN: n/a
+Category: Extension Proposal
+
+
+      ACP Extension Proposal 33: Manifest History, Retention and
+                              the GC Pin
+     -- Every Version Retained for a Window, Deleted Bytes Kept
+        Reachable, and Restore Expressed as a Forward Commit
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies MANIFEST HISTORY: the
+   authority retains a VERSION RECORD for every manifest version it
+   produces, subject to a per-space RETENTION POLICY (a time window, a
+   minimum depth, an optional byte cap); it WIDENS blob garbage-
+   collection reachability so that every blob referenced by any
+   retained record stays on disk (the GC PIN); it adds READ endpoints
+   for past versions and per-path timelines; and it defines RESTORE as
+   an ordinary forward commit -- a restore is itself a version in the
+   history, so it is reversible and never rewrites state in place.
+
+   It ABSORBS EXT-30 (Space Checkpoints): a checkpoint is a named pin
+   on a retained version record, exempt from retention eviction until
+   deleted.  One extension, one capability string: "history".
+
+   The motivation is the shared filesystem's single promise -- your
+   data is safe.  Today the authority keeps exactly one manifest
+   version and GC keeps only the blobs that version references; any
+   mass deletion, whether a mistake, a buggy client, or a wrong flag,
+   is one garbage-collection sweep from permanent.  With this memo the
+   bytes are still there for the retention window and "undo" is one
+   commit.
+
+   Nothing changes the wire version "acp/1": the additions are new
+   endpoints, one OPTIONAL commit field, additive response fields on a
+   versioned read, and four per-space quota fields, all negotiated by
+   capability.  GET /v1/manifest without a version and POST /v1/commit
+   without the new field are byte-for-byte unchanged.
+
+Status of This Memo
+
+   ACCEPTED and IMPLEMENTED.  The protocol owner RATIFIED this memo and
+   its seven open questions on 2026-09-11 ("build it") and the reference
+   implementation ships it under the capability string "history"
+   (the conformance test suite is green in BOTH storage modes).  The
+   extension number
+   EXT-33 is now assigned.  Its Section 4.5 amendment to ACP/1 Section 15
+   (id acp1-15-gc-retained-history) is RATIFIED and written into
+   rfc/acp-1.txt (with the additive Section 16 reference lines,
+   id acp1-16-history-endpoints).  It builds on ACP/1 Section 11 (blobs +
+   manifest CAS), Section 15 (administration, GC) and Section 17
+   (determinism).  It SUPERSEDES the PROPOSED EXT-30 (Space Checkpoints),
+   whose API it carries forward (Section 4.6) and whose open questions it
+   resolves (Section 12).  The base protocol version string remains
+   "acp/1".  Distribution is unlimited.
+
+   The seven ratify decisions are folded in;
+   the one that CHANGES the drafted design is #2 — history_min_versions is
+   a hard FLOOR the byte cap never evicts below (Section 4.3.2 below is the
+   as-built rule, superseding the memo's original "hard cap wins" and the
+   Section 13 open question).
+
+   Published 2026-09-11 (draft); ACCEPTED/IMPLEMENTED 2026-09-11.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Motivation -- one manifest, one GC, no way back
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Design
+       4.1.  Capability
+       4.2.  Version records (the history)
+       4.3.  Retention policy
+       4.4.  Pruning (history.prune)
+       4.5.  The GC pin -- amendment to ACP/1 Section 15
+       4.6.  Checkpoints (EXT-30 absorbed)
+       4.7.  Reading history
+       4.8.  Restore as a forward commit
+       4.9.  Audit events
+       4.10. Statistics
+   5.  Interaction with Other Extensions
+   6.  Interaction with Compaction
+   7.  Section 17 Determinism and High Availability
+   8.  Capability Negotiation, Rollout and Migration
+   9.  Wire API Additions
+   10. Security Considerations
+   11. Test Specification (the merge bar for an implementation)
+   12. EXT-30 Fold Note (dated)
+   13. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Appendix D.  Client Verb Contract (informative)
+   Authors' Addresses
+
+
+1.  Motivation -- one manifest, one GC, no way back
+
+   1.1.  What the base protocol keeps.
+
+      ACP/1 Section 11 defines a space's filesystem state as exactly
+      (manifest version + referenced blobs).  The manifest advances
+      monotonically under compare-and-swap; blobs are immutable and
+      content-addressed.  Section 15 lets an admin reclaim blobs "not
+      referenced by the manifest" -- the CURRENT manifest.  Nothing in
+      ACP/1 requires that an earlier manifest version remain readable,
+      and nothing keeps a blob alive once the current manifest stops
+      referencing it.
+
+   1.2.  Why that is a data-loss hazard, not a storage detail.
+
+      A single commit may delete or overwrite any number of paths; a
+      client that mis-derives deletions from a stale or partial view, a
+      wrong flag, an agent that "reorganizes" the tree, or a future
+      regression in any client can all land such a commit.  The base
+      protocol's guards (CAS, leases, path validation) are about
+      CONCURRENCY and SAFETY OF PATHS, not about INTENT; a well-formed
+      wipe is accepted.  After it lands, the only record of what was
+      there is the audit event stream (whose retention is bounded and
+      which is not atomic with the manifest) and the blobs themselves --
+      until the next GC sweep reclaims them.  The loss is then permanent.
+
+      The independent data-loss review of the reference implementation
+      found this to be the single root cause that turns every other
+      mass-deletion path into a permanent one.  Client-side guards
+      reduce how OFTEN a wipe happens; only history bounds what it
+      COSTS.
+
+   1.3.  The fix: retain, pin, expose, and make undo a commit.
+
+      o  RETAIN: keep a version record for every manifest version,
+         for a window (30 days by default) and at least a minimum depth
+         (100 versions by default), bounded by an optional byte cap.
+      o  PIN: widen GC reachability so that any blob a retained record
+         references is kept.  Deleted bytes become "trash, not erased".
+      o  EXPOSE: read any retained version; list the history of the
+         space and of a path.
+      o  UNDO IS A COMMIT: restoring to version N is a normal forward
+         commit that re-points paths to N's entries; blobs are present
+         by the pin, so nothing is uploaded, and the restore is itself
+         a version -- reversible, auditable, guarded by every existing
+         rule (CAS, leases, scopes, bulk confirmation).
+
+      Because blobs are already immutable and content-addressed, history
+      costs one small record per commit and ZERO byte copies.  This is
+      the cheapest possible undo, and it is the same mechanism EXT-30
+      proposed for checkpoints -- which is why EXT-30 is absorbed rather
+      than built alongside.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the definitions of ACP/1 (manifest, manifest
+   version, entry, blob, content hash, commit, CAS, space, GC, roles,
+   replicated command) without restating them.
+
+   VERSION RECORD:  The immutable record of one manifest version:
+      its entries map plus commit metadata (Section 4.2).  The current
+      manifest is the newest version record.
+
+   RETAINED:  A version record the space's retention policy has not
+      evicted.  The current record is always retained.
+
+   RETENTION POLICY:  The per-space rule that decides which version
+      records are retained (Section 4.3).
+
+   PRUNE:  The replicated, leader-driven operation that evicts version
+      records the policy no longer retains (Section 4.4).
+
+   GC PIN:  The rule that blob reachability for garbage collection
+      includes every retained version record (Section 4.5).
+
+   CHECKPOINT:  A named pin on a retained version record that exempts
+      it from retention eviction until the checkpoint is deleted
+      (Section 4.6).  Carried forward from EXT-30.
+
+   AUTO-CHECKPOINT:  A checkpoint whose name begins with "auto/",
+      created by the authority itself (never by a client), which is a
+      SOFT pin: it guarantees retention for at least the time window
+      and then ages out (Section 4.6.4).
+
+   RESTORE:  A forward commit whose changes set paths to their entries
+      at an earlier retained version (Section 4.8).  Never an in-place
+      rewrite.
+
+   FOOTPRINT:  The accounted byte cost of the retained history
+      (Section 4.3.3), computed from replicated state only.
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Recoverability first.  Every other data-loss guard reduces the
+      FREQUENCY of a mistake; this one bounds its COST.  It therefore
+      also covers the mistakes not yet found: once the last window of
+      versions is retained and pinned, no commit -- buggy client, bad
+      flag, hostile agent, a future regression -- can make data
+      unrecoverable inside the window.
+
+   3.2.  Zero byte copies.  The content-addressed store already holds
+      every historical byte until GC; history only decides what GC may
+      take.  No trash directory, no second store, no second GC.
+
+   3.3.  The core exposes reads; restore is a client pattern over the
+      existing commit.  A second write path would have to mirror every
+      commit guard forever.  (EXT-30 Section 6 asked this; the answer
+      is the commit.)
+
+   3.4.  Never rewrite in place.  A restore is a NEW version.  Nothing
+      in this memo mutates a retained record or moves the manifest
+      backwards.
+
+   3.5.  On by default, tunable per space.  The safety backbone is not a
+      build-time or daemon-wide option.  A space MAY tune the window,
+      depth and cap, including to zero.
+
+   3.6.  Deterministic and replicated (ACP/1 Section 17).  Records,
+      pins, policy and eviction are a pure function of the replicated
+      command stream.  No node-local clock, no on-disk size, no timer
+      inside an apply.
+
+   3.7.  The hot path stays byte-identical.  GET /v1/manifest without a
+      version, and POST /v1/commit without the new field, MUST behave
+      and serialize exactly as today.  History adds one record write to
+      the commit's existing atomic apply and nothing to any read.
+
+   3.8.  Non-goals.  This memo does NOT: specify CRDT document (op-log)
+      retention (Section 6.2, forward pointer); specify automatic GC
+      scheduling (Section 13); replace the authority-level backup/
+      snapshot-restore administrative operation; or define history for
+      a realtime-mode region (EXT-28), which has no linear manifest
+      version.
+
+
+4.  Design
+
+   4.1.  Capability.
+
+      The capability string "history", advertised on GET /v1/healthz
+      and /v1/stats (per the EXT-1 Section 7 convention), asserts ALL
+      of Sections 4.2 through 4.10 and the Section 4.5 GC rule.  An
+      authority MUST NOT advertise "history" unless every one of those
+      is enforced.  Absent the capability the new endpoints are unknown
+      (404), the commit field is ignored per ACP/1 Section 18, and GC
+      behaves exactly as ACP/1 Section 15 today.  The EXT-30 string
+      "checkpoints" is RETIRED and MUST NOT be advertised; "history"
+      covers the checkpoint surface.
+
+   4.2.  Version records (the history).
+
+      4.2.1.  What is recorded.  For every manifest version V the
+         authority produces, it MUST hold a version record:
+
+            VersionRecord = {
+              "version":    <uint64>,           ; V
+              "entries":    { <path>: ManifestEntry },  ; ACP/1 App. A
+              "at":         <rfc3339>,          ; leader-stamped commit time
+              "actor":      <string>,           ; the committing identity
+              "note":       <string>?,          ; CommitRequest.note
+              "restore_of": <uint64>? }         ; Section 4.8
+
+         "entries" is exactly the map GET /v1/manifest returned for V.
+         Version 0 is the empty record.  The current manifest is the
+         record with the highest version.
+
+      4.2.2.  Atomicity.  The record for V+1 MUST be produced in the
+         SAME atomic apply that advances the manifest from V to V+1.  A
+         crash MUST NOT leave a manifest at V+1 without its record, or a
+         record without its manifest.  History is exactly as durable as
+         the manifest -- never an event appended afterwards.
+
+      4.2.3.  Immutability.  A version record MUST NOT change after it
+         is produced.  Eviction (Section 4.4) removes a record whole;
+         nothing edits one.
+
+      4.2.4.  Storage encoding is not a wire concern.  An
+         implementation MAY store records as full copies, as deltas
+         against a neighbour, or in any form, provided every retained
+         record is reproducible exactly and the FOOTPRINT (Section
+         4.3.3) is accounted as if each record were its full canonical
+         serialization -- so two implementations agree on the byte cap.
+
+      4.2.5.  Upgrade.  An authority that gains this capability with an
+         existing manifest at version V MUST treat that manifest as the
+         version record for V (with "at" and "actor" absent or
+         unknown).  It is derived from replicated state and is therefore
+         identical on every node.  Versions before V are honestly absent
+         (GET /v1/history reports "oldest": V).
+
+   4.3.  Retention policy.
+
+      4.3.1.  Fields.  Four OPTIONAL per-space fields are added to the
+         EXT-7 Section 5.1 Quota object (replicated via quota.set):
+
+            "history_ttl_sec":      <uint64>?  ; default 2592000 (30 d)
+            "history_min_versions": <uint32>?  ; default 100
+            "max_history_bytes":    <uint64>?  ; default unbounded
+            "max_checkpoints":      <uint32>?  ; default 256
+
+         Unlike EXT-7's "absent is unbounded" rule for its own fields,
+         an ABSENT history_ttl_sec / history_min_versions / max_checkpoints
+         means THIS MEMO'S DEFAULT; an explicit 0 means zero.  An absent
+         max_history_bytes means unbounded (consistent with EXT-7).
+
+      4.3.2.  The retention rule.  Let "now" be the leader-stamped time
+         carried in the prune command (Section 4.4).  A version record
+         R is RETAINED if and only if at least one of:
+
+            (a) R is the current record; or
+            (b) R is pinned by a live checkpoint (Section 4.6); or
+            (c) R is an auto-checkpointed record whose "at" is within
+                history_ttl_sec of now (soft pin, Section 4.6.4); or
+            (d) now - R.at <= history_ttl_sec; or
+            (e) R is among the history_min_versions newest records
+                (counting from the current record, which is rank 1);
+
+         and then, if max_history_bytes is set and the FOOTPRINT still
+         exceeds it, the OLDEST records kept by (d) ALONE (above the
+         history_min_versions floor) are evicted, one at a time, until the
+         footprint fits.  [ AS-BUILT, ratify decision #2, 2026-09-11: the
+         byte cap MAY evict records kept ONLY by (d); it MUST NOT evict
+         records kept by (a), (b), (c) OR (e) — history_min_versions is a
+         hard FLOOR, never crossed by the cap.  This SUPERSEDES the draft's
+         "the cap MAY evict records that (d) or (e) would keep" and the
+         Section 13 "BYTE CAP vs MINIMUM DEPTH" open question. ]  When the
+         floor holds the footprint above max_history_bytes, the authority
+         HONORS the floor and /v1/stats MUST report
+         "history_bytes_over_cap": true (Section 4.10) with a loud warning;
+         recoverability is never sacrificed to the cap.
+
+         history_ttl_sec = 0 together with history_min_versions = 0 is
+         permitted and retains nothing beyond (a)-(c); the endpoints
+         still exist and answer honestly.
+
+      4.3.3.  Footprint.  The accounted cost of history is:
+
+            footprint = SUM over retained NON-current records R of
+                          len(canonical_json(R))
+                      + SUM over blob hashes H that are referenced by at
+                          least one retained non-current record and NOT
+                          by the current manifest, of size(H)
+
+         where canonical_json is the record serialized with object keys
+         sorted and no insignificant whitespace, and size(H) is the
+         "size" field of any entry referencing H.  Both terms are pure
+         functions of replicated state.  On-disk sizes MUST NOT be used
+         (ACP/1 Section 17, amendment acp1-17-node-local-state).
+
+      4.3.4.  Quota interaction.  Blobs retained only by history are
+         stored bytes and MUST count toward EXT-7 max_blob_bytes.  A
+         space whose deleted-but-retained bytes fill its blob quota sees
+         507 on new uploads; the cause is visible in /v1/stats
+         ("history.blob_bytes") and the remedies are to lower the window,
+         prune, GC, or raise the quota.  This is deliberate: hiding real
+         disk use would be dishonest accounting.
+
+   4.4.  Pruning (history.prune).
+
+      4.4.1.  A replicated command.  Eviction is performed ONLY by the
+         replicated command history.prune { "now": <rfc3339> }, proposed
+         by the leader.  Every node's apply MUST recompute the eviction
+         set from (now, the space's policy, the retained records, the
+         live checkpoints) -- never from its own clock, never from
+         node-local state.  The command carries no eviction list; the
+         list is derived identically on every node.
+
+      4.4.2.  Cadence.  The leader SHOULD propose history.prune on a
+         bounded interval (RECOMMENDED at most one hour) and MAY skip
+         proposing when its own pre-computation finds nothing to evict;
+         that pre-computation is an optimisation, and the apply's
+         recomputation is the truth.  POST /v1/admin/history/prune
+         (admin) proposes the same command immediately and returns
+         { "evicted": <n>, "oldest_version": <uint64> }.
+
+      4.4.3.  Effect.  Evicted records are removed whole.  Their blobs
+         become GC-eligible only insofar as no OTHER retained record and
+         not the current manifest references them (Section 4.5), and
+         only on a later GC sweep -- prune never deletes bytes.  The
+         authority SHOULD append one event history.pruned with
+         "after": { "oldest_version", "evicted" }.
+
+      4.4.4.  Reads racing a prune.  A read of version N that has just
+         been evicted returns 404 version_pruned.  A restore commit whose
+         restore_of was evicted between the read and the commit fails
+         404 version_pruned with NO state change (Section 4.8.3); a
+         commit that re-references a hash GC has since reclaimed fails
+         400 exactly as ACP/1 Section 11.3 already specifies.  Neither
+         race can lose data; both are retried by re-reading.
+
+   4.5.  The GC pin -- amendment to ACP/1 Section 15.
+
+      Blob reachability for POST /v1/admin/gc is WIDENED.  The following
+      block is the proposed text for ACP/1 Section 15; it is carried
+      here as the memo's normative statement and is to be placed in the
+      base specification on ratification, markers retained.
+
+====== BEGIN UNSIGNED AMENDMENT · id=acp1-15-gc-retained-history · proposed 2026-09-11 · NOT normative until ratified ======
+   [ AMENDMENT -- PROPOSED 2026-09-11 (engineering, EXT-33 Manifest
+     History, Retention and GC-Pin).  Extends Section 15's garbage-
+     collection reachability; it tightens (GC keeps MORE), it relaxes
+     nothing.  NOT normative until the protocol owner ratifies. ]
+
+   15.1.  Garbage-Collection Reachability with Retained History
+
+   An authority that retains historical manifest versions (EXT-33)
+   MUST compute blob reachability for POST /v1/admin/gc as the union of
+   the blob hashes referenced by:
+
+      (a) the current manifest, AND
+      (b) every RETAINED historical version record (those the space's
+          retention policy has not evicted), AND
+      (c) every version record pinned by a live checkpoint.
+
+   A blob reachable under (a), (b) or (c) MUST NOT be reclaimed.  The
+   grace window (grace_sec) continues to apply to unreachable blobs
+   exactly as before.  The reachability set MUST be derived solely from
+   replicated state (Section 17); the eviction of a historical record
+   (which can make a blob unreachable) MUST itself be a replicated,
+   leader-driven command and MUST NOT be performed inside the GC sweep.
+
+   Event-log compaction (Section 8.5) MUST NOT remove historical version
+   records; they are derived state that is independently durable, in the
+   same sense as the manifest and leases.
+
+   An authority that does not implement EXT-33 has no retained records
+   and no checkpoints; for it, (b) and (c) are empty and this rule
+   reduces to the existing text of Section 15.
+====== END UNSIGNED AMENDMENT · id=acp1-15-gc-retained-history ======
+
+      4.5.1.  Unlink safety.  The reachability DECISION is deterministic
+         and replicated (it is the same sweep ACP/1 Section 17 already
+         requires to be leader-driven).  The physical unlink is a node-
+         local storage action; an authority MUST NOT unlink a blob that
+         is reachable at the moment of unlink -- on a single node this
+         means the per-blob decision is taken against the current
+         reachability set under the store's write exclusion, so that a
+         concurrent commit or checkpoint re-referencing an old blob can
+         never be left dangling.  Reference counting is by CONTENT HASH:
+         a blob shared by several records is reachable while any one of
+         them is retained.
+
+      4.5.2.  Monotone in the safe direction.  The pin can only KEEP
+         blobs.  Every blob reclaimable under the base rule and this
+         memo was unreachable from the current manifest AND from every
+         retained record AND from every checkpoint.
+
+   4.6.  Checkpoints (EXT-30 absorbed).
+
+      A checkpoint is a named pin on a retained version record.  The
+      EXT-30 endpoints are carried forward verbatim in shape; the role
+      for creation changes (Section 4.6.5) and the pin set is derived
+      rather than stored (EXT-30's PIN-SET STORAGE question).
+
+      4.6.1.  Create.
+
+         POST /v1/checkpoint  (writer role)
+            { "name": <string>, "version": <uint64>?, "note": <string>? }
+            -> Checkpoint | 400 | 404 | 409 | 507
+
+         Pins "version" (default: the current version).  "version" MUST
+         be retained (else 404 version_pruned / version_unknown).  Names
+         are unique within a space (duplicate -> 409 checkpoint_exists),
+         non-empty, at most 256 bytes, and MUST NOT begin with "auto/"
+         (reserved, Section 4.6.4; -> 400).  Creating a checkpoint at the
+         current version always succeeds (subject to the cap).  The
+         count of live checkpoints in the space MUST NOT exceed
+         max_checkpoints (-> 507 checkpoint_quota; a stored-state cap in
+         the EXT-7 Section 5.2 sense).  The "created" timestamp is
+         leader-stamped.  A checkpoint is IMMUTABLE.
+
+      4.6.2.  List / read.
+
+         GET /v1/checkpoint            (reader) -> [ Checkpoint, ... ]
+         GET /v1/checkpoint?name=<n>   (reader) -> Checkpoint | 404
+
+            Checkpoint = { "name", "version", "created", "actor",
+                           "note"?, "entries": <uint32> }
+
+         "entries" is the number of entries in the pinned record (for a
+         read-scoped token, the FILTERED count -- Section 5.1).  A
+         checkpoint's CONTENT is read through the ordinary surfaces at
+         its version: GET /v1/manifest?version=<v> and GET /v1/blobs/<h>.
+
+      4.6.3.  Delete (unpin).
+
+         DELETE /v1/checkpoint?name=<n>  (admin role) -> {ok} | 404
+
+         Removes the pin.  The record then falls under the ordinary
+         retention rule (Section 4.3.2) -- it is NOT evicted on the
+         spot, and its blobs are reclaimable only after a later prune
+         and GC find them unreachable.  Deletion is the only way a
+         user-named checkpoint's pin is released.
+
+      4.6.4.  Auto-checkpoints.  Names beginning with "auto/" are
+         RESERVED for checkpoints the AUTHORITY creates as part of
+         another operation (for example, the snapshot-before-bulk of a
+         later bulk-change guard).  An auto-checkpoint is a SOFT pin: it
+         retains its record for at least history_ttl_sec from the
+         record's "at", regardless of history_min_versions and
+         max_history_bytes (rule (c) of Section 4.3.2), after which the
+         record is subject to ordinary retention and the checkpoint is
+         removed with it.  A client that wants to keep such a state
+         longer creates a user-named checkpoint on the same version.
+         Auto-checkpoints count toward max_checkpoints; an authority
+         MUST NOT fail the operation that would create one because the
+         cap is reached -- it omits the auto-checkpoint and SHOULD note
+         that in the operation's event.
+
+      4.6.5.  Roles.  Creation requires the WRITER role (EXT-30 said
+         admin); deletion requires ADMIN.  The asymmetry is deliberate:
+         adding a safety net is cheap and bounded (max_checkpoints),
+         removing one is an administrative act, so an agent cannot
+         unpin what protects another agent's work.
+
+      4.6.6.  Events.  checkpoint.created { after: {name, version} } and
+         checkpoint.deleted { before: {name, version} } SHOULD be
+         appended.
+
+   4.7.  Reading history.
+
+      4.7.1.  A past manifest.
+
+         GET /v1/manifest?version=<N>  (reader)
+            -> { "version", "entries", "at"?, "actor"?, "note"?,
+                 "restore_of"?, "checkpoints": [<name>]? }
+            | 404 version_pruned | 404 version_unknown
+
+         The body is the version record (Section 4.2.1) plus the names
+         of checkpoints pinning it.  version_unknown means N exceeds the
+         current version; version_pruned means N existed and has been
+         evicted.  GET /v1/manifest WITHOUT "version" MUST remain byte-
+         identical to ACP/1 Section 11.2 (no new fields).
+
+      4.7.2.  The space's history.
+
+         GET /v1/history?limit=<n>&before=<v>  (reader)
+            -> { "versions":    [ VersionInfo, ... ],   ; newest first
+                 "oldest":      <uint64>,   ; oldest retained version
+                 "next_before": <uint64>?,  ; present when more remain
+                 "policy":      RetentionPolicy }
+
+            VersionInfo = { "version", "at"?, "actor"?, "note"?,
+                            "restore_of"?, "checkpoints": [<name>]?,
+                            "entries": <uint32> }
+
+         limit defaults to 100 and MUST NOT exceed 1000; before selects
+         versions strictly less than v.  Only retained versions are
+         listed.  "entries" is the record's entry count (filtered for a
+         read-scoped token).  RetentionPolicy echoes the four effective
+         fields of Section 4.3.1 (defaults applied).
+
+      4.7.3.  A path's timeline.
+
+         GET /v1/history?path=<p>&limit=<n>&before=<v>  (reader)
+            -> { "path": <p>,
+                 "versions": [ PathVersion, ... ],   ; newest first
+                 "oldest":   <uint64>,
+                 "next_before": <uint64>? }
+
+            PathVersion = { "version", "at"?, "actor"?, "hash"?,
+                            "size"?, "mtime"?, "deleted": <bool>,
+                            "restore_of"? }
+
+         One element per retained version at which the path's entry
+         DIFFERS from the entry in the previous retained record (by
+         hash, size or mtime, or by presence).  It is derived from the
+         retained records, NOT from the event log (whose retention is
+         separate).  The oldest retained record contributes an element
+         if the path is present there (its earlier history is unknown).
+         A path that never existed, or that is outside a read-scoped
+         token's scope, yields the same empty "versions" (Section 5.1).
+
+      4.7.4.  Bytes.  Historical bytes are read with the ordinary
+         GET /v1/blobs/<hash>; the pin (Section 4.5) guarantees presence
+         for every hash in a retained record.
+
+   4.8.  Restore as a forward commit.
+
+      4.8.1.  The pattern (normative for the core, a pattern for the
+         client).  To restore paths to their state at retained version
+         N, a client reads GET /v1/manifest?version=N and the current
+         manifest, and issues ONE ordinary POST /v1/commit whose changes
+         set each chosen path to its entry at N -- { path, hash, size }
+         where N has the path, { path, deleted: true } where N does not
+         -- with base_version = the current version.  No blob is
+         uploaded: every hash in a retained record is present by the
+         pin, and POST /v1/blobs/has reports it present (Section 5.1 for
+         scoped tokens).  The authority processes this commit EXACTLY as
+         any other: CAS (409 on a stale base), leases (423), path
+         validation, read/write scopes, any bulk-change confirmation a
+         later extension requires, audit events, quota.  The result is a
+         NEW version N+k with its own record.  A restore is undone by
+         restoring again.  Nothing is rewritten in place and the
+         manifest version never decreases.
+
+      4.8.2.  Intent binding (OPTIONAL field).  CommitRequest gains
+
+            "restore_of": <uint64>?
+
+         When present, the authority MUST verify IN APPLY that, after
+         the changes are applied, every path named in "changes" is
+         EXACTLY equal (hash, size; or absent) to its entry in the
+         record for restore_of.  On any mismatch the commit MUST fail
+         400 restore_mismatch with NO state change.  If restore_of is
+         not retained the commit MUST fail 404 version_pruned (or
+         version_unknown) with no state change.  The check is per named
+         path, so a partial (path-subset) restore binds only the paths
+         it touches; paths not named are untouched and unchecked.
+         mtime is NOT compared (the authority sets it).  When the commit
+         succeeds the new record carries "restore_of".  An old client
+         that restores by a plain commit without the field is still
+         correct; the field only makes a botched restore fail loudly.
+
+      4.8.3.  Failure is always safe.  A restore that fails for any
+         reason -- 400, 404, 409, 423, a bulk-confirmation demand, 507
+         -- MUST leave the manifest, the records and the checkpoints
+         unchanged.  There is no partial restore.
+
+      4.8.4.  Not the administrative snapshot restore.  An authority's
+         whole-state backup/restore administrative operation (outside
+         ACP/1's wire) is a disaster-recovery tool with its own
+         semantics; content rollback within a space SHOULD use this
+         section, which is reversible and auditable by construction.
+
+   4.9.  Audit events.
+
+      Existing per-change file.edited / file.deleted events are
+      unchanged.  Additionally the authority SHOULD append:
+
+         manifest.restored   after: { version, restore_of }  (with the
+                             per-path events of a restore_of commit)
+         history.pruned      after: { oldest_version, evicted }
+         checkpoint.created  after: { name, version }
+         checkpoint.deleted  before: { name, version }
+
+      The event log remains the AUDIT surface; the version records are
+      the RECOVERY surface.  Per-change events that carry a prior hash
+      remain valid and useful as a breadcrumb; they are not the history
+      and an implementation MUST NOT rely on them to satisfy this memo.
+
+   4.10. Statistics.
+
+      GET /v1/stats gains a per-space block:
+
+         "history": { "versions":          <uint32>,  ; retained records
+                      "oldest_version":    <uint64>,
+                      "oldest_at":         <rfc3339>?,
+                      "record_bytes":      <uint64>,  ; Section 4.3.3
+                      "blob_bytes":        <uint64>,  ; history-only blobs
+                      "live_blob_bytes":   <uint64>,  ; current-manifest blobs (decision #5 split)
+                      "footprint_bytes":   <uint64>,  ; record_bytes + blob_bytes
+                      "checkpoints":       <uint32>,
+                      "history_bytes_over_cap": <bool>, ; the floor holds it above max_history_bytes (decision #2)
+                      "history_disabled":  <bool>,    ; ttl 0 + min 0 (decision #7); LOUD
+                      "policy":            RetentionPolicy }
+
+      All values are derived from replicated state and MAY be served by
+      any node.  [ AS-BUILT 2026-09-11: the draft's "min_versions_unmet"
+      became "history_bytes_over_cap" (decision #2 makes min-versions a
+      floor, so it is never "unmet" — the cap yields instead); the
+      live-vs-history split "live_blob_bytes" (decision #5) and the loud
+      "history_disabled" flag (decision #7) were added. ]
+
+
+5.  Interaction with Other Extensions
+
+   5.1.  EXT-27 (read_prefix).  A historical manifest read, a history
+      listing and a path timeline are path-shaped reads and MUST be
+      filtered exactly as the live manifest is: entries outside the
+      token's read scope are omitted; per-version "entries" counts are
+      the filtered counts; a path timeline for an out-of-scope path is
+      the same empty shape as for a path that never existed; a
+      checkpoint's "entries" is filtered.  The blob reachability rule of
+      EXT-27 Section 5.2 / B.1 (blobs/has) and the B.3 POSSESSION rule
+      for commit-by-hash are WIDENED to "reachable via an in-scope path
+      in the current manifest OR in ANY RETAINED version record" --
+      otherwise a read-scoped token could not restore its own deleted
+      file.  Version numbers are space-global and already visible via
+      the live manifest (EXT-27's named residual); this memo neither
+      widens nor narrows that.  The no-oracle discipline applies to
+      every new surface: out-of-scope existence MUST NOT be revealed by
+      status, count, shape or timing.
+
+   5.2.  EXT-7 (quotas).  The four fields of Section 4.3.1 ride the
+      Quota object and quota.set.  History-only blob bytes count toward
+      max_blob_bytes (Section 4.3.4).  Sub-scope quotas (EXT-7 Section
+      5.5) MAY carry the fields; the retention rule is then evaluated
+      per sub-scope over that sub-scope's records.
+
+   5.3.  A later bulk-change guard (provisional EXT-34).  Such a guard
+      creates auto/pre-bulk-v<N> on the prior version when it accepts a
+      bulk commit (Section 4.6.4 semantics) and applies its confirmation
+      requirement to a bulk RESTORE like any other commit.  This memo
+      does not depend on it.
+
+   5.4.  EXT-3 (capability URLs).  A historical blob is minted like any
+      other; the EXT-27 B.4 mint rule applies with Section 5.1's widened
+      reachability.
+
+   5.5.  EXT-28 (CRDT directory tree) / EXT-31 (filesystem mode).  A
+      realtime-mode region has no linear manifest version; history and
+      checkpoints target the CAS manifest only.  Checkpointing a
+      realtime region remains EXT-30's inherited open question and a
+      further reason realtime is opt-in where audit and rollback matter.
+
+   5.6.  EXT-18 (provenance).  A version record is a natural attestation
+      anchor; a checkpoint is a named, immutable point in the totally
+      ordered history.  No coupling is introduced.
+
+   5.7.  EXT-10 (storage engine).  History is stored through the same
+      storage seam as the manifest; every profile MUST provide the
+      Section 4.2.2 atomicity.
+
+
+6.  Interaction with Compaction
+
+   6.1.  Event-log compaction (ACP/1 Section 8.5).  MUST NOT remove
+      version records or checkpoints (stated in the Section 4.5 block).
+      The event log's own retention is unaffected by this memo.
+
+   6.2.  Collaborative-document op-log compaction (forward pointer, NOT
+      normative here).  Compacting a document's op log (ACP/1 Section
+      12, POST /v1/admin/compact) discards the tombstones that would
+      let a truncated document be recovered.  The retention window this
+      memo defines (history_ttl_sec) is the natural bound for a pre-
+      compaction op-log retention, but the mechanism for documents is
+      sequenced as its own small extension (one feature per extension).
+      Until it lands, document recovery relies on the client-side
+      truncation confirmation and the authority's truncation hold.
+
+
+7.  Section 17 Determinism and High Availability
+
+   7.1.  Replicated commands.  This memo adds or touches:
+
+      commit             shape UNCHANGED (plus the OPTIONAL restore_of
+                         field); the apply additionally produces the
+                         version record and, when restore_of is present,
+                         performs the Section 4.8.2 verification.  No
+                         new command.
+      history.prune      { now }  -- Section 4.4.
+      checkpoint.create  { name, version, actor, at, note }.
+      checkpoint.delete  { name }.
+      quota.set          + the four Section 4.3.1 fields.
+
+   7.2.  Invariants.
+      o  No wall-clock in apply: "now" and every "at" are stamped by
+         the leader into the command (ACP/1 Section 17).
+      o  No node-local state in apply (amendment acp1-17-node-local-
+         state): the footprint uses canonical record length and entry
+         "size" fields, never on-disk sizes; the eviction set never
+         consults a timer, a directory or a metric.
+      o  The eviction set is a pure function of (now, policy, records,
+         pins) and is totally ordered (oldest-first by version), so it
+         is byte-identical on every node.
+      o  Version records, checkpoints and policy are part of the
+         replicated snapshot (ACP/1 Section 14.3); a node bootstrapped
+         or caught up from a snapshot has byte-identical history.
+      o  The leader's "anything to prune?" pre-check is an optimisation;
+         a node that skipped it and applied the command would compute
+         the same result.
+      o  GC's reachability set (Section 4.5) is derived from replicated
+         state; the physical unlink is node-local and guarded (4.5.1).
+      o  Reads (Sections 4.7, 4.10) are pure functions of replicated
+         state and MAY be served by any node under ACP/1 Section 14.2's
+         stale-read rule.
+
+   7.3.  Conformance.  The determinism check ACP/1 Section 17 calls for
+      (apply an identical command stream to independent state machines
+      and compare) MUST include commits, history.prune with skewed node
+      clocks, checkpoint create/delete and a GC sweep, and MUST compare
+      the version records, checkpoints and reachability sets, not only
+      the current manifest (Section 11).
+
+
+8.  Capability Negotiation, Rollout and Migration
+
+   8.1.  Negotiation.  Clients feature-detect "history".  Without it
+      they MUST NOT rely on any version being readable after the
+      manifest advances.
+
+   8.2.  Backward compatibility.  Byte-identical: GET /v1/manifest (no
+      version), POST /v1/commit (no restore_of), GET /v1/stats minus the
+      new block, every existing endpoint.  New endpoints are additive.
+      An old client talking to a new authority sees no change; a new
+      client talking to an old authority sees 404 on the new endpoints
+      and MUST NOT interpret that as "version pruned".
+
+   8.3.  Cluster upgrade order.  Version records are replicated state
+      produced by the commit apply.  A node WITHOUT this capability
+      applying a commit produces no record; its state diverges from a
+      node that does, and it cannot apply history.prune or
+      checkpoint.*.  Therefore an operator MUST upgrade EVERY node of a
+      cluster before the first commit that follows the upgrade, and an
+      authority SHOULD refuse to advertise "history" or to propose
+      history.prune while it knows a member lacks the capability.
+      (Where the authority has no inter-node version exchange, this is
+      an operational rule and MUST be documented as such.)
+
+   8.4.  First prune after upgrade.  Nothing to evict: Section 4.2.5
+      makes the pre-upgrade manifest the only record.  History grows
+      from there; no back-fill is attempted and none is claimed.
+
+   8.5.  Rollout.  Phase 1: records + retention + prune + the GC pin +
+      /v1/manifest?version + /v1/history + stats (the safety backbone).
+      Phase 2: checkpoints (Section 4.6) and restore_of (Section 4.8.2).
+      Both phases ship behind the single capability; an authority MUST
+      NOT advertise "history" until both are enforced (Section 4.1).
+      Interim: until it ships, garbage collection SHOULD remain a manual
+      administrative action.
+
+
+9.  Wire API Additions
+
+   New (all gated by "history"; ACP/1 Section 6 conventions):
+
+      GET    /v1/manifest?version=N      past manifest -> record | 404
+      GET    /v1/history?limit=&before=  retained versions (newest first)
+      GET    /v1/history?path=&limit=&before=  a path's timeline
+      POST   /v1/checkpoint              pin a version   (writer)
+      GET    /v1/checkpoint[?name=]      list / read     (reader)
+      DELETE /v1/checkpoint?name=        unpin           (admin)
+      POST   /v1/admin/history/prune     propose a prune (admin)
+
+   Modified:
+
+      POST /v1/commit                    + OPTIONAL "restore_of"
+                                         -> 400 restore_mismatch |
+                                            404 version_pruned
+      GET  /v1/stats                     + "history" block
+      PUT  /v1/admin/quota               + history_ttl_sec,
+                                           history_min_versions,
+                                           max_history_bytes,
+                                           max_checkpoints
+      GET  /v1/healthz, /v1/stats        + "history" capability
+      POST /v1/admin/gc                  reachability widened (4.5)
+      POST /v1/blobs/has, commit-by-hash (EXT-27 tokens) reachability
+                                         widened to retained records
+
+   Proposed ACP/1 Section 16 reference lines (ride the Section 4.5
+   ratification):
+
+      GET    /manifest?version=      -> Manifest+meta | 404
+      GET    /history?path=&limit=&before= -> History
+      POST   /checkpoint             {name,version,note} -> Checkpoint
+      GET    /checkpoint?name=       -> [Checkpoint] | Checkpoint
+      DELETE /checkpoint?name=       -> {ok}                  (admin)
+      POST   /admin/history/prune    -> {evicted,oldest_version} (admin)
+
+
+10. Security Considerations
+
+   10.1.  Retention is a disclosure window.  Deleted content remains
+      readable to any reader of the space for the retention window.
+      This is the feature; operators handling data that MUST be
+      forgotten on deletion set history_ttl_sec / history_min_versions
+      accordingly (Section 4.3.2 permits zero), run
+      /v1/admin/history/prune and GC, and understand that a checkpoint
+      pins content until an admin deletes it.
+
+   10.2.  Pinning as denial of service.  A writer could pin history to
+      defeat GC; max_checkpoints bounds the count and max_history_bytes
+      bounds the footprint, and deletion is admin-only so a pin cannot
+      be silently removed either.  Both caps are per space.
+
+   10.3.  No oracle.  Section 5.1: every new read is scope-filtered and
+      missing-shaped for out-of-scope resources; the widened
+      reachability for blobs/has and possession applies only to IN-SCOPE
+      paths of retained records.  A read-scoped token learns nothing
+      about out-of-scope history that it could not learn about the
+      out-of-scope present.
+
+   10.4.  Restore is not privilege escalation.  A restore is a commit:
+      a token restores only what it could commit (write scope), only
+      what it could read (Section 5.1), only under the leases it holds
+      or that are free, and under the same confirmation rules as any
+      other commit.
+
+   10.5.  Immutability.  Records and checkpoints are never edited; a
+      restore creates a new version.  An attacker with a writer token
+      can still commit a wipe -- and the wipe is now reversible for the
+      window, which is the point.
+
+   10.6.  The event log is not the recovery surface.  Events carrying a
+      prior hash are a breadcrumb with bounded retention; an
+      implementation MUST satisfy this memo with version records.
+
+
+11. Test Specification (the merge bar for an implementation)
+
+   An implementation MUST NOT advertise "history" until every test
+   below exists as a NAMED test in its suite and passes.  Where a test
+   reproduces a loss, it MUST first be shown to FAIL on the pre-fix
+   code (exploit-first), then pass.  The clause-to-test map is
+   maintained outside the memo.
+
+   11.1.  History and the pin (the F-1 class).
+      T1  TestCommitRetainsVersionRecordAtomically -- every commit
+          leaves a record for the new version; a crash injected between
+          manifest persist and record persist leaves both or neither.
+      T2  TestDeleteThenGCVersionStillReadableWithinTTL -- 200 files,
+          one commit deleting all 200, GC with grace 0: the prior
+          version is readable, every one of its blobs is fetchable, and
+          a restore commit brings back 200 entries with byte-identical
+          content.  (The exact reproduction that lost everything.)
+      T3  TestMassDeleteFullyReversibleViaRestoreCommit -- restore is
+          version N+2 with restore_of = N; restoring to N+1 again yields
+          N+3 whose entries equal N+1's (a restore is reversible).
+      T4  TestGCNeverReclaimsBlobReferencedByRetainedVersion --
+          property/fuzz: random commits (add/overwrite/delete/re-add),
+          prunes and GCs; invariant after every step: every hash in
+          every retained record exists on disk.
+      T5  TestGCReclaimsBlobOnceUnreferencedByAllRetainedRecords --
+          after eviction + GC the bytes ARE freed (retention bounds
+          disk; it does not leak).
+      T6  TestGCUnlinkDecisionAgainstWidenedSetUnderLock -- single-node
+          race: a commit or checkpoint re-references a history-only blob
+          at the instant GC evaluates it; never dangling.
+
+   11.2.  Retention.
+      T7  TestHistoryPruneRespectsTTLAndMinVersions -- matrix over
+          (ttl, min_versions) x (quiet space, busy space): retained set
+          equals the Section 4.3.2 rule exactly, boundary inclusive.
+      T8  TestHistoryPruneMaxBytesOldestFirstAndReportsUnmet -- the cap
+          evicts oldest-first past TTL/min; pinned and auto (within TTL)
+          records survive; stats shows min_versions_unmet.
+      T9  TestHistoryFootprintUsesReplicatedSizesNotDisk -- two nodes
+          with different on-disk layouts compute identical footprints.
+      T10 TestHistoryBoundedUnderChurn -- 10 000 commits under a policy:
+          retained count <= max(min_versions, versions within ttl),
+          footprint <= cap, records/pins byte-identical across nodes.
+      T11 TestZeroPolicyRetainsOnlyCurrentAndPins -- ttl 0, min 0.
+      T12 TestHistoryOnlyBlobsCountTowardBlobQuota -- 507 surfaces and
+          clears after prune + GC.
+
+   11.3.  Checkpoints.
+      T13 TestCheckpointExemptsVersionFromPruneAndGC -- a pinned record
+          survives TTL expiry, min-versions overflow, the byte cap and
+          GC; its blobs are readable.
+      T14 TestAutoCheckpointAgesOutAfterTTL -- auto/ survives min/cap
+          within ttl, is evicted after; a user-named checkpoint on the
+          same version promotes it.
+      T15 TestCheckpointDeleteReleasesPinNotBytes -- delete, then prune
+          + GC reclaim only blobs no other retained record uses.
+      T16 TestCheckpointRolesQuotaAndReservedPrefix -- writer creates,
+          reader 403, writer delete 403, admin deletes; 409 duplicate;
+          507 at max_checkpoints; 400 on "auto/" from a client; 404 on a
+          pruned version.
+
+   11.4.  Restore.
+      T17 TestRestoreIsACommitUnderAllGuards -- CAS 409 on a stale
+          base; 423 under another agent's lease; read/write scope
+          enforced; audit events carry Before.hash; the new record
+          carries restore_of.
+      T18 TestRestoreNeedsNoUpload -- blobs/has reports present for
+          every historical hash; the commit succeeds with zero PUTs.
+      T19 TestRestoreOfMismatchIs400NoStateChange -- a change that does
+          not match the named version fails; manifest/records/pins are
+          byte-identical before and after.
+      T20 TestRestoreOfPrunedVersionIs404NoStateChange -- and a plain
+          commit re-referencing a reclaimed hash is 400, no change.
+      T21 TestPartialRestoreBindsOnlyNamedPaths.
+
+   11.5.  Reads and scoping.
+      T22 TestManifestReadAtVersionIsScopeFiltered -- filtered exactly
+          as the live manifest; byte-parity with an unscoped read of the
+          same in-scope subset.
+      T23 TestHistoryNoOracleForReadScopedToken -- out-of-scope path
+          timeline == never-existed timeline (status, body, timing
+          smoke); per-version counts are filtered; blobs/has and
+          possession widened to retained IN-SCOPE paths only.
+      T24 TestPathTimelineDerivedFromRecordsNotEvents -- compact the
+          event log to nothing; the timeline is unchanged.
+      T25 TestLiveManifestAndCommitByteIdenticalWithoutHistoryFields --
+          GET /v1/manifest and a plain commit serialize exactly as
+          before (the hot path).
+      T26 TestHistoryPaginationAndLimits -- limit default/max, before,
+          next_before, oldest.
+
+   11.6.  Determinism and HA.
+      T27 TestHistoryPruneDeterministicAcrossReplicas -- 3 nodes with
+          local clocks skewed by hours apply the same stream including
+          history.prune; records, pins, reachability sets are byte-
+          identical; the eviction is decided by the command's now.
+      T28 TestSnapshotCarriesHistoryPinsAndPolicy -- a lagging node
+          restored from a snapshot equals the leader byte-for-byte.
+      T29 TestDeterministicApplyIncludesHistoryCommands -- the existing
+          determinism guard extended to history.prune, checkpoint.*,
+          quota.set with the new fields, and GC reachability.
+      T30 TestFailoverPreservesHistory -- leader loss between a commit
+          and its prune; no record lost, no double eviction.
+      T31 TestEventCompactionNeverDropsRecords.
+
+   11.7.  Upgrade.
+      T32 TestUpgradeTreatsExistingManifestAsCurrentRecord -- oldest ==
+          current after upgrade; first commit creates the first prior.
+      T33 TestOldNodeInMixedClusterIsDocumentedHazard -- at minimum a
+          hazard record and an operations note; where a version exchange
+          exists, refusal to advertise/propose.
+
+   11.8.  Client verbs (when built; Appendix D).
+      T34 TestAcpHistoryListsVersionsAndPath.
+      T35 TestAcpRestoreDryRunListsExactChangesAndTouchesNothing.
+      T36 TestAcpUndoRestoresMyLastCommitOnly.
+      T37 TestAcpRestoreForwardsRestoreOfAndSurfaces400Honestly.
+
+
+12. EXT-30 Fold Note (dated)
+
+   ====== BEGIN FOLD NOTE · id=ext30-folded-into-ext33 · ratified 2026-09-18 ======
+   EXT-30 (Space Checkpoints, draft 2026-08-21) is FOLDED into this
+   memo.  Its three endpoints are carried forward in shape (Section
+   4.6); its capability string "checkpoints" is retired in favour of
+   "history"; its GC pin (EXT-30 Section 3.5) is generalised to every
+   retained record (Section 4.5).  Its open questions are resolved as
+   follows: PIN-SET STORAGE -> derived from the pinned record (no
+   stored set); RETENTION INTERACTION -> the pin IS the record's
+   exemption from retention, so the record is retained by definition;
+   QUOTA / LIMIT -> max_checkpoints (default 256) and max_history_bytes;
+   RESTORE SEMANTICS -> a client-side forward commit (Section 4.8), no
+   new write endpoint; REALTIME-MODE CHECKPOINTS -> inherited, still
+   open (Section 5.5).  The role for creation changes from admin to
+   writer (Section 4.6.5) -- flagged for the owner.  The EXT-30 draft
+   text is retained for provenance with a matching dated note.
+   ====== END FOLD NOTE · id=ext30-folded-into-ext33 ======
+
+
+13. Open Questions
+
+   o  CHECKPOINT CREATE ROLE.  Writer (this memo, Section 4.6.5) or
+      admin (EXT-30).  Owner call.
+
+   o  BYTE CAP vs MINIMUM DEPTH.  This memo makes max_history_bytes a
+      HARD cap that can evict below history_min_versions (reported).
+      The alternative -- min-versions as a floor the cap cannot cross --
+      makes the cap soft.  Owner call.
+
+   o  restore_of.  Keep the OPTIONAL intent-binding field (recommended)
+      or strike it and leave restore a pure client pattern.
+
+   o  AUTOMATIC GC.  With the pin in place an automatic sweep that
+      reclaims only bytes outside the retention window becomes safe;
+      its cadence and quiescence rules are not specified here.
+
+   o  DOCUMENT OP-LOG RETENTION (Section 6.2) -- its own small memo.
+
+   o  REALTIME-MODE CHECKPOINTS (EXT-28) -- inherited from EXT-30.
+
+   o  ZERO POLICY.  Whether ttl 0 + min 0 should be permitted per space
+      (this memo: yes, visible in stats) or floored at 1.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   VersionRecord (new; the body of GET /v1/manifest?version=):
+      { "version": <uint64>, "entries": { <path>: ManifestEntry },
+        "at": <rfc3339>?, "actor": <string>?, "note": <string>?,
+        "restore_of": <uint64>?, "checkpoints": [<string>]? }
+
+   VersionInfo (new; element of GET /v1/history):
+      { "version": <uint64>, "at": <rfc3339>?, "actor": <string>?,
+        "note": <string>?, "restore_of": <uint64>?,
+        "checkpoints": [<string>]?, "entries": <uint32> }
+
+   PathVersion (new; element of GET /v1/history?path=):
+      { "version": <uint64>, "at": <rfc3339>?, "actor": <string>?,
+        "hash": <hex64>?, "size": <int64>?, "mtime": <rfc3339>?,
+        "deleted": <bool>, "restore_of": <uint64>? }
+
+   History (new):
+      { "versions": [VersionInfo], "oldest": <uint64>,
+        "next_before": <uint64>?, "policy": RetentionPolicy }
+   PathHistory (new):
+      { "path": <string>, "versions": [PathVersion],
+        "oldest": <uint64>, "next_before": <uint64>? }
+
+   RetentionPolicy (new; effective values, defaults applied):
+      { "history_ttl_sec": <uint64>, "history_min_versions": <uint32>,
+        "max_history_bytes": <uint64>?, "max_checkpoints": <uint32> }
+
+   Checkpoint (from EXT-30, revised):
+      { "name": <string>, "version": <uint64>, "created": <rfc3339>,
+        "actor": <string>, "note": <string>?, "entries": <uint32> }
+
+   CommitRequest (ACP/1 Appendix A, extended):
+      { "base_version": <uint64>, "changes": [Change],
+        "note": <string>?, "restore_of": <uint64>? }
+
+   Quota (EXT-7 Section 5.1, extended):
+      { ..., "history_ttl_sec": <uint64>?,
+        "history_min_versions": <uint32>?,
+        "max_history_bytes": <uint64>?, "max_checkpoints": <uint32>? }
+
+   Stats (extended): "history": { see Section 4.10 }
+
+
+Appendix B.  New Error Conditions
+
+   400  restore_mismatch    a restore_of commit's changes do not equal
+                            the named version's entries (no state change)
+   400  checkpoint_name     empty, too long, or reserved "auto/" prefix
+   404  version_unknown     N exceeds the current version
+   404  version_pruned      N existed and has been evicted
+   404  checkpoint_unknown  no such checkpoint
+   409  checkpoint_exists   duplicate name in the space
+   507  checkpoint_quota    max_checkpoints reached (stored-state cap)
+   All follow ACP/1 Section 6 { "error": <string> } with the code as a
+   stable "code" field where the implementation provides one.
+
+
+Appendix C.  Worked Examples
+
+   C.1.  A wipe, then undo (the motivating case)
+
+      > POST /v1/commit {"base_version":12,"changes":[200 x {deleted}]}
+      < 200 {"version":13,"entries":{}}
+      (an admin runs GC with grace 0 -- nothing referenced by v12 is
+       reclaimed: v12 is retained)
+      > GET /v1/manifest?version=12
+      < 200 {"version":12,"entries":{...200...},"at":"...","actor":"b"}
+      > POST /v1/commit {"base_version":13,"restore_of":12,
+      >   "changes":[200 x {"path":..,"hash":..,"size":..}]}
+      < 200 {"version":14,"entries":{...200...}}      (no blob uploaded)
+      > GET /v1/history?limit=3
+      < 200 {"versions":[{"version":14,"restore_of":12,...},
+      <        {"version":13,...},{"version":12,...}],"oldest":0,...}
+
+   C.2.  A path's timeline
+
+      > GET /v1/history?path=src/main.go
+      < 200 {"path":"src/main.go","versions":[
+      <   {"version":14,"hash":"<h1>","deleted":false,"restore_of":12},
+      <   {"version":13,"deleted":true},
+      <   {"version":9,"hash":"<h1>","deleted":false}],"oldest":0}
+
+   C.3.  Pin a release, later unpin
+
+      > POST /v1/checkpoint {"name":"release-1.4.0","version":14}
+      < 200 {"name":"release-1.4.0","version":14,"created":"...",
+      <      "actor":"a","entries":200}
+      > DELETE /v1/checkpoint?name=release-1.4.0          (admin)
+      < 200 {"ok":true}
+
+   C.4.  A botched restore is refused
+
+      > POST /v1/commit {"base_version":14,"restore_of":9,
+      >   "changes":[{"path":"src/main.go","hash":"<wrong>","size":1}]}
+      < 400 {"error":"restore_mismatch: src/main.go differs from v9"}
+      (manifest still at 14; nothing changed)
+
+   C.5.  Retention tuned per space
+
+      > PUT /v1/admin/quota {"space":"scratch","history_ttl_sec":86400,
+      >   "history_min_versions":10,"max_history_bytes":1073741824}
+      < 200 {...}
+
+
+Appendix D.  Client Verb Contract (informative)
+
+   The reference client surfaces (built after the core; contract only):
+
+      acp history [path] [--limit N] [--before V]
+         Lists GET /v1/history (or the path timeline).
+      acp show --version N <path>       (alias: acp cat --version N)
+         Fetches the entry at N and streams its blob.
+      acp restore --version N [path ...] [--dry-run | --yes]
+         Builds the Section 4.8.1 commit with restore_of = N for the
+         named paths (default: all paths that differ).  --dry-run
+         prints the exact change list and touches nothing.  Bulk
+         restores are subject to the same confirmation as any bulk
+         commit.
+      acp undo [--actor me]
+         Finds the newest retained version V committed by this actor,
+         diffs V against V-1, and restores exactly those paths to
+         their V-1 entries (restore_of = V-1).  Refuses if V-1 is
+         pruned.
+      acp checkpoint create <name> [--version N] [--note ..]
+      acp checkpoint list | delete <name>
+      MCP: acp_history, acp_restore (with the same dry-run default).
+      Mount: readFile(path, {version}), history(path).
+
+   None of these adds a wire operation beyond Section 9.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .  It builds on ACP/1 Sections 11,
+   15 and 17 and folds in EXT-30.

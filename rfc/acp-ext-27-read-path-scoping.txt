@@ -1,0 +1,676 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-27                                     ab0t.com
+Updates: ACP/1                                                    August 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+        ACP Extension Proposal 27: Read-Path Scoping (read_prefix)
+       -- Token-Carried, Self-Contained Read Least-Privilege for
+                    the Path-Shaped Surfaces
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies READ-PATH SCOPING: an
+   OPTIONAL "read_prefix" constraint on a per-agent grant that narrows
+   what a token may READ to resource names beginning with one of a set
+   of byte prefixes, over the three path-shaped read surfaces -- the
+   manifest, blob reads, and collaborative documents.  It is the read
+   counterpart of EXT-7's accepted "path_prefix" (which narrows
+   WRITES): a token write-scoped to projects/42/ can today still read
+   the WHOLE space; read_prefix closes that.
+
+   This feature ORIGINATED as EXT-7 Section 4.8, where it was
+   published as a PROPOSAL "pending the owner's approval."  This memo
+   PROMOTES it to its own extension number for three reasons: (1)
+   EXT-7 is already PARTIALLY ACCEPTED (Sections 4.1-4.7 scoped
+   tokens and Section 5 quotas shipped), so adding a new normative
+   read surface to it muddies that accepted/proposed line; (2) read
+   scoping is a DISTINCT surface with its own capability
+   ("scopedtokens.read", foreshadowed by EXT-7 Section 4.8.6) and its
+   own fail-closed envelope bump; and (3) it must be able to ship
+   INDEPENDENTLY and EARLY -- it is the cheap keystone that unblocks
+   scoped semantic search (EXT-16) and a safe read-scoped browser
+   token (EXT-25) -- and it must NOT be coupled to the larger,
+   authority-backed EXT-24.  On acceptance, this memo SUPERSEDES
+   EXT-7 Section 4.8 (which was never accepted); the accepted status of
+   EXT-7 Sections 4.1-4.7 and 5 is unchanged.
+
+   Honesty up front (normative, carried verbatim from the origin):
+   read_prefix is least-privilege HYGIENE for CONTENT (tree shape,
+   blob bytes, document contents) -- NOT confidentiality and NOT a
+   boundary.  It scopes only the PATH-SHAPED reads; the event log,
+   mailbox, presence roster, lease listings, and /v1/stats remain
+   visible to any token in the space.  The space remains the only hard
+   boundary (ACP/1 Section 7).  read_prefix is TOKEN-CARRIED and
+   SELF-CONTAINED (no external authority), which is exactly what lets
+   it ship now; the general, identity-and-relationship-aware read
+   enforcement is EXT-24's job, and the two compose (Section 7).
+
+   Nothing changes the wire version "acp/1": one OPTIONAL scope field
+   and read-surface filtering, negotiated by capability.
+
+Status of This Memo
+
+   ACCEPTED and IMPLEMENTED (spec ratified by the protocol owner,
+   2026-09-11; implementation ratified 2026-09-18), INCLUDING the
+   `ext27-4.3-v4-envelope-and-oracle-closure` amendment below (v4
+   envelope + the four oracle-surface closures).  The reference
+   implementation ships it under a banking-grade no-oracle build and
+   advertises `scopedtokens.read`.  This supersedes the "DRAFT PROPOSAL"
+   wording below, retained for history.
+
+   This is a DRAFT PROPOSAL, published for review by the protocol
+   team; it is NOT accepted and NOT part of the normative ACP/1
+   specification.  The extension number EXT-27 is PROVISIONAL; the
+   protocol owner assigns final numbers on acceptance.  Nothing in
+   this memo is implemented at the time of writing.  It builds on the
+   ACCEPTED EXT-7 (the scoped-grant machinery, the fail-closed
+   versioned envelope) and, on acceptance, SUPERSEDES the PROPOSED
+   EXT-7 Section 4.8.  It composes with, but does not require, EXT-24
+   (external authorization) and EXT-16 (scoped search).  The base
+   protocol version string remains "acp/1".  Distribution is
+   unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Introduction and Motivation
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  The read_prefix Field and Its Carriage
+   5.  Scoped Read Surfaces
+   6.  The Honest Caveat (reads are broader than writes)
+   7.  Relationship to EXT-7, EXT-24, EXT-22, EXT-16
+   8.  Capability Negotiation and Backward Compatibility
+   9.  Wire API Additions
+   10. Determinism and High Availability
+   11. Security Considerations
+   12. Rollout Plan
+   13. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Authors' Addresses
+
+
+1.  Introduction and Motivation
+
+   1.1.  The gap EXT-7 left open.
+
+      EXT-7 Section 4.2 (accepted, capability "scopedtokens")
+      constrains WRITE resource names by byte prefix: a token can be
+      confined to committing under projects/42/ and acquiring leases
+      under projects/42/.  But that same token can still READ the
+      whole space -- the entire manifest, any blob, any collaborative
+      document, every event.  For a principal that holds its own token
+      yet should see only its slice (a per-project bot, a browser pod,
+      a partner integration), that is an over-broad READ grant.  EXT-7
+      Section 12 recorded read scoping as its first open question and
+      Section 4.8 sketched a resolution; this memo is that resolution,
+      promoted to a first-class extension.
+
+   1.2.  Why it is the cheap keystone.
+
+      Read scoping is small (it reuses path_prefix's byte-prefix
+      convention and EXT-7's fail-closed envelope), self-contained (no
+      external authority, unlike EXT-24), and it unblocks two things
+      that cannot be safe without it: scoped semantic SEARCH (EXT-16 --
+      a search MUST NOT return an out-of-scope hit) and a read-scoped
+      BROWSER token (EXT-25 -- a browser must see only its slice).
+      The storage-landscape gap analysis names exactly this as the
+      right-sized version of "fine-grained access rules" ("Partial --
+      ship read-scoping; a full rules engine is over-scope").
+
+   1.3.  Why its own ext (not another EXT-7 amendment).
+
+      EXT-7 is partially accepted; a new normative read surface added
+      to it would blur which parts a "scopedtokens" daemon actually
+      enforces.  A separate number with its own capability
+      ("scopedtokens.read") makes enforcement HONESTLY DISCOVERABLE (a
+      remote minter can tell "write scopes only" from "read scopes
+      too") -- the exact residual gap EXT-7 Section 4.8.6 flagged.
+
+   1.4.  Prior art.
+
+      Firestore rules scope reads and writes INDEPENDENTLY, keyed on a
+      path -- the shape to borrow (independent read scope), minus the
+      predicate language (over-scope, EXT-24's non-goal too).  S3
+      prefix-scoped read grants and object-store "list only your
+      prefix" are the same idea at the storage layer.  EXT-7's own
+      path_prefix is the in-house precedent this mirrors on the read
+      side.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", ... (BCP 14 [RFC2119]
+   [RFC8174]).  ACP/1 (manifest, blob, document, event), EXT-7
+   (grant, scope, path_prefix, the fail-closed versioned envelope,
+   Section 10.7 name validation) definitions are used without
+   restating them.
+
+   READ_PREFIX:  An OPTIONAL scope field: a list of byte prefixes; a
+      readable resource name MUST begin with at least one to be
+      returned to this token.
+
+   PATH-SHAPED READ SURFACE:  A read whose resource has a path-like
+      name -- the manifest (paths), a blob (reachable via manifest
+      paths), a collaborative document (path-like name).  These are
+      the surfaces read_prefix scopes.
+
+   NON-PATH-SHAPED SURFACE:  The event log, mailbox, presence roster,
+      lease listings, /v1/stats -- NOT scoped by read_prefix (Section
+      6).
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Only narrows; independent of path_prefix.
+
+      read_prefix can only REDUCE what a role permits (EXT-7 Section
+      3.3); it is INDEPENDENT of path_prefix (a token may be
+      write-scoped but read-unscoped, or the reverse), and ANDs with
+      the rest of the scope.  Absent read_prefix means "read
+      everything" -- exactly today's behaviour.
+
+   3.2.  No oracle (normative).
+
+      An out-of-scope read MUST be indistinguishable from a genuinely
+      missing resource: a filtered manifest is a 200 (not a 403); an
+      out-of-scope blob read is a 404 byte-identical to a missing
+      blob; an out-of-scope document read returns the empty-document
+      200 of the CRDT endpoints.  A scoped token learns nothing about
+      the existence or content of out-of-scope resources beyond what
+      it could already reach.
+
+   3.3.  Not confidentiality, not a boundary (normative).
+
+      read_prefix is content HYGIENE, not confinement.  It does NOT
+      hide the event log, mail, roster, or stats (Section 6); the
+      SPACE remains the only hard boundary (ACP/1 Section 7).  A daemon
+      and its documentation MUST NOT present read_prefix as
+      confidentiality.
+
+   3.4.  Self-contained: no external authority.
+
+      read_prefix is carried IN THE GRANT (EXT-7's own agents.json /
+      admin API) and enforced as a pure function of grant + request.
+      It needs NO snapshot, NO IdP, NO relationship engine -- which is
+      what lets it ship early and independently of EXT-24.
+
+   3.5.  Fail-closed carriage.
+
+      A grant containing any read_prefix MUST be written in a BUMPED
+      versioned envelope (version 3, one past EXT-7's write-scope
+      version 2), so a binary that enforces write scopes but predates
+      read scoping REFUSES TO START rather than silently serve
+      unfiltered reads (EXT-7 owner refinement 6, extended).
+
+   3.6.  Non-goals.
+
+      Does NOT scope the EVENT LOG (deferred; a filtered log is closer
+      to EXT-1 channels / EXT-22 watch, and many events are not
+      path-shaped -- Section 6, Section 13).  Does NOT scope mail,
+      presence, stats, or lease lists.  Does NOT add a predicate
+      language.  Does NOT fold document names into path_prefix WRITE
+      enforcement (that stays EXT-7's open question, Section 13).  Does
+      NOT provide identity/relationship-aware read rules (EXT-24).
+
+
+4.  The read_prefix Field and Its Carriage
+
+   4.1.  The field.
+
+      The EXT-7 Scope gains an OPTIONAL:
+
+         "read_prefix": [<string>]?
+
+      Prefix values are validated per EXT-7 Section 10.7 (RECOMMENDED
+      [A-Za-z0-9._:/-]{1,128}) and matched by EXACT BYTE PREFIX, like
+      path_prefix; the operator uses a trailing slash for subtree
+      isolation.  Absent = read everything (today).
+
+   4.2.  Minting (informative).
+
+      coordd -mkagent pod-42w -role writer \
+             -path-prefix projects/42/ -read-prefix projects/42/
+      and the OPTIONAL admin API Scope carries "read_prefix" per
+      Appendix A.  An admin API that ACCEPTS a grant with read_prefix
+      MUST either ENFORCE it or REJECT the grant (400) -- it MUST NOT
+      store and ignore the field (Section 4.3).
+
+   4.3.  Fail-closed envelope (normative).
+
+      An agents.json containing any read_prefix MUST use envelope
+      version 3.  An older binary that understands only version 2
+      (write scopes) MUST error and refuse to start on a version-3
+      envelope, so a scope can never silently degrade to unfiltered
+      reads (Section 3.5).
+
+
+5.  Scoped Read Surfaces
+
+   When read_prefix is present the authority MUST constrain exactly
+   the three path-shaped surfaces:
+
+   5.1.  Manifest -- FILTERED 200.
+
+      GET /v1/manifest returns only entries whose path begins with at
+      least one listed prefix.  The token sees its slice as if it were
+      the whole tree; an unscoped token's response is byte-identical to
+      today's.  This is a FILTERED 200, never a 403.
+
+   5.2.  Blob reads -- 404-shaped for out-of-scope.
+
+      A blob GET is permitted only when the requested hash is
+      referenced by at least one manifest path WITHIN read_prefix;
+      otherwise the authority MUST return 404 with a body
+      indistinguishable from a genuinely missing blob (no existence
+      oracle).  Because content addressing makes one hash reachable
+      from many paths, the rule is "referenced by ANY in-scope path
+      grants the read" -- if an in-scope file and an out-of-scope file
+      share bytes, the token was already entitled to those bytes via
+      its in-scope reference.
+
+   5.3.  Collaborative documents -- empty-doc for out-of-scope.
+
+      A document read (text, ACP/1 Section 12; structured, EXT-5)
+      whose name does not begin with a listed prefix MUST return the
+      SAME response as a NONEXISTENT document (the empty-document 200
+      of the CRDT endpoints -- no oracle); document LISTS are filtered
+      like the manifest.  (Whether document names should ALSO join
+      path_prefix WRITE enforcement stays EXT-7's open question --
+      Section 13.)
+
+   5.4.  Not scoped in v1 (deliberately -- Section 6).
+
+      The event stream, mailbox reads, /v1/stats, the presence roster,
+      and lease listings are NOT constrained by read_prefix.
+
+
+6.  The Honest Caveat (reads are broader than writes) [NORMATIVE]
+
+   Write scoping is airtight because writes funnel through few,
+   name-bearing operations.  Reads do not: a space leaks information
+   through many surfaces, and this cut scopes only the path-shaped
+   ones (Section 5).  A daemon and its documentation MUST NOT present
+   read_prefix as confinement.  Specifically, a read-scoped token can
+   still:
+
+      o  tail the EVENT LOG and see every event, including entities
+         (paths), lease names, and actions outside its prefix -- event
+         filtering is deferred (Section 13; many events are not
+         path-shaped, and a filtered log is closer to EXT-1/EXT-22);
+      o  read /v1/stats aggregate counters (space-wide usage);
+      o  receive MAIL directed at the agent (not path-shaped) and see
+         the presence roster -- who is in the space;
+      o  observe lease names via lease operations and events.
+
+   read_prefix is least-privilege HYGIENE for CONTENT, not
+   confidentiality and not a boundary; the space remains the only hard
+   boundary (ACP/1 Section 7).  This is the same honesty rule EXT-7
+   applies to sub-scopes ("not isolation").
+
+
+7.  Relationship to EXT-7, EXT-24, EXT-22, EXT-16
+
+   o  EXT-7 (path_prefix): the WRITE counterpart; read_prefix is its
+      independent read sibling in the same grant/envelope.  On
+      acceptance this memo supersedes EXT-7 Section 4.8.
+
+   o  EXT-24 (external authorization): the GENERAL,
+      identity/relationship-aware read enforcement.  read_prefix is
+      the SELF-CONTAINED, token-carried subset that ships without an
+      authority; where EXT-24 is configured, its read enforcement
+      (EXT-24 Section 4.4) MUST honor the SAME no-oracle discipline
+      (Section 3.2) and MAY subsume read_prefix (the intersection
+      governs; each only narrows).  A deployment picks read_prefix for
+      the simple case, EXT-24 for the identity/relationship case; they
+      compose.
+
+   o  EXT-22 (scoped watch): watch is REQUESTED narrowing of a stream
+      the token may already read in full -- NOT a security control
+      (EXT-22 Section 10.1).  read_prefix is ENFORCED narrowing of the
+      path-shaped reads.  The event-log read-scoping that neither
+      closes is the recorded open question of both (Section 13); a
+      future grant-pinned watch filter is its intended mechanism.
+
+   o  EXT-16 (scoped search): read_prefix is a PREREQUISITE -- search
+      results MUST be filtered to hashes reachable through the caller's
+      in-scope manifest paths, with the same 404-shaped out-of-scope
+      behaviour (Section 5.2).  EXT-16 cannot ship safely without this.
+
+
+8.  Capability Negotiation and Backward Compatibility
+
+   The capability string "scopedtokens.read", advertised on GET
+   /v1/healthz and /v1/stats (EXT-1 Section 7), asserts Sections 4-6.
+   It is GRANULAR alongside EXT-7's "scopedtokens" (write scopes):
+
+      "scopedtokens"       -- write scoping (EXT-7 Sections 4.1-4.7)
+      "scopedtokens.read"  -- read scoping (this memo)
+
+   A daemon advertising "scopedtokens.read" MUST also advertise
+   "scopedtokens" (read scoping without write scoping is not a
+   meaningful posture).  ABSENT "scopedtokens.read", a daemon does not
+   filter reads: a scoped token there reads the whole space (the
+   FAIL-OPEN direction EXT-7 Section 3.2 documents).  Therefore a
+   principal RELYING on read scoping MUST first confirm
+   "scopedtokens.read"; the fail-closed VERSIONED ENVELOPE (Section
+   4.3) additionally guarantees no SAME-DEPLOYMENT version skew serves
+   unfiltered reads.
+
+   Unscoped tokens are byte-identical before and after; a peer without
+   the extension interoperates unchanged.
+
+
+9.  Wire API Additions
+
+   Modified:
+      per-agent grant  + OPTIONAL "read_prefix" (Section 4.1); carried
+                         in a version-3 fail-closed envelope
+      GET /v1/manifest -> FILTERED 200 for a read-scoped token
+      blob GET         -> 404 (missing-shaped) for out-of-scope
+      CRDT doc read    -> empty-document 200 for out-of-scope; doc
+                         LIST filtered
+      GET /v1/whoami   -> includes "read_prefix" in the returned scope
+      GET /v1/healthz,/v1/stats + "scopedtokens.read" capability
+
+   New endpoints: none.  All follow ACP/1 Section 6 conventions.
+
+
+10. Determinism and High Availability
+
+   Read filtering is a PURE FUNCTION of (the replicated grant, the
+   request, the committed manifest): every replica returns the same
+   filtered result for the same token and committed state.  It adds NO
+   replicated state and NO write path.  Grants are replicated as EXT-7
+   already specifies (admin ops in the Raft log), so a failover does
+   not change what a token may read.  Reads are served under ACP/1's
+   ordinary leader/follower rules (a follower's filtered read is
+   stale-consistent, never wrong).
+
+
+11. Security Considerations
+
+   11.1.  No oracle (normative).
+
+      Section 3.2/5: out-of-scope reads are indistinguishable from
+      missing resources.  A daemon MUST NOT return a distinguishable
+      error, timing, or count that reveals out-of-scope existence.
+
+   11.2.  Not confidentiality.
+
+      Section 6: read_prefix does not hide the log, mail, roster, or
+      stats.  Operators MUST NOT treat it as confinement; confidential
+      separation requires a separate SPACE (ACP/1 Section 7).
+
+   11.3.  Fail-closed on skew, fail-open across daemons.
+
+      The version-3 envelope prevents an older SAME-deployment binary
+      from serving unfiltered reads (Section 4.3); but a daemon that
+      does not advertise "scopedtokens.read" simply does not filter, so
+      a relying party MUST check the capability (Section 8).
+
+   11.4.  Shared-bytes reachability.
+
+      The blob rule (Section 5.2) grants a hash if ANY in-scope path
+      references it; this is correct (the token was entitled to those
+      bytes via its in-scope file) and avoids a content-addressing
+      oracle, but operators should understand that identical bytes in
+      an out-of-scope file are thereby readable -- an argument for a
+      separate SPACE when byte-level secrecy is required.
+
+
+12. Rollout Plan
+
+   Phase 1 -- manifest + document filtering + doc lists (the common
+      case: a token sees its subtree of files/docs).
+   Phase 2 -- blob read scoping with the reachability rule (Section
+      5.2) and its no-oracle 404.
+   Ship behind "scopedtokens.read" and the version-3 envelope.  It is
+   independently valuable and independently negotiated; it unblocks
+   EXT-16 (scoped search) and safe read-scoped EXT-25 browser tokens
+   the day it lands.  Interim: without it, deployments that need read
+   confinement use a separate SPACE, and browser exposure stays behind
+   a broker.
+
+
+13. Open Questions
+
+   o  EVENT-LOG read scoping.  Still open (EXT-7 Section 4.8.4): a
+      token that may READ only a subset of the log.  A filtered log is
+      closer to EXT-1 channels / EXT-22 watch than to a name check,
+      and many events are not path-shaped; the intended path is a
+      GRANT-PINNED watch filter (EXT-22 Section 10.1) -- this memo does
+      not close it and does not claim to.
+
+   o  Document names in WRITE path_prefix.  Whether doc names should
+      also join EXT-7 Section 4.2 write enforcement (they are read-
+      scoped here) -- inherited EXT-7 open question.
+
+   o  Wildcards / hierarchy vs exact byte prefix (shared with EXT-7).
+
+   o  Whether mailbox reads (directed, not path-shaped) ever warrant a
+      recipient-scoping beyond "your own mail" -- likely not; recorded.
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   Scope (EXT-7, extended):
+      { "path_prefix": [<string>]?,   ; EXT-7 (writes)
+        "read_prefix": [<string>]?,   ; THIS memo (reads)
+        "spaces":      [<string>]?,   ; EXT-7 amendment (space select)
+        "sub_scope":   <string>? }
+
+   Grant envelope (version bump):
+      { "version": 3, "agents": { <id>: { role, scope } } }
+      ; version 3 REQUIRED when any grant carries read_prefix
+      ; (version 2 = write scopes only; a v2-only binary refuses v3)
+
+   WhoAmI: { "agent", "role", "scope": { ..., "read_prefix": [...]? } }
+      ; no token echoed
+
+
+Appendix B.  New Error Conditions
+
+   400  a grant with read_prefix submitted to an admin API that will
+        not enforce it (Section 4.2); malformed read_prefix (EXT-7
+        Section 10.7).
+   NOT-403 for out-of-scope reads (the whole point): a blob/doc read
+   outside read_prefix returns the SAME response as a missing
+   resource (404 for blobs; empty-document 200 for CRDT docs); a
+   read-scoped GET /v1/manifest is a FILTERED 200.  No distinguishable
+   error is ever returned for an out-of-scope read (Section 3.2).
+   Startup: a version-3 envelope on a binary that enforces only
+   version 2 -> the daemon REFUSES TO START (Section 4.3).
+
+
+Appendix C.  Worked Examples
+
+   C.1.  A read-scoped project token.
+
+      coordd -mkagent pod-42w -role writer \
+             -path-prefix projects/42/ -read-prefix projects/42/
+
+      GET /v1/manifest
+      -> 200, only projects/42/** entries (filtered; no 403)
+      GET /v1/blobs/<hash referenced only by projects/99/...>
+      -> 404 (byte-identical to a missing blob; no oracle)
+      GET /v1/crdt/json/doc?doc=projects/42/board  -> 200 (the doc)
+      GET /v1/crdt/json/doc?doc=projects/99/board  -> 200 {} (as if
+         nonexistent)
+      GET /v1/events?follow=true
+      -> 200, the FULL space stream -- events are NOT read-scoped
+         (Section 6); the minter MUST NOT mistake read_prefix for
+         confinement.
+
+   C.2.  Capability check before relying.
+
+      GET /v1/healthz
+      -> capabilities include "scopedtokens" but NOT
+         "scopedtokens.read": the minter MUST NOT rely on read_prefix
+         (the daemon serves unfiltered reads); it keeps read
+         least-privilege broker-side or uses a separate space.
+
+   C.3.  Composing with EXT-16 scoped search.
+
+      A read_prefix projects/42/ token issues POST /v1/search: results
+      contain ONLY hashes reachable via projects/42/** manifest paths;
+      an out-of-scope hit is withheld exactly as a 404-shaped blob
+      (Section 5.2) -- search inherits read_prefix's no-oracle rule.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .  It promotes and supersedes the
+   PROPOSED EXT-7 Section 4.8; the accepted EXT-7 Sections 4.1-4.7 and
+   5 are unchanged.
+
+
+====== BEGIN RATIFIED AMENDMENT · id=ext27-4.3-v4-envelope-and-oracle-closure · proposed 2026-09-11 · RATIFIED by the protocol owner 2026-09-11 ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-09-11 (one movement; nothing is released, so the
+     independent review's fixes are folded in the same day -- no second sign).  Now NORMATIVE.  Marker
+     retained for provenance.  Sources: the no-oracle test spec + an
+     independent engineering review + an authorization-model review
+     (ReBAC/Zanzibar lens).
+     read_prefix is a READ-SCOPE (a least-privilege read filter),
+     NOT a hard isolation boundary -- the SPACE remains the only hard boundary (Sections 3.3, 6, 11.2).
+     Every surface that could reveal or launder out-of-scope bytes MUST be closed. ]
+
+   A.  ENVELOPE VERSION 3 -> 4.  The shipped agents.json envelope is ALREADY version 3 (EXT-7's
+       sub_scope/deny).  read_prefix MUST use envelope version 4.  A binary understanding only version < 4
+       MUST refuse to load a v4 file (no silent degrade to unfiltered).  EVERY place the memo says the
+       envelope is "3" is amended to "4": Sections 3, 3.5, 4.3, 9, 11.3, 12, and Appendices A and B.
+
+   B.  ADDITIONAL SCOPED READ / WRITE-ECHO SURFACES (Section 5 is extended).  Beyond the manifest, blob
+       GET, and CRDT document reads, a read_prefix token MUST also be scoped on:
+       B.1  POST /v1/blobs/has -- an existence-by-hash ORACLE.  A hash MUST report "missing" unless it is
+            reachable via an in-scope manifest path; the out-of-scope-referenced response MUST be
+            byte-identical to genuinely-missing.
+       B.2  CRDT OPS-PULL (not just document reads).  Same path scope as document reads; an out-of-scope
+            doc's ops are indistinguishable from empty/absent.
+       B.3  COMMIT-BY-HASH -- a POSSESSION rule.  ("Wholly unreferenced" is itself a content oracle: blob
+            PUT is dedup-silent, so a token could upload guessed bytes G and commit H(G) to learn whether
+            an out-of-scope file holds G.)  A read-scoped token committing under its prefix MAY reference a
+            blob hash ONLY if it is reachable via an in-scope path OR the SAME token uploaded those bytes
+            (possession); else the commit MUST fail with the SAME 400/404 as an unknown hash.  Blob PUT
+            MUST NOT reveal, by status or timing, that identical bytes already existed out of scope.  The
+            reachability/possession check MUST be evaluated DETERMINISTICALLY IN THE FSM APPLY STEP, not at
+            the HTTP boundary: the predicate is state-dependent, so a boundary check races a concurrent
+            commit/delete (TOCTOU) and the delete->GC grace window could otherwise re-classify an
+            out-of-scope hash as "unreferenced" and readable.
+       B.4  EXT-3 CAPABILITY MINT (the /v1/cap blob-URL mint).  A read-scoped token MUST NOT mint a
+            capability URL for a hash it could not itself read (the B.1 rule).
+       B.5  COMMIT / MANIFEST / WRITE-ECHO RESPONSE BODIES.  A commit response (on 200 AND on 409 conflict),
+            any manifest returned to a read-scoped token, and any other body that echoes tree state --
+            lease acquire/renew/list responses (holder names), CRDT-ops {total,epoch} echoes -- MUST be
+            FILTERED to the token's read_prefix; none MUST return the full manifest or out-of-scope
+            names/counts.  (Else a read-scoped writer reads the whole tree via a no-op commit.)  Enforce as
+            a positive allowlist -- filter to what the token CAN read -- not a denylist of known-leaky
+            fields, so a future response field is scoped by default.
+       B.6  WRITE/READ COVERAGE (normative).  Every path_prefix a token can WRITE MUST be covered by a
+            read_prefix.  A write scope wider than the read scope leaks through write-path responses
+            (CRDT-ops totals, 409 conflict manifests, 423 lease-holder identities).  The loader MUST reject
+            a grant whose write scope is not read-covered (refuse-by-default; no silent widening).
+       B.7  SEGMENT-BOUNDARY PREFIX MATCHING (normative).  A prefix MUST match on path-SEGMENT boundaries:
+            read_prefix p matches name n iff n == p (with trailing "/" stripped) OR n starts with p where p
+            ends in "/".  A byte-only prefix is a real bug: "projects/4" would otherwise match
+            "projects/42/secret" and "projects/4x".  The loader MUST reject (not merely warn on) a
+            read_prefix / path_prefix that does not end in "/" (or is not an exact whole-name grant).  Same
+            rule for BOTH read_prefix and path_prefix.
+       B.8  UNIFIED READ-DENY SHAPE ACROSS LAYERS (normative; composition with EXT-24).  When read_prefix
+            composes with an external authorizer (EXT-24) or write-scope (EXT-7), an out-of-scope or denied
+            READ MUST be byte-identical to a missing resource regardless of WHICH layer denied it -- a
+            read denial is NEVER a distinguishable 403.  ("Which layer said no" is itself an oracle.)  This
+            overrides EXT-24 Section 7 step 4's "read_prefix (reads)? -> else 403" for reads: reads deny as
+            the ext-27 missing shape (filtered-200 / 404 / empty-doc), only WRITES deny as 403.  Layers
+            INTERSECT (each only narrows; an EXT-24 allow never widens past read_prefix); when a layer is
+            un-evaluable it fails closed to the missing shape.
+
+   C.  Section 6 (the honest caveat) is amended and STRENGTHENED: read_prefix covers the surfaces above,
+       but the EVENT LOG stays space-visible AND leaks out-of-scope PATHS and BLOB HASHES (file.edited
+       carries After.hash); the mailbox, presence/awareness payloads, /v1/subscopes, and lease listings
+       also stay space-visible.  "slice of the TREE, not the space" -- hard isolation is still a separate
+       space (a grant-enforced event scope is future work, EXT-22/EXT-24).  DOCUMENTED RESIDUALS (named, not
+       hidden behind "no oracle"): (i) the blob-dedup + /v1/stats counter is a low-bandwidth existence side
+       channel; (ii) the GLOBAL manifest `version` is space-global and bumps on every out-of-scope commit,
+       so a scoped token observes out-of-scope WRITE ACTIVITY (rate/existence) even without event access --
+       a per-scope version would break CAS base_version commit semantics, so this is a residual, not a fix.
+       These are acceptable for a SEMI-TRUSTED bot/partner principal (trusted not to weaponize metadata),
+       and NOT acceptable for an untrusted browser/end-user.
+       C.2  UNTRUSTED-BROWSER GATING (normative correction).  read_prefix alone does NOT make a
+            direct-to-browser token "safe": a hostile holder can enumerate the whole space's metadata via
+            /v1/events, /v1/stats, /v1/agents (presence), and directed mail (path names, doc names, lease
+            names, participants, activity -- frequently sensitive).  Any claim in Sections 1.2 / 12 that
+            read_prefix "unblocks a safe browser token the day it lands" is STRUCK/QUALIFIED: an untrusted
+            browser/end-user deployment MUST use a broker or a SEPARATE SPACE until a grant-pinned
+            event/stats/presence filter exists.  That filter (EXT-22 watch-filter / EXT-24 event-scoping) is
+            a TRACKED PREREQUISITE of EXT-25 -- EXT-25 MUST NOT rely on read_prefix alone for
+            confidentiality.
+
+   D.  TEST OBLIGATION.  The banking-grade NO-ORACLE suite (IMPLEMENTATION_PLAN.md Section E.4) MUST cover
+       B.1-B.8 with byte-identical out-of-scope-vs-missing responses (including HEADER parity -- no
+       ETag/Last-Modified/Content-Length divergence -- and the FSM-apply-authoritative commit-by-hash
+       possession check under a concurrent-delete/GC race), FILTERED commit/409/lease/CRDT-echo bodies, the
+       write/read-coverage rejection, segment-boundary prefix matching (projects/4 does NOT match
+       projects/42/secret), the unified missing-shaped read-deny across EXT-24/EXT-7 composition, and
+       reachability-scan timing parity (per-manifest-version memoized reverse index so timing is
+       token-independent).
+====== END RATIFIED AMENDMENT · id=ext27-4.3-v4-envelope-and-oracle-closure ======
+
+====== BEGIN AMENDMENT · id=ext27-b7-released-path-prefix-migration · RATIFIED 2026-09-11 (engineering, under the owner's standing directive; same movement as ext27-4.3 — nothing released, single movement, no double-sign) ======
+   [ AMENDS B.7 ONLY.  Source: the independent review of the core build
+     (findings F3 + F5).
+     B.7's rule for read_prefix is UNCHANGED.  This block adds the migration carve-out for the
+     RELEASED ext-7 field path_prefix, which B.7 also governs, and narrows the exact-node clause. ]
+
+   B.7.1  read_prefix (NEW field, envelope v4, no legacy).  A read_prefix value MUST end in "/".
+          The loader MUST reject (not warn on) a bare value at mint AND at load, naming the fix
+          (`read_prefix "X" must end in "/" to scope a subtree`).  There is no exact-whole-name
+          form for read_prefix; the parenthetical "(or is not an exact whole-name grant)" in B.7
+          does NOT create one.
+
+   B.7.2  path_prefix (RELEASED ext-7 field) — loose-form migration, never silent, never
+          fail-open.  A bare (non-"/"-terminated) path_prefix found in an EXISTING agents.json
+          at LOAD MUST be normalized to its subtree form (append "/") and MUST produce one loud
+          per-grant startup warning naming the one-character fix
+          (`path_prefix "projects/42" is loose-form; treating as "projects/42/" — add the
+          trailing "/" to silence this`).  The daemon MUST NOT refuse to start on such a file
+          (no upgrade downtime) and MUST NOT silently re-interpret the grant as exact-match.
+          A NEW mint (-mkagent / any future grant-creation API) MUST reject a bare path_prefix.
+          Rationale: under ext-7's shipped byte-prefix rule a bare "projects/42" meant, in
+          practice, the "projects/42/" subtree plus the byte-adjacent over-match ("projects/420/…")
+          that B.7 removes; this preserves the historical intent, closes the over-match, and
+          converges the released field to the strict spelling through a visible warning.
+
+   B.7.3  The exact-node clause is READ-only.  B.7's "n == p (with trailing "/" stripped)"
+          clause applies to READ matching only (a read_prefix "projects/42/" may LIST/READ a
+          node named "projects/42").  It MUST NOT apply to WRITE admission: a path_prefix
+          "projects/42/" MUST NOT admit committing (or deleting) a FILE named exactly
+          "projects/42".  Write admission is a true subtree match ("n starts with p").  This
+          keeps the shipped ext-7 403 for the exact node and prevents a scoped writer from
+          creating a file/directory name collision (first-slice review R5).
+
+   B.7.4  B.6 coverage is evaluated on the canonical (subtree) forms.  Both read_prefix and the
+          normalized path_prefix are subtree grants, so a write prefix w is read-covered iff some
+          read prefix r satisfies w == r or w nested under r.
+
+   Test obligation (extends D): bare read_prefix refused at mint + load; loose path_prefix
+   normalized + warned at load and refused at mint; strict files load silently; the exact node
+   readable but not write-admissible; the normalized legacy grant admits its subtree and refuses
+   the byte-adjacent sibling.
+====== END AMENDMENT · id=ext27-b7-released-path-prefix-migration ======

@@ -1,0 +1,1411 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-31                                     ab0t.com
+Updates: ACP/1                                                September 2026
+Category: Extension Proposal                                       ISSN: n/a
+Supersedes: the EXT-31 draft of 2026-08-21
+
+
+        ACP Extension Proposal 31: Filesystem Mode (CAS <-> Realtime)
+     -- The Per-Space Toggle Between the Explicit, Auditable CAS
+        Filesystem and the Conflict-Free Realtime Filesystem, With a
+          LOSSLESS, ATOMIC, AUDITABLE Transition Between Them
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies FILESYSTEM MODE: a
+   per-space (optionally per-path-prefix) SELECTOR between the two
+   filesystem behaviours a space can present -- CAS mode and REALTIME
+   mode -- AND the SEMANTICS OF SWITCHING BETWEEN THEM.  CAS mode (the
+   STRICT DEFAULT) is the ACP/1 Section 11 blob+manifest compare-and-swap
+   filesystem: explicit, lease-guardable, auditable, with a linear,
+   totally-ordered version history (EXT-33) and a commit-time bulk wall
+   (EXT-34).  REALTIME mode is the EXT-28 CRDT directory tree plus CRDT
+   files, surfaced through the virtual-FS facade, so an agent writes
+   ordinary files that CONVERGE live -- no push/pull, no 409, no version
+   conflict thinking.
+
+   This memo SUPERSEDES the EXT-31 draft of 2026-08-21.  The earlier
+   draft specified the mode SELECTOR and correctly made CAS the default,
+   but it left the TRANSITION -- what happens to the data in a space when
+   its mode changes -- as an Open Question ("both are one-way snapshots;
+   the exact operation is deferred").  For a system whose one promise is
+   that your data is safe, a mode flip that is under-specified is exactly
+   where data is silently lost, duplicated, or made unauditable.  This
+   revision CLOSES it (Sections 4.6-4.8): the flip is a SINGLE,
+   LEADER-STAMPED, TOTALLY-ORDERED, ATOMIC replicated command; cas ->
+   realtime SEEDS the CRDT tree deterministically from the current
+   manifest; realtime -> cas SNAPSHOTS the converged live tree into a new
+   manifest version as ONE forward commit (the EXT-33 restore-as-a-commit
+   pattern, whole-region); the pre-flip state on EITHER side is RETAINED,
+   GC-pinned, and recoverable across the flip by exactly the EXT-33
+   machinery; and the flip is itself an AUDITABLE EVENT.  The round trip
+   is LOSSLESS and the whole operation is deterministic (Section 4.11).
+   That closure is the reason this memo supersedes the draft rather than
+   merely extending it.
+
+   HONESTY UP FRONT (normative).  Realtime mode trades the linear,
+   totally-ordered version history (EXT-33), whole-tree version pinning,
+   the EXT-18 total-order attestation line, and the commit-time EXT-34
+   bulk WALL for convergence.  Some customers NEED those; therefore CAS
+   is the STRICT DEFAULT -- a new space is CAS, and no space ever leaves
+   CAS except by an explicit, confirmed, admin-authorized flip (Section
+   4.3).  A space is NEVER silently switched.  This memo weakens nothing
+   in CAS; it offers the alternative and defines a safe road between the
+   two.
+
+   The feature is negotiated by the capability string "fsmode".  Nothing
+   changes the wire version "acp/1": the mode is additive replicated
+   space configuration and the flip is an additive admin command, both
+   gated by capability; a peer without it, and any space left in the
+   default CAS mode, interoperates unchanged.
+
+Status of This Memo
+
+   This is an EXTENSION PROPOSAL published for review (Request For
+   Comment).  It SUPERSEDES the EXT-31 draft of 2026-08-21 (same
+   provisional number).  It is CUSTOMER-SOURCED (customer questions on
+   "isn't this a worse git?", "a real-time filesystem as an option?",
+   and the just-works UX).  The reference implementation SHIPS this
+   extension and advertises the capability string "fsmode"; the mode is
+   opt-in (CAS is the default, never a silent switch).  The extension
+   number EXT-31 is PROVISIONAL and its ACP/1 dependency (below) is NOT
+   yet finally ratified — normative only when the protocol owner
+   ratifies; the memo is published now for review.
+
+   It COMPOSES the ACCEPTED+IMPLEMENTED EXT-33 (manifest history,
+   retention, GC-pin, checkpoints, restore-as-a-forward-commit -- whose
+   version records, auto-checkpoints and restore pattern the transition
+   REUSES) and the CRDT file path (ACP/1 Section 12 text CRDT + EXT-5
+   structured CRDT, SHIPPED).  It SELECTS the realtime structure of
+   EXT-28 (CRDT directory tree, DRAFT REFRESHED 2026-09-12) and
+   DISCHARGES EXT-28's deferred "mode MIGRATION between CAS and realtime"
+   (EXT-28 Section 8.4).  It composes with EXT-27 (read scope), EXT-7
+   (quota fields), EXT-34 (bulk-change guard), ACP/1 Section 10 (leases),
+   and a virtual-FS facade.  It edits no acp-1.txt text itself, but --
+   CORRECTED per the 2026-09-12 design review -- it DEPENDS ON the REVISED
+   EXT-28 amendment acp1-15-gc-realtime-tree (now presence-based and
+   mode-independent) so a flipped region's retained trash stays pinned;
+   the earlier "NO amendment needed (union of two existing rules)" claim
+   was falsified and is corrected (Section 4.8.4; owner re-confirms).  The
+   base protocol version string remains "acp/1".  Distribution is
+   unlimited.
+
+   Published 2026-09-12 (draft, superseding 2026-08-21).
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Motivation -- "your choice, per space" and the road between
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Design
+       4.1.  Capability, and the mode as replicated state
+       4.2.  The two modes; the strict CAS default
+       4.3.  Setting the mode (admin + confirm; never silent)
+       4.4.  Per-path-prefix mode (optional)
+       4.5.  How reads and writes dispatch by mode
+       4.6.  Transition cas -> realtime (seed the tree)
+       4.7.  Transition realtime -> cas (snapshot the tree)
+       4.8.  Atomicity, and how EXT-33 history spans the flip
+       4.9.  Data model and data-model delta
+       4.10. Wire API additions
+       4.11. Section 17 determinism (mode replicated; flip totally ordered)
+   5.  Interaction with Other Extensions
+   6.  The space stays the only hard boundary
+   7.  Value
+   8.  Capability Negotiation, Rollout and Migration
+   9.  Wire API Summary
+   10. Security Considerations
+   11. Test Specification (the merge bar for an implementation)
+   12. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  Worked Examples (the lossless round trip)
+   Authors' Addresses
+
+
+1.  Motivation -- "your choice, per space" and the road between
+
+   1.1.  The owner wants a real-time filesystem OPTION, not a
+         replacement.
+
+      ACP's default filesystem is deliberately EXPLICIT: a client
+      uploads blobs and commits a manifest under a compare-and-swap
+      (ACP/1 Section 11).  That gives the linear, auditable, reviewable,
+      lease-guardable behaviour ACP was designed around, now backed by a
+      full version history and recoverable retention (EXT-33) and a
+      commit-time bulk wall (EXT-34).  It is exactly what some customers
+      need (it is NOT "a worse git"; the explicit, auditable line is
+      the point).  But it also means an agent must THINK about push/pull
+      and version conflicts: under many
+      concurrent workers the CAS-retry loop dominates.  The owner asked
+      (Q-8) for a REAL-TIME filesystem where writes "just work" -- live
+      sync, conflict-free, no push/pull/lease thinking.  EXT-28 built
+      that structure.  This memo is the SWITCH: "git-mode vs
+      Firebase-mode, your choice, per space."
+
+   1.2.  The selector is the easy half; the TRANSITION is the hard half.
+
+      Two modes coexisting is a small piece of replicated config (the
+      2026-08-21 draft had it right).  The dangerous piece -- the piece
+      that draft deferred -- is what happens to the DATA ALREADY IN A
+      SPACE when its mode changes.  A team with a live realtime workspace
+      decides they now need an auditable release line and flips to CAS;
+      or a CAS project drowning in 409s flips to realtime.  If that flip
+      drops files, duplicates them, silently erases recoverable trash, or
+      leaves the history unauditable across the boundary, the product's
+      one promise is broken at the worst possible moment -- a deliberate,
+      whole-space operation the operator expected to be safe.  Sections
+      4.6-4.8 make the flip LOSSLESS, ATOMIC, and AUDITABLE, and reuse
+      the EXT-33 machinery so there is ONE retention/recovery story on
+      both sides of the road.
+
+   1.3.  It composes what we already have.
+
+      Realtime mode is not a new engine: it is EXT-28's CRDT directory
+      tree (structure that converges) + the CRDT file path (content that
+      converges, SHIPPED) + the virtual-FS facade (so the agent just
+      calls readFile/writeFile).  The transition is not a new recovery
+      engine either: cas -> realtime seeds the tree from the manifest
+      that EXT-33 already retains; realtime -> cas is EXT-33's
+      restore-as-a-forward-commit applied to the whole materialized tree;
+      the pre-flip state is kept by EXT-33 retention + an
+      auto-checkpoint.  This memo ties them together and lets a space
+      CHOOSE, with a safe road between.  It weakens nothing; it keeps CAS
+      the strict default.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the definitions of ACP/1 (space, manifest, path,
+   commit, base_version, blob, content hash, lease, event, admin/writer/
+   reader role, snapshot, replicated command, capability negotiation),
+   EXT-28 (CRDT directory tree, realtime mode, node, node id, placement,
+   ROOT, TRASH, live node, trashed node, retained, fs.ops, fs.prune,
+   materialization), EXT-33 (version record, retention policy,
+   history_ttl_sec, history_min_versions, max_history_bytes, GC-pin,
+   checkpoint, auto-checkpoint, restore-as-a-forward-commit, restore_of,
+   history.prune), EXT-27 (read_prefix, read scope, no-oracle), EXT-7
+   (quota fields), and EXT-34 (bulk-change guard, net-loss measurement,
+   bulk disposition) without restating them.
+
+   FILESYSTEM MODE (the MODE):  A per-space (optionally per-path-prefix)
+      replicated configuration value in { "cas", "realtime" } selecting
+      the filesystem behaviour a path region presents.
+
+   CAS MODE:  ACP/1 Section 11 blob+manifest compare-and-swap -- the
+      STRICT DEFAULT.  Explicit, lease-guardable, auditable, with the
+      EXT-33 linear version history and the EXT-34 commit-time wall.
+
+   REALTIME MODE:  The EXT-28 CRDT directory tree + CRDT files, surfaced
+      through the virtual-FS facade -- conflict-free, live-converging, no
+      409.
+
+   REGION:  The path scope a single mode value governs: a whole space,
+      or a path prefix within a space when per-prefix mode is in use
+      (Section 4.4).
+
+   FLIP:  A change of a region's mode value, effected only by the
+      replicated admin command fs.mode.set (Section 4.3).  A cas->
+      realtime flip SEEDS a tree (Section 4.6); a realtime->cas flip
+      SNAPSHOTS a tree (Section 4.7).
+
+   SEED:  The deterministic construction of an EXT-28 TreeDoc for a
+      region from the region's current manifest, performed inside the
+      cas->realtime flip command (Section 4.6).
+
+   SNAPSHOT (of a tree):  The deterministic materialization of a
+      realtime region's live tree into a new CAS manifest version,
+      performed inside the realtime->cas flip command (Section 4.7).
+      (Distinct from an ACP/1 Section 14.3 REPLICATED snapshot; where
+      ambiguous this memo writes "tree snapshot".)
+
+   fs.mode.set { region, mode, now, confirm }:  The leader-driven,
+      leader-stamped, totally-ordered replicated command that changes a
+      region's mode and performs the seed or tree snapshot atomically
+      (Section 4.3, 4.8).
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  CAS is the strict default and is never weakened.  A new space
+      is CAS; a region with no explicit mode is CAS; a CAS region is
+      byte-identical to ACP/1 today (manifest, commit CAS, 409s, leases,
+      EXT-33 history, EXT-34 guard).  Realtime exists only where a flip
+      has explicitly selected it.
+
+   3.2.  Never a silent switch.  A mode NEVER changes as a side effect of
+      a write, a read, a capability upgrade, or a client's expectation.
+      It changes only by the explicit, admin-authorized, CONFIRMED
+      fs.mode.set command (Section 4.3).
+
+   3.3.  The transition is lossless, atomic, and auditable.  Every live
+      file crosses the flip with its bytes; every recoverable deleted
+      file remains recoverable within its window; nothing is duplicated;
+      the pre-flip state is pinned and reachable AFTER the flip; and the
+      flip is a single replicated command and a logged event (Sections
+      4.6-4.8).  A cas->realtime->cas round trip returns a byte-identical
+      manifest; a realtime->cas->realtime round trip returns a
+      path-identical tree (Section 11).
+
+   3.4.  One retention and recovery story on both sides.  The transition
+      reuses EXT-33 version records, auto-checkpoints, restore-as-a-
+      commit and retention -- not a new recovery engine -- so an operator
+      tunes ONE set of knobs and a customer hears ONE promise across the
+      road.
+
+   3.5.  Deterministic and replicated (ACP/1 Section 17).  The mode is
+      replicated config; the flip is leader-stamped and totally ordered
+      on the single log; the seed and the tree snapshot are pure
+      functions of replicated state plus the leader stamp at the flip's
+      log position.  No wall-clock, no node-local state, no I/O in the
+      apply path (Section 4.11).
+
+   3.6.  Additive and honest.  The mode is a small config field; the
+      flip is one admin command; the trade-off realtime makes (no linear
+      history, no whole-tree version pin, no EXT-18 attestation line, no
+      commit-time bulk wall) is stated and made an explicit per-region
+      choice, never hidden.
+
+   3.7.  Non-goals.  This memo does NOT: define the CRDT tree itself
+      (EXT-28), per-file content merge (the CRDT file path), the version
+      history/retention engine (EXT-33), or the bulk guard (EXT-34) -- it
+      COMPOSES them.  It does not specify the client virtual-FS facade (a
+      separate client epic); it defines only the daemon-side mode, the
+      flip, and how a client negotiates which surface to use.  It does
+      not add a linear version history to a realtime region (that is CAS
+      + EXT-33; a realtime region cannot be an EXT-18 attestation source
+      -- Section 5).
+
+
+4.  Design
+
+   4.1.  Capability, and the mode as replicated state.
+
+      The capability string "fsmode", advertised on GET /v1/healthz and
+      /v1/stats (EXT-1 Section 7 convention), asserts ALL of Sections 4.2
+      through 4.11.  An authority MUST NOT advertise "fsmode" unless it
+      also advertises "crdtfs" (EXT-28 -- realtime mode IS that
+      structure) and "history" (EXT-33 -- the transition and the
+      pre-flip pin ARE that machinery).  A daemon MAY advertise "fsmode"
+      and still run every space in CAS mode; the capability advertises
+      the AVAILABILITY of the toggle, not that any space uses it.
+
+      The mode is REPLICATED SPACE CONFIGURATION: a value in {"cas",
+      "realtime"} plus an OPTIONAL map of path-prefix overrides (Section
+      4.4), stored in the space's replicated config and applied through
+      the FSM.  It is set only by fs.mode.set (Section 4.3) and read as a
+      pure lookup (GET /v1/space/config).  Absent any value, the region
+      is CAS (Section 3.1).
+
+   4.2.  The two modes; the strict CAS default.
+
+      o  "cas" (STRICT DEFAULT): the region's files ARE the ACP/1 Section
+         11 manifest.  writeFile = POST /v1/blobs + POST /v1/commit (CAS
+         on base_version); readdir/readFile = manifest/blob reads; a
+         stale write gets a 409 and the client rebases.  Explicit,
+         auditable, lease-guardable, with EXT-33 history and the EXT-34
+         wall.  UNCHANGED from ACP/1.
+
+      o  "realtime": the region's structure IS an EXT-28 CRDT directory
+         tree and its files are CRDT documents or pinned blobs;
+         writeFile/rename/move are EXT-28 CRDT ops that CONVERGE with NO
+         409; deletes are recoverable EXT-28 trash; the virtual-FS facade
+         presents them as ordinary files.
+
+   4.3.  Setting the mode (admin + confirm; never silent).
+
+      SET (admin role):
+         PUT /v1/space/config
+            { "fs_mode": "cas" | "realtime",
+              "prefixes": { <pathPrefix>: "cas" | "realtime" }?,
+              "confirm": <FlipConfirm>? }
+
+      Setting or changing a mode is an ADMIN operation (never writer,
+      never a read-scoped token -- Section 5.3) that proposes the
+      replicated command fs.mode.set.  It is deliberately NOT a
+      per-write choice.
+
+      4.3.1.  The confirm gate (no accidental flip).  A flip that would
+         change the mode of a NON-EMPTY region is a large,
+         semantics-changing, whole-region operation and MUST NOT proceed
+         on the admin call alone.  The authority MUST first return 428
+         fs_mode_confirm_required with the EXACT scope of what will be
+         transformed:
+
+            { "region": <path prefix or "/">,
+              "from": "cas"|"realtime", "to": "cas"|"realtime",
+              "entries": <uint32>,        ; live files that will cross
+              "trashed": <uint32>?,       ; retained trashed nodes (realtime->cas)
+              "from_version": <uint64>?,  ; current manifest version (cas->*)
+              "leases_held": <uint32> }   ; Section 5.4
+
+         The client re-issues the PUT with confirm = { region, from, to,
+         entries } echoed EXACTLY (the EXT-34 confirm discipline: exact
+         equality on the counts, or 428 fs_mode_confirm_mismatch, never
+         rounded).  The echoed count MUST be re-evaluated DETERMINISTICALLY
+         IN APPLY at the flip's log position, not merely checked at the
+         HTTP edge (finding F9): if writes raced between the 428 and the
+         confirmed apply so that the count no longer matches what the flip
+         would transform, the flip is REFUSED in apply with 428
+         fs_mode_confirm_mismatch and NO partial state -- closing the
+         a check-then-act TOCTOU exactly as EXT-34's
+         exact-echo discipline does.  Setting a region to the mode it
+         ALREADY has is a no-op success and needs no confirm.  Setting the
+         mode of an EMPTY region needs no confirm (nothing crosses).  An
+         implementation MAY additionally require a typed region name in
+         confirm, as an operator guard.
+
+      4.3.2.  Idempotence and ordering.  fs.mode.set carries an op-id
+         (EXT-5); a retried flip is idempotent.  Concurrent fs.mode.set
+         on the same region are totally ordered by the log; the second
+         sees the region already in the target mode and is a no-op.  A
+         flip and any data op on the region are totally ordered by the
+         single log (Section 4.8).
+
+      NEGOTIATE (any role):
+         GET /v1/space/config -> { "fs_mode": ..., "prefixes": {...}? }
+
+      A client discovers a region's mode and uses the matching surface
+      (Section 4.5).  The virtual-FS facade performs this negotiation so
+      page/agent code calls the same readFile/writeFile regardless.
+
+   4.4.  Mode granularity: WHOLE-SPACE in v1 (per-prefix is an
+         unresolved design gap).
+
+      v1 flips a WHOLE SPACE only (the ratified default).  The seed
+      (Section 4.6), tree snapshot (Section 4.7), the V0 freeze and the
+      V1 mint are all defined over the WHOLE-SPACE manifest version line:
+      "V0" and "V1 = current + 1" are whole-space monotonic versions of
+      the ENTIRE manifest, and a v1 flip's confirm/seed/snapshot/version
+      semantics are scoped to the whole space accordingly.
+
+      Per-path-prefix mode -- a default mode with per-prefix overrides
+      (e.g. whole space "realtime" but releases/ pinned to "cas") -- is
+      an UNRESOLVED DESIGN GAP, not a mere fast-follow (finding F6).  It
+      does NOT compose cleanly with the whole-space manifest-version
+      model: you cannot freeze PART of a version line, and a whole-space
+      V1 minted by a subtree snapshot must still carry every OTHER CAS
+      region's entries -- the region-vs-whole-space version identity is
+      undefined here and MUST be resolved in a follow-up before per-prefix
+      flips are built.  Until then a daemon MUST implement whole-space
+      mode only and MUST reject a per-prefix PUT with 400 rather than
+      silently applying a whole-space flip.  (Where a v1 daemon still
+      exposes a read-only per-prefix map for negotiation, it is
+      read_prefix-filtered as in Section 5.3; but a per-prefix FLIP is a
+      400 in v1.)
+
+   4.5.  How reads and writes dispatch by mode.
+
+      A client (or a mount) asks GET /v1/space/config for a path's mode
+      and uses the matching surface: for a CAS region the ACP/1 Section
+      11 commit/manifest endpoints (and EXT-33 history reads); for a
+      realtime region the EXT-28 endpoints (POST /v1/fs/ops, GET
+      /v1/fs/tree, GET /v1/fs/trash) and the CRDT-file endpoints.  The
+      virtual-FS facade routes readFile/writeFile to the right surface,
+      so agent/page code is mode-agnostic.
+
+      WRONG-SURFACE REFUSAL (normative; no shadow state).  A write to the
+      surface that does NOT match a region's mode MUST be refused
+      cleanly, with NO state change and the region's actual mode in the
+      body:
+
+         o  POST /v1/commit or POST /v1/blobs...+commit targeting a path
+            in a REALTIME region -> 409 wrong_fs_mode
+            { "region", "mode": "realtime" }.
+         o  POST /v1/fs/ops targeting a path in a CAS region -> 409
+            wrong_fs_mode { "region", "mode": "cas" }.
+
+      This is a hard invariant: a CAS commit must NEVER create a shadow
+      manifest for a realtime region, and an fs.ops must NEVER create a
+      shadow tree for a CAS region.  A region has exactly ONE authoritative
+      structure at any committed state, and it is the one its mode names.
+      The refusal is deterministic (decided from replicated config in
+      apply), returns no out-of-scope information (EXT-27 no-oracle), and
+      is the client's signal to re-read the mode and retry on the right
+      surface.
+
+   4.6.  Transition cas -> realtime (seed the tree).
+
+      A cas->realtime flip SEEDS an EXT-28 TreeDoc for the region from
+      the region's manifest, inside the single fs.mode.set command, so
+      the moment the flip commits the region has a fully-formed,
+      converged tree equal to the manifest it left.
+
+      4.6.1.  What is seeded.  Let V0 be the region's current manifest
+         version at the flip's log position, filtered to the region's
+         paths.  For the manifest entries in canonical sorted-key order
+         (the EXT-5 materialization order), the seed:
+
+            (a) mints the folder chain: for each distinct path segment
+                prefix a folder node is created if absent, parented under
+                its parent folder (ROOT for the top);
+            (b) mints one file node per manifest entry, parented under
+                its folder with the entry's final segment as its name,
+                and sets its content to { "blob": <hash> } with the
+                entry's size (ACP/1 Section 11; the blob is already
+                present and is now referenced by a live node, so it is
+                reachable -- Section 5.5);
+            (c) mints an empty folder node for each path in V0's version
+                record `empty_dirs` list (if any -- present when V0 was
+                itself produced by a prior realtime->cas flip that
+                preserved empty dirs, Section 4.7.1), so a
+                realtime->cas->realtime round trip does not lose an empty
+                directory (finding F8);
+            (d) assigns every minted node id DETERMINISTICALLY (Section
+                4.11.1) so every replica seeds the byte-identical tree.
+
+         No blob is uploaded or copied: content is addressed by the same
+         hashes the manifest held.  Names in a manifest are already
+         unique paths, so the seed produces no name collision (Section
+         4.2.4 of EXT-28 does not fire).
+
+      4.6.2.  What happens to the CAS history.  The flip does NOT delete
+         the region's manifest history.  V0 (a WHOLE-SPACE manifest
+         version -- Section 4.4; v1 is whole-space) and every retained
+         version record remain RETAINED under the space's EXT-33 policy,
+         and the flip creates an AUTO-CHECKPOINT
+         "auto/fsmode-cas-to-realtime-v<V0>" pinning V0 (Section 4.6.4 of
+         EXT-33; a soft pin held for at least history_ttl_sec).  This
+         pre-flip pin is MANDATORY, not best-effort (finding F5): if the
+         space is at max_checkpoints so that EXT-33 §4.6.4 would silently
+         OMIT the auto-checkpoint, the flip MUST instead be REFUSED with
+         409 checkpoint_cap_at_capacity (surfaced in the 428 pre-flight)
+         and MUST NOT proceed unpinned.  So the exact pre-flip CAS state
+         -- its manifest and all its blobs -- is auditable and restorable
+         AFTER the flip, for the retention window, without the operator
+         taking any extra step.  The CAS manifest for the region is
+         FROZEN at V0: no further /v1/commit is accepted there (Section
+         4.5, wrong_fs_mode); the region's authoritative live structure
+         is now the tree.
+
+      4.6.3.  Losslessness.  Every file in the region at V0 is a live
+         node in the seeded tree with the identical path, hash and size;
+         no file is dropped, none is duplicated, and the pre-flip state
+         is separately pinned (4.6.2).  A subsequent realtime->cas flip
+         with no intervening edit reproduces V0's entry set exactly
+         (Section 11, T-31).
+
+   4.7.  Transition realtime -> cas (snapshot the tree).
+
+      A realtime->cas flip SNAPSHOTS the region's converged LIVE tree
+      into a NEW manifest version, inside the single fs.mode.set command,
+      as the EXT-33 restore-as-a-forward-commit pattern applied to the
+      whole region.
+
+      4.7.1.  What is snapshotted.  The flip materializes the region's
+         LIVE tree exactly as GET /v1/fs/tree does (the EXT-5
+         deterministic sorted-key walk, the EXT-14 stamp-ordered validity
+         pass, and the EXT-28 Section 4.2.4 name-collision
+         disambiguation), yielding a deterministic path -> content view
+         of the live nodes only (TRASH is not part of the live view).
+         Each live file node becomes one manifest entry:
+
+            (a) a node whose content is { "blob": <hash> } maps directly
+                to { path, hash, size }; the blob is present (it was
+                referenced by a live node) and needs no upload;
+            (b) a node whose content is a live CRDT document { "doc":
+                <name> } is handled FLUSH-FIRST (the PRIMARY path, per
+                the ratified decision): the flip is REFUSED unless every
+                live-doc file in the region has first been FLUSHED to an
+                immutable blob (the 428 pre-flight lists the unflushed
+                doc paths, and a flip attempted with live docs still
+                present returns 409 live_docs_unflushed { paths }).  A
+                flushed doc is an ordinary { "blob": <hash> } node by
+                flip time and maps as in (a), so there is nothing to
+                serialize in apply and no concurrent-edit window.  As a
+                documented FALLBACK (an owner-enabled option, for a doc
+                still live at the flip), the leader FLATTENS the doc to
+                its canonical bytes AS OF THE FLIP'S LOG POSITION -- it
+                serializes the document's materialized value including
+                every doc op ordered BEFORE the flip and EXCLUDING any
+                ordered at or after it, content-addresses it, and the
+                resulting { path, hash, size } enters the manifest; the
+                region MUST reject doc ops from the flip's log position
+                onward (wrong_fs_mode), so no accepted edit is silently
+                frozen out (Section 4.11.2; finding F3/F4);
+            (c) a name-collision loser surfaced by EXT-28 as
+                "<name>~<nodeId>" maps to that exact disambiguated path
+                via EXT-28's INJECTIVE, REVERSIBLE tree-name -> manifest-
+                path encoding (full node id; a literal "~" in a real name
+                escaped -- EXT-28 §4.2.4), so no two entries collide, a
+                real file literally named the disambiguated form is NOT
+                overwritten, and no live node is dropped.  A live tree
+                path that is NOT a representable manifest path -- illegal
+                path bytes, or a (possibly disambiguated) path exceeding
+                the blob store's MaxPathLen -- has a DEFINED
+                outcome: the flip is REFUSED with 409 unrepresentable_path
+                { paths } naming the offending path(s), the region stays
+                realtime, and NO partial manifest is written (finding F7;
+                composes with the atomicity of Section 4.8.1).  A path is
+                NEVER silently dropped and the flip is NEVER wedged.
+
+         Empty directories are PRESERVED across the flip (finding F8): a
+         folder node with no live descendants would leave no path->blob
+         entry in a CAS manifest, so the flip records the region's set of
+         empty-directory paths as replicated metadata in V1's EXT-33
+         version record (an `empty_dirs` list, retained and GC-tracked
+         with the record), and a later cas->realtime seed (Section 4.6.1)
+         re-creates those folder nodes from it.  No visible manifest
+         entry is added, so file-entry byte-identity (T-32) is preserved.
+
+         The result is a NEW manifest version V1 = (current version) + 1
+         with its own EXT-33 version record.  The manifest version never
+         decreases; the flip is a FORWARD commit, reversible by a later
+         flip, never a rewrite in place.
+
+      4.7.2.  What happens to the tree and its trash.  The flip does NOT
+         hard-delete the realtime TreeDoc.  The live tree it snapshotted
+         and every RETAINED trashed node (those still within their EXT-28
+         window) remain RETAINED and GC-pinned under the space's EXT-33
+         policy.  Their blobs stay pinned by the REVISED
+         acp1-15-gc-realtime-tree amendment, whose reachability keys on
+         the PRESENCE of the retained realtime tree/trash and NOT on the
+         region's mode, so the flip to CAS does NOT unpin them (Section
+         4.8.4; finding F1).
+
+         The flip creates an AUTO-CHECKPOINT
+         "auto/fsmode-realtime-to-cas-v<V1>" pinning V1.  This pre-flip
+         pin is MANDATORY, not best-effort (finding F5): unlike an
+         ordinary EXT-33 auto-checkpoint, which EXT-33 §4.6.4 permits an
+         authority to silently OMIT when the space is at max_checkpoints,
+         a flip MUST NOT proceed unpinned.  If max_checkpoints would force
+         omission, the authority MUST refuse the flip with 409
+         checkpoint_cap_at_capacity (surfaced in the 428 pre-flight) --
+         the operator raises max_checkpoints or deletes an old
+         checkpoint, then retries -- so the pre-flip state is NEVER left
+         to ordinary retention with no guaranteed >= ttl soft pin.
+
+         So: the new CAS line begins at V1 with every live file; AND a
+         file that was in recoverable realtime trash at the moment of the
+         flip stays recoverable, by its EXT-28 node id, for the remainder
+         of its window -- the flip does not shorten a deleted file's
+         recovery window.  fs.ops for the region is refused after the
+         flip (Section 4.5); the tree is frozen as retained state, and it
+         remains listable/restorable through the CAS-mode recovery
+         surface of Section 4.7.4 (finding F2).
+
+      4.7.3.  Losslessness.  Every LIVE file in the region crosses into
+         V1 with its bytes (a blob directly; a doc by its flush-first
+         blob, or by its flip-position canonical flatten in the fallback
+         path -- Section 4.7.1(b)); every still-recoverable trashed file
+         remains recoverable in the retained tree (Section 4.7.4); empty
+         directories are preserved (Section 4.7.1); nothing is duplicated
+         (the injective disambiguation guarantees unique paths).  A
+         subsequent cas->realtime flip with no intervening edit reseeds a
+         path-identical tree (Section 11, T-32).
+
+      4.7.4.  Recovering pre-flip trash AFTER the flip (the CAS-mode
+         recovery surface).  Section 4.7.2 keeps a pre-flip trashed file
+         recoverable "by its EXT-28 node id" -- but EXT-28's own recovery
+         surfaces (POST /v1/fs/ops RESTORE, GET /v1/fs/trash) are REALTIME
+         surfaces and are refused on a now-CAS region (wrong_fs_mode,
+         Section 4.5).  So the flip MUST expose an explicit CAS-mode
+         recovery surface for the retained pre-flip tree/trash, pinned by
+         and reached through the flip's auto-checkpoint (finding F2):
+
+            GET  /v1/fs/trash?checkpoint=<auto/fsmode-realtime-to-cas-v<V1>>
+                 ; reader; lists the retained pre-flip trashed nodes
+                 ; (name, nodeId, trashed_at, stored origin path) that
+                 ; are still within their EXT-28 window; read_prefix-
+                 ; filtered by the stored origin path, no-oracle.
+            POST /v1/fs/trash/restore
+                 { node_id, checkpoint }
+                 ; writer (possession-scoped as in EXT-28 §5.3); restores
+                 ; a retained pre-flip trashed file into the CURRENT CAS
+                 ; manifest as an EXT-33 restore-as-a-forward-commit (the
+                 ; file's blob is still GC-pinned -- Section 4.7.2), so
+                 ; recovery in CAS mode does NOT require flipping back to
+                 ; realtime.
+
+         These read/restore the RETAINED structure only; they create no
+         shadow realtime tree (the region has exactly one authoritative
+         live structure, the CAS manifest -- Section 10.2).  When the
+         retained tree's window elapses and its auto-checkpoint is
+         reclaimable, the surface returns the pre-flip trash as gone, the
+         same as any other post-window state.
+
+   4.8.  Atomicity, and how EXT-33 history spans the flip.
+
+      4.8.1.  One command, all-or-nothing.  A flip -- the mode change
+         PLUS its seed or tree snapshot PLUS the pre-flip auto-checkpoint
+         -- is ONE replicated command (fs.mode.set).  The single Raft log
+         IS the coordinator, as for every ACP write.  Either the region
+         is fully in the new mode with a fully-formed new structure and
+         the pre-flip pin, or the flip did not happen: there is no
+         half-seeded tree, no half-materialized manifest, and no window
+         in which the region has two authoritative structures.  A flip
+         and a concurrent data op are totally ordered by the log; a data
+         op ordered before the flip is included in what the flip
+         transforms, and one ordered after it is refused by
+         wrong_fs_mode against the OLD surface (Section 4.5) -- there is
+         no flip-vs-op race (the check-then-act class is excluded because
+         the mode is read in apply, not at the edge).
+
+         ALL of the flip's preconditions and sub-steps are evaluated IN
+         APPLY, as part of this single command, and ANY failure refuses
+         the ENTIRE flip with the region left in its OLD mode and NO
+         partial state -- never a half-written manifest or half-seeded
+         tree (findings F5/F7/F9/F11).  Because the tree snapshot IS an
+         EXT-33 restore-as-a-forward-commit (Section 4.7), it inherits
+         commit's in-apply failure modes and each aborts the whole flip:
+         a quota overrun (507 -- doc-flatten mints NEW blobs that count
+         toward max_blob_bytes per EXT-33 §4.3.4, and retained pre-flip
+         bytes also count), an unrepresentable/illegal path (409
+         unrepresentable_path, Section 4.7.1(c)), a max_checkpoints cap
+         that would drop the mandatory pin (409 checkpoint_cap_at_capacity,
+         Sections 4.6.2/4.7.2), a confirm-count mismatch re-checked in
+         apply (428, Section 4.3.1), or a bulk-guard refusal (Section
+         5.5).  None leaves a manifest version partially written.
+
+      4.8.2.  The flip is an auditable event.  The authority appends
+
+            fs.mode.changed { before: { mode }, after: { mode },
+                              region, at, actor,
+                              from_version?, to_version?,
+                              checkpoint }
+
+         to the event log (watchable, EXT-22).  from_version is V0 for a
+         cas->realtime flip; to_version is V1 for a realtime->cas flip;
+         checkpoint is the auto-checkpoint name.  The flip is thus a
+         first-class, totally-ordered, attributable point in the space's
+         timeline.
+
+      4.8.3.  History spans the flip.  The pre-flip state is reachable
+         AFTER the flip through the auto-checkpoint (Sections 4.6.2,
+         4.7.2): a reader crosses the boundary by reading the pinned
+         version (cas->realtime) or the retained tree/trash
+         (realtime->cas).  A CAS region's EXT-33 version line is
+         contiguous up to V0, resumes at V1 after a later realtime->cas
+         flip, and the fs.mode.changed events mark every boundary in
+         order -- so the space's history is auditable ACROSS mode
+         changes, not merely within one mode.  A realtime region has no
+         linear whole-tree version line while it is realtime (EXT-28
+         Section 3.7); the auto-checkpoint at each boundary is the
+         auditable anchor.
+
+      4.8.4.  How EXT-33/EXT-28 reachability spans the flip (REVISED PER
+         REVIEW -- owner RE-CONFIRMS).  A flipped region can, for the
+         retention window, have BOTH a retained pre-flip structure and a
+         live new structure.  GC must keep the blobs of both.  The
+         retained CAS manifest version and its auto-checkpoint are kept
+         by amendment acp1-15-gc-retained-history (EXT-33).  The retained
+         realtime live tree and trash are kept by amendment
+         acp1-15-gc-realtime-tree (EXT-28) -- BUT ONLY AS THAT AMENDMENT
+         IS NOW REVISED.  The independent design review (finding F1)
+         falsified this memo's original "no amendment needed" claim: the
+         2026-09-12 wording of acp1-15-gc-realtime-tree excluded "a space
+         in CAS mode," which is EXACTLY what a realtime->cas flip makes
+         the region -- so after the flip the realtime rule stopped
+         pinning the retained trash's blobs, and the next GC reclaimed a
+         still-recoverable deleted file up to 29 days early (breaking
+         Sections 4.7.2 and T-34).  The union argument was therefore
+         FALSE as the rule was worded.
+
+         The fix: acp1-15-gc-realtime-tree has been REVISED (EXT-28 §4.9)
+         so its reachability keys on the PRESENCE of a retained EXT-28
+         tree/trash in replicated state -- explicitly INCLUDING a region
+         that "retains a pre-flip realtime tree and trash from a prior
+         EXT-31 realtime->cas flip still within its retention window" --
+         and NOT on the region's current mode.  With that revision, a
+         flipped region's retained pre-flip trash stays pinned for the
+         remainder of its window and is evicted only by fs.prune, exactly
+         as before the flip; the union of the two (revised) rules holds.
+         This memo therefore DEPENDS ON the revised EXT-28 amendment
+         (rather than "no amendment"), and REVISITS the ratified "no
+         acp-1 amendment" decision (D8 / Section 12 / this section) --
+         the owner MUST RE-CONFIRM.  This memo still edits no
+         PUBLIC_REPO/rfc/acp-1.txt text itself; the change is to the
+         EXT-28 amendment block, which the owner ratifies with EXT-28.
+
+   4.9.  Data model and data-model delta.
+
+      DATA MODEL:
+         SpaceConfig (per space, replicated admin state):
+            { "fs_mode": "cas" | "realtime",       ; default "cas"
+              "prefixes": { <pathPrefix>: "cas"|"realtime" }? }
+         (The realtime structure itself is EXT-28's TreeDoc; the CAS
+         structure is the ACP/1 manifest; this memo SELECTS between
+         them and adds only the selector + the flip.)
+
+      DATA-MODEL DELTA vs acp/1:
+         + a small fs_mode field (+ optional prefix overrides) per space,
+           in replicated space config -- ADDITIVE.
+         + fs.mode.set replicated command (leader-stamped; carries the
+           deterministic seed / tree-snapshot result and the pre-flip
+           auto-checkpoint) -- ADDITIVE.
+         ~ CAS-mode behaviour is UNCHANGED; realtime-mode structure is
+           EXT-28's TreeDoc (no new content model here); the transition
+           REUSES EXT-33 version records, auto-checkpoints and restore-
+           as-a-commit, and EXT-28 seed/materialization -- no new
+           recovery engine.
+         (No change to leases, mailbox, presence, events, or the space
+         boundary.)
+
+   4.10. Wire API additions.
+
+      New / modified (gated by "fsmode"):
+         PUT /v1/space/config   ; admin; set fs_mode (+ optional
+                                ;   prefixes); 428 fs_mode_confirm_
+                                ;   required then confirmed (Section 4.3)
+         GET /v1/space/config   ; any role; read the mode for
+                                ;   negotiation (per-prefix map read_
+                                ;   prefix-filtered, Section 5.3)
+         GET /v1/fs/trash?checkpoint=<auto/fsmode-realtime-to-cas-v<V>>
+                                ; reader; list retained PRE-FLIP trash of
+                                ;   a now-CAS region (Section 4.7.4, F2);
+                                ;   read_prefix-filtered by stored origin
+         POST /v1/fs/trash/restore ; writer; restore a retained pre-flip
+                                ;   trashed file into the CURRENT CAS
+                                ;   manifest as an EXT-33 forward commit
+                                ;   (Section 4.7.4, F2)
+         GET /v1/healthz, /v1/stats  + "fsmode" capability + an "fsmode"
+                                ;   block (per-region mode, last flip)
+
+      Realtime regions use EXT-28's endpoints and the CRDT-file
+      endpoints; CAS regions use the ACP/1 Section 11 commit/manifest
+      endpoints and EXT-33 history reads -- all already defined.  A
+      write to the wrong surface returns 409 wrong_fs_mode (Section 4.5).
+      Replicated command: fs.mode.set (Section 4.3, 4.8).  No change to
+      POST /v1/commit, GET /v1/manifest, POST /v1/fs/ops, or any existing
+      surface's success path.  All follow ACP/1 Section 6 conventions;
+      the "acp/1" wire string is unchanged.
+
+   4.11. Section 17 determinism (mode replicated; flip totally ordered).
+
+      Mode is static replicated configuration and the flip is a
+      deterministic, side-effect-free command; neither introduces
+      nondeterminism.
+
+      4.11.1.  Deterministic seed (cas->realtime).  Node ids minted
+         during the seed MUST be a pure function of the flip command's
+         leader stamp at its log position and the CANONICAL ORDER of the
+         seeded paths (the EXT-5 sorted-key order), e.g. the k-th node in
+         that order takes an id derived from (leader stamp, k).  Every
+         replica applies the identical stamped command and mints the
+         identical ids, placements and content refs; the seeded TreeDoc
+         is byte-identical on every replica.  No follower re-derives ids
+         from arrival order; no wall-clock; no randomness.
+
+      4.11.2.  Deterministic tree snapshot (realtime->cas).  The live
+         tree is materialized by the pure EXT-28 function (Section 4.7.1).
+         For a { "blob": <hash> } file -- including every FLUSH-FIRST doc,
+         which is a blob by flip time (Section 4.7.1(b), the primary
+         path) -- the manifest entry is a pure copy of replicated state,
+         so in the flush-first case the apply is trivially pure and there
+         is nothing to serialize.  For a doc still live at the flip (the
+         FALLBACK path) the LEADER serializes the document's deterministic
+         materialization AS OF THE FLIP'S LOG POSITION (every doc op
+         ordered before the flip included, none at/after it), content-
+         addresses it, and STAMPS the resulting { path, hash, size } into
+         the fs.mode.set command; followers apply the stamped manifest
+         WITHOUT re-serializing (the same leader-stamped-result pattern
+         EXT-28's fs.prune uses for `now`).  Because the doc's value is
+         pinned to the flip's log position and doc ops from that position
+         onward are refused (Section 4.7.1(b)), no concurrent edit is
+         accepted-then-frozen-out (finding F4).  Serialization and hashing
+         are the only leader-side computation and their RESULT (not the
+         act) is what is replicated, so the FSM apply on every node is a
+         pure function of the stamped command.  Blob bytes are content-
+         addressed and reach followers by the existing blob replication
+         path; no follower performs I/O in apply.
+
+      4.11.3.  Static read.  Reading the mode is a pure lookup of
+         replicated config; every replica returns the same mode for the
+         same committed state.  Each mode's own write path is already
+         Section 17-compliant (CAS is ACP/1 Section 11; realtime is
+         EXT-28).  This memo composes two deterministic surfaces behind a
+         static, replicated switch and a deterministic flip; it adds no
+         I/O, no ML, and no wall-clock scheduling to the apply path.
+
+      4.11.4.  Atomicity across leader changes.  fs.mode.set is one
+         replicated command; a leader change between the flip and the
+         next op loses no seeded/snapshotted state and double-applies no
+         flip (idempotent op-id, Section 4.3.2), verified by the failover
+         test (Section 11, T-38).
+
+
+5.  Interaction with Other Extensions
+
+   5.1.  EXT-28 (CRDT directory tree).  Realtime mode IS EXT-28's
+      structure; this memo is the selector that turns it on for a
+      region and the definition of the flip that seeds/snapshots it.
+      This memo DISCHARGES EXT-28's deferred "mode MIGRATION between CAS
+      and realtime" (EXT-28 Section 8.4): the seed (Section 4.6) is
+      EXT-28's "seed the realtime tree from the current manifest" and the
+      tree snapshot (Section 4.7) is EXT-28's "snapshot the realtime tree
+      into a CAS manifest," now specified as one atomic, lossless,
+      deterministic command each.
+
+   5.2.  EXT-33 (history, retention, GC-pin, checkpoints, restore).  The
+      transition REUSES EXT-33 wholesale: realtime->cas IS restore-as-a-
+      forward-commit (Section 4.8 of EXT-33) applied to the whole
+      materialized tree, producing a new version record; the pre-flip
+      pin on either side is an EXT-33 auto-checkpoint (soft pin, Section
+      4.6.4 of EXT-33); the retained pre-flip structure is kept by EXT-33
+      retention and GC-pin.  One retention policy object governs both
+      sides of the flip.  A customer who flips to realtime does not lose
+      the recoverability EXT-33 gives, and a customer who flips back to
+      CAS gets a clean version line resuming at V1.
+
+   5.3.  EXT-27 (read scope, no-oracle).  Setting a mode is ADMIN-only,
+      so a read-scoped token can never flip.  The per-prefix mode MAP in
+      GET /v1/space/config is PATH-SHAPED and MUST be filtered by
+      read_prefix: a read-scoped token sees the mode of prefixes in its
+      scope and out-of-scope prefixes are missing-shaped (no-oracle).
+      The 428 fs_mode_confirm_required counts and the wrong_fs_mode body
+      reveal nothing out of scope.  Post-flip reads of the tree/manifest
+      stay read_prefix-filtered exactly as EXT-28/EXT-33 define.
+
+   5.4.  ACP/1 Section 10 (leases).  CAS mode is lease-guardable;
+      realtime mode replaces the lock with convergence and does not use
+      leases for structure.  A cas->realtime flip of a region with
+      OUTSTANDING LEASES is unsafe (a held lock would silently lose its
+      meaning); the authority MUST surface leases_held in the 428
+      (Section 4.3.1) and MUST refuse the flip with 409 leases_held until
+      the operator has released them.  (The 2026-08-21 "release the leases
+      as a logged effect of the flip" alternative is NOT chosen -- the
+      ratified decision is REFUSE, so a lock is never silently voided.)
+      A realtime->cas flip starts the new CAS region lease-free.  A client
+      that expects lease-gated writes against a realtime region is told
+      the region's mode by wrong_fs_mode / GET /v1/space/config, so a
+      lock expectation is never silently lost.
+
+   5.5.  EXT-34 (bulk-change guard).  A flip is a large, whole-region,
+      semantics-changing operation, so it carries its OWN confirm gate
+      (Section 4.3.1, the EXT-34 exact-echo discipline) independent of
+      whether "bulkguard" is present -- and that confirm gate, together
+      with the losslessness invariant below, IS the wall for a flip.
+
+      The GUARD AGAINST A DROPPING FLIP is the entry-count / losslessness
+      invariant enforced INSIDE the flip (live-nodes-in == manifest-
+      entries-out, plus accounted disambiguation and preserved empty
+      dirs -- Sections 4.7.1, 4.7.3, and T-31), NOT EXT-34 net-loss
+      measurement (finding F10).  EXT-34 net loss is measured against the
+      PRIOR CAS manifest, which for a born-realtime region is EMPTY -- so
+      a buggy flip that dropped 90% of the live tree would still show net
+      loss ~ 0 against an empty prior and PASS.  The earlier claim that
+      ext-34 measurement "guards a pathological content-dropping flip"
+      is therefore corrected: it does not, and the flip does not rely on
+      it for that.
+
+      Where "bulkguard" is advertised, the realtime->cas tree snapshot
+      (a forward commit) IS subjected to EXT-34's confirm/disposition
+      plumbing like any other commit (the ratified "IS ext-34-measured,"
+      not "SHOULD"): the flip's own auto-checkpoint coincides with the
+      EXT-34 pre-bulk pin.  That plumbing bounds the disposition/confirm
+      path; the count-invariant above is what guards losslessness.  Which
+      mode's bulk guard applies to ORDINARY writes is set by the region's
+      mode: CAS uses the commit-time wall (EXT-34), realtime uses the
+      fs.ops batch guard (EXT-28 Section 5.7).
+
+   5.6.  EXT-18 (provenance).  A realtime region has no total-order
+      whole-tree version line, so it is not an EXT-18 attestation source
+      (Section 3.7); a customer who needs the attestation keeps the
+      region in CAS.  The fs.mode.changed events are logged and
+      watchable, so the CHOICE of mode over time is itself auditable.
+
+   5.7.  EXT-22 (scoped watch).  fs.mode.changed and the post-flip
+      structural/commit events are watchable and subtree-filterable
+      exactly as their mode's events are.
+
+   5.8.  EXT-32 (acp:// URI).  A URI names a resource independent of the
+      region's mode; the resolver reads GET /v1/space/config to route to
+      the CAS or realtime surface, so a stable address survives a flip.
+      EXT-32 already lists EXT-31 as a write-surface dependency.
+
+   5.9.  The virtual-FS facade (client epic).  The facade performs the
+      Section 4.5 negotiation so page/agent readFile/writeFile is
+      mode-agnostic and a flip is transparent to code that does not care
+      which surface it uses.
+
+
+6.  The space stays the only hard boundary
+
+   The mode is a property WITHIN a space; it never spans two spaces and
+   confers no cross-space reach (ACP/1 Section 7).  A per-prefix mode
+   partitions BEHAVIOUR within a space, not ISOLATION -- the space
+   remains the only hard isolation boundary, in either mode and across a
+   flip.  A flip's seed/snapshot reads and writes only the region's own
+   space; it never crosses into another.  This memo neither adds,
+   weakens, nor crosses an isolation boundary.
+
+
+7.  Value
+
+   7.1.  Value to the framework.
+
+      o  Resolves the top adoption UX issue (agents should not have to
+         THINK about coordination) WITHOUT
+         sacrificing the audit story -- the trade-off is an explicit,
+         per-region choice, CAS is the strict default, and no space
+         loses its audit line by accident.
+      o  Closes the draft's deferred blocker: the TRANSITION is now a
+         lossless, atomic, deterministic, auditable command (Sections
+         4.6-4.8), reusing EXT-33 rather than inventing a second recovery
+         engine, with exploit-first round-trip tests (Section 11).
+      o  Composes existing deterministic pieces (EXT-28 + CRDT files +
+         EXT-33 + the facade) behind a static, Section 17-safe switch and
+         a totally-ordered flip -- no new engine, no new coordination
+         primitive, no new retention story, and no acp-1 text edited by
+         this memo (it depends on the revised EXT-28 §15.2 amendment --
+         Section 4.8.4).
+      o  Keeps the framework honest: git-mode and Firebase-mode are both
+         first-class, and the road between them is safe and reversible.
+
+   7.2.  Value to customers.
+
+      o  "Git-mode vs Firebase-mode, your choice, per space" (and per
+         subtree): explicit+auditable where review and rollback matter,
+         live+conflict-free where many agents collaborate.
+      o  A SAFE road between them: flip a drowning-in-409s CAS project to
+         realtime and every file arrives intact; flip a live workspace to
+         CAS when it needs an auditable release line and get a clean
+         version line, with the pre-flip state recoverable for the same
+         30-day window either way -- and the round trip is lossless.
+      o  No client rewrite: the virtual-FS facade hides the mode, so the
+         SAME readFile/writeFile code works against either and through a
+         flip.
+      o  A workspace whose needs change is not trapped: mode is a
+         reversible, per-region decision, not a one-way door.
+
+
+8.  Capability Negotiation, Rollout and Migration
+
+   8.1.  Negotiation.  Clients feature-detect "fsmode" (and "crdtfs" +
+      "history", which it requires).  A client routes per GET
+      /v1/space/config (Section 4.5); the facade hides which surface.
+
+   8.2.  Backward compatibility.  Byte-identical for every CAS-mode space
+      and every existing endpoint.  A peer without "fsmode" cannot flip
+      any space and sees only CAS spaces; a peer without "crdtfs" cannot
+      select a realtime value (the flip is refused).
+
+   8.3.  Cluster upgrade order (mixed-version cluster hazard).  A node lacking
+      "fsmode" (or "crdtfs"/"history") cannot apply fs.mode.set (or the
+      resulting fs.ops); a flipped space on a mixed cluster would
+      diverge.  Therefore an authority MUST NOT advertise "fsmode", and
+      MUST NOT allow a flip, while it knows a cluster member lacks the
+      required capabilities; operators upgrade EVERY node before enabling
+      the toggle.  Documented as an operational rule with a hazard record
+      (same posture as EXT-27, EXT-28 Section 8.3, EXT-33 Section 8.3).
+
+   8.4.  Migration (this memo IS the migration).  The one-way concern
+      EXT-28 Section 8.4 deferred is discharged here as a REVERSIBLE,
+      atomic, lossless flip in each direction (Sections 4.6, 4.7).  No
+      separate migration tool is needed.
+
+
+9.  Wire API Summary
+
+   New / modified (gated by "fsmode"; ACP/1 Section 6 conventions):
+
+      PUT /v1/space/config   ; admin; set fs_mode (+ prefixes); 428
+                             ;   fs_mode_confirm_required -> confirmed
+      GET /v1/space/config   ; any role; read mode (read_prefix-filtered
+                             ;   per-prefix map)
+      GET /v1/fs/trash?checkpoint=  ; reader; retained PRE-FLIP trash of a
+                             ;   now-CAS region (Section 4.7.4)
+      POST /v1/fs/trash/restore  ; writer; restore pre-flip trash into the
+                             ;   current CAS manifest (forward commit)
+      GET /v1/healthz, /v1/stats  + "fsmode" capability + fsmode block
+      (dispatch) 409 wrong_fs_mode on a write to the non-matching surface
+
+   Replicated command: fs.mode.set { region, mode, now, confirm }
+   (leader-stamped; carries the deterministic seed / tree-snapshot result
+   + the MANDATORY pre-flip auto-checkpoint).  Event: fs.mode.changed.  No
+   change to POST /v1/commit, GET /v1/manifest, POST /v1/fs/ops, or any
+   CAS/realtime success path.  This memo DEPENDS ON the REVISED EXT-28
+   amendment acp1-15-gc-realtime-tree (presence-based, mode-independent --
+   Section 4.8.4); it edits no PUBLIC_REPO/rfc/acp-1.txt text itself, but
+   the earlier "NO amendment to ACP/1" claim is CORRECTED (owner
+   re-confirms).  The "acp/1" wire string is unchanged.
+
+
+10. Security Considerations
+
+   10.1.  No silent switch is a security property.  A mode change alters
+      which guarantees a region carries (audit line, bulk wall, lease
+      lock).  Requiring an explicit, admin-authorized, confirmed flip
+      (Section 4.3) prevents an attacker or a runaway agent from quietly
+      stripping a region's audit/lock posture; a writer or read-scoped
+      token can never flip.
+
+   10.2.  No shadow structure.  wrong_fs_mode (Section 4.5) guarantees a
+      region has exactly one authoritative structure, so a write cannot
+      smuggle content into a hidden manifest/tree that reads do not show.
+
+   10.3.  No oracle.  The per-prefix mode map, the 428 confirm counts,
+      and the wrong_fs_mode body are read_prefix-filtered / scope-safe
+      (Section 5.3); a flip's seed/snapshot counts shown to any token are
+      the in-scope counts.
+
+   10.4.  Retention is a disclosure window across the flip.  The pre-flip
+      state (a pinned manifest, or a retained tree + trash) is
+      RECOVERABLE for history_ttl_sec after the flip.  An operator
+      handling must-forget data sets the policy accordingly and, where
+      required, deletes the auto-checkpoint (admin) to let the pre-flip
+      state fall under ordinary retention -- the same consideration
+      EXT-33/EXT-28 record.  "A flip erases the old structure
+      immediately" is NOT the promise, by design, and is documented so.
+
+   10.5.  Losslessness is an integrity property.  The round-trip tests
+      (Section 11) are the guarantee that a flip does not drop or
+      duplicate a customer's files; they are exploit-first (a naive flip
+      that drops a name-collision loser or a live doc is shown to lose
+      data first).
+
+   10.6.  The space is the boundary (Section 6); the mode and the flip
+      neither add nor weaken an isolation boundary.
+
+
+11. Test Specification (the merge bar for an implementation)
+
+   An implementation MUST NOT advertise "fsmode" until every test below
+   exists as a NAMED test in its suite and passes, and until "crdtfs"
+   (EXT-28) and "history" (EXT-33) are advertised.  Tests marked
+   (exploit-first) MUST first be shown to FAIL on a naive implementation
+   with the loss/duplication/silent-switch reproduced.  The
+   clause-to-test map is maintained outside the memo
+   (CONFORMANCE-stub.md).
+
+   11.1.  The lossless transition (the hard part).
+      T-30 TestCasToRealtimeSeedIsLossless (exploit-first) -- a manifest
+           of N files/folders; flip to realtime; the seeded tree has
+           exactly the same paths, hashes and sizes as live nodes; the
+           byte-identical tree on 3 replicas; no blob re-upload; V0 is
+           pinned by auto/fsmode-cas-to-realtime-v<V0> and still
+           readable.  Naive: a seed that re-derives ids per replica
+           diverges, or drops empty folders.
+      T-31 TestRealtimeToCasSnapshotIsLossless (exploit-first) -- a live
+           tree with blob files AND live-doc files AND a name-collision
+           pair; flip to CAS; V1's manifest has ONE entry per live node
+           with the right bytes (a doc via its flush-first blob or its
+           flip-position flatten, a collision loser at its INJECTIVE
+           disambiguated path); the losslessness invariant live-nodes-in
+           == manifest-entries-out (+ accounted disambiguation) holds;
+           nothing dropped or merged; V1 pinned by
+           auto/fsmode-realtime-to-cas-v<V1>.  Naive: the live doc is
+           skipped (no blob) or the collision loser overwrites the winner
+           (data loss).
+      T-32 TestCasRealtimeCasRoundTripByteIdentical (exploit-first) --
+           manifest M0 -> flip realtime -> flip cas -> manifest M1; M1's
+           entry set (path,hash,size) equals M0's exactly.
+      T-33 TestRealtimeCasRealtimeRoundTripPathIdenticalInclEmptyDirs --
+           tree T0 (INCLUDING at least one EMPTY directory) -> flip cas ->
+           flip realtime -> tree T1; T1's live path->content equals T0's
+           AND every empty directory in T0 is present in T1 (node ids MAY
+           be re-minted; paths and bytes identical).  The test MUST assert
+           empty-dir survival, not silently pass while dirs vanish
+           (finding F8).
+      T-34 TestFlipPreservesRetainedTrashAndItIsRecoverableInCas
+           (exploit-first) -- realtime region with a file deleted 1 day
+           ago (window 30 d, blob H); flip to CAS; H is NOT reclaimed by
+           a GC run after the flip (the revised presence-based
+           acp1-15-gc-realtime-tree keeps it -- findings F1); and the
+           trashed node is listable AND restorable THROUGH THE CAS-MODE
+           SURFACE (GET /v1/fs/trash?checkpoint=..., POST
+           /v1/fs/trash/restore -- Section 4.7.4, finding F2) for the
+           remaining 29 days; the flip did not shorten the window.  Naive:
+           GC reclaims H right after the flip (data loss 29 days early),
+           or there is no CAS-mode surface to recover it.
+
+   11.2.  No silent switch; wrong-surface refusal.
+      T-35 TestNewSpaceIsCasAndNeverAutoFlips (exploit-first) -- a fresh
+           space is CAS; no commit, fs.ops attempt, read, or capability
+           upgrade changes its mode; only fs.mode.set does.
+      T-36 TestFlipRequiresAdminAndExactConfirm -- a writer/read-scoped
+           token cannot flip (403); an admin flip of a non-empty region
+           returns 428 with exact counts; a mismatched confirm -> 428
+           fs_mode_confirm_mismatch; the exact echo succeeds; an
+           empty-region or same-mode flip needs no confirm.
+      T-37 TestWrongSurfaceRefusedNoShadowState (exploit-first) -- a
+           /v1/commit to a realtime region -> 409 wrong_fs_mode, no
+           manifest created; an fs.ops to a CAS region -> 409
+           wrong_fs_mode, no tree created; a later correct-surface read
+           shows no shadow structure.
+
+   11.3.  Atomicity, determinism, HA (Section 17).
+      T-38 TestFlipIsAtomicAcrossFailover -- a leader change during
+           fs.mode.set (real Raft InstallSnapshot/failover) leaves the
+           region either fully flipped (tree/manifest + pin present) or
+           not flipped; never half; no double-apply on retry.
+      T-39 TestFlipIsDeterministicAcrossReplicas -- the same fs.mode.set
+           on 3 nodes with skewed clocks yields byte-identical seeded
+           TreeDoc / snapshot manifest; ids from (leader stamp, canonical
+           order); doc-flatten result stamped by the leader, not
+           re-serialized by followers.
+      T-40 TestModeIsReplicatedStaticConfig -- GET /v1/space/config
+           returns the same mode for the same committed state on every
+           replica; the per-prefix longest-match resolution is identical.
+      T-41 TestDeterministicCheckIncludesModeSetAndDispatch -- the
+           Section 17 determinism check spans a stream of commits,
+           fs.ops, and flips in both directions across 3 nodes; mode,
+           tree, manifest, records, checkpoints and stats byte-identical.
+
+   11.4.  History spanning the flip; EXT-33 composition.
+      T-42 TestHistorySpansTheFlip -- after a flip the pre-flip state is
+           reachable via the auto-checkpoint; fs.mode.changed is in the
+           log with from/to versions; a CAS version line is contiguous to
+           V0 and resumes at V1 across a realtime interval.
+      T-43 TestPreFlipCheckpointRetainedThenReclaimable -- the
+           auto-checkpoint is a soft pin held >= history_ttl_sec; after
+           the window (and its deletion where user-pinned) the pre-flip
+           blobs become reclaimable; GC never reclaims a blob still
+           reachable from the live new structure OR the retained pre-flip
+           structure (the union of EXT-33 acp1-15-gc-retained-history and
+           the REVISED presence-based acp1-15-gc-realtime-tree, F1).
+
+   11.5.  Granularity; scope; leases; bulk.
+      T-44 TestPerPrefixFlipRejectedInV1 -- v1 is WHOLE-SPACE only
+           (finding F6): a per-prefix flip PUT is rejected with 400 (no
+           silent whole-space flip); a whole-space flip succeeds; the
+           region-vs-whole-space version identity is flagged an
+           unresolved design gap, not built in v1.
+      T-45 TestModeMapReadIsScopeFiltered -- the per-prefix map and the
+           confirm/refusal bodies are read_prefix-filtered, no-oracle;
+           two tokens with different out-of-scope prefixes get identical
+           in-scope bodies.
+      T-46 TestFlipRefusedWithHeldLeases -- a cas->realtime flip of a
+           region with an outstanding lease is refused 409 leases_held
+           (leases_held surfaced in the 428) until released (the ratified
+           REFUSE behaviour; the release-as-logged-effect alternative is
+           not chosen).
+      T-47 TestRealtimeToCasSnapshotHonorsBulkGuardAndCountInvariant (if
+           bulkguard) -- the snapshot commit IS measured by EXT-34 for the
+           confirm/disposition plumbing (net loss ~ 0 vs prior manifest
+           passes; the pin is created); AND, INDEPENDENT of ext-34, the
+           in-flip losslessness invariant (live-nodes-in ==
+           manifest-entries-out) is what actually catches a content-
+           dropping flip -- the test asserts a flip that drops live nodes
+           FAILS the count invariant even though ext-34 net loss vs an
+           (empty, for a born-realtime region) prior manifest is ~0
+           (finding F10).
+
+   11.6.  Interop and capability.
+      T-48 TestFsmodeNotAdvertisedWithoutCrdtfsAndHistory -- "fsmode"
+           requires "crdtfs" and "history"; a build lacking either does
+           not advertise fsmode and refuses a realtime flip.
+      T-49 TestCasSpaceByteIdenticalWithFsmodeAvailable -- a CAS-mode
+           space's manifest, commit, 409, history and bulk-guard
+           behaviour is byte-identical whether or not fsmode is
+           advertised.
+      T-50 TestMixedVersionClusterFlipIsDocumentedHazard -- a node
+           lacking the capabilities cannot apply fs.mode.set; a flip is
+           refused/undeclared on a mixed cluster; hazard record.
+
+   11.7.  Review-driven exploit-first tests (added 2026-09-12).
+      T-51 TestFlushFirstIsPrimaryLiveDocPath (exploit-first) -- a
+           realtime->cas flip of a region with a LIVE doc is REFUSED (409
+           live_docs_unflushed listing the doc) until the doc is flushed
+           to a blob; the flushed doc then crosses as a blob entry.  With
+           the fallback enabled, the doc is flattened AS OF THE FLIP'S LOG
+           POSITION and doc ops from that position onward are refused.
+           Naive (the memo's earlier primary): leader-flatten as the only
+           path, serialized at PROPOSE time, silently drops an edit
+           ordered after serialize but before the flip commits (F3/F4).
+      T-52 TestConcurrentDocEditDuringFlipNotLost (exploit-first) -- with
+           the flatten fallback, a doc op ordered between the leader's
+           serialize and the flip's commit is either INCLUDED (ordered
+           before the flip) or REFUSED wrong_fs_mode (ordered at/after);
+           it is NEVER accepted-then-frozen-out of the manifest (F4).
+      T-53 TestSnapshotNameMappingInjectiveAndTotal (exploit-first) -- a
+           live file literally named "<name>~<hex>" and a collision loser
+           materialized as "<name>~<nodeId>" both cross to DISTINCT
+           manifest paths (no overwrite); a live path that is illegal or
+           exceeds MaxPathLen REFUSES the whole flip (409
+           unrepresentable_path), region stays realtime, no partial
+           manifest.  Naive: the two collide (one file's bytes lost), or
+           an over-length path is dropped / wedges the flip (F7).
+      T-54 TestPreFlipCheckpointMandatoryAtCap -- a flip of a space at
+           max_checkpoints is REFUSED 409 checkpoint_cap_at_capacity (not
+           silently proceeding with the pre-flip pin omitted); after the
+           operator raises the cap or deletes a checkpoint, the flip
+           succeeds WITH the pin (F5).
+      T-55 TestConfirmCountReEvaluatedInApply (exploit-first) -- writes
+           race between the 428 and the confirmed apply so the echoed
+           `entries` no longer matches at the flip's log position; the
+           flip is REFUSED 428 fs_mode_confirm_mismatch IN APPLY with no
+           partial state.  Naive (edge-only check): the flip proceeds on a
+           stale count (a TOCTOU race).
+      T-56 TestFlipQuotaPathBulkFailureIsAtomicWholeFlip (exploit-first)
+           -- a realtime->cas flip that would overrun max_blob_bytes (507,
+           doc-flatten mints new blobs + retained bytes count), hit an
+           unrepresentable path, or a bulk refusal, aborts the ENTIRE flip
+           in apply; region stays realtime; no half-written manifest
+           version (F11).
+
+
+12. Open Questions
+
+   o  REVISED PER INDEPENDENT DESIGN REVIEW (2026-09-12) -- OWNER MUST
+      RE-CONFIRM.  Five items were CHANGED after review found them
+      unsound/inconsistent and are no longer the text first ratified:
+      (F1/F2) a realtime->cas flip now KEEPS the GC-pin on retained trash
+      and exposes a CAS-mode recovery surface (Sections 4.7.2, 4.7.4) --
+      this REVISITS the ratified "NO acp-1 amendment" decision: the memo
+      now DEPENDS on the REVISED EXT-28 amendment acp1-15-gc-realtime-tree
+      (presence-based, mode-independent), see below; (F3/F4) FLUSH-FIRST
+      is now the PRIMARY live-doc path with leader-flatten the fallback,
+      matching ratification (the memo had it backwards); (F6) v1 is
+      WHOLE-SPACE only and per-prefix is an unresolved design gap;
+      (F7) the tree->manifest name mapping is injective with a
+      refuse-on-unrepresentable-path rule; (F5) the pre-flip
+      auto-checkpoint is MANDATORY (refuse at cap).  See
+      REVIEW-FIXES-20260912.md.
+
+   o  THE LOSSLESS TRANSITION (for confirmation).  Sections 4.6-4.8
+      define cas->realtime seed and realtime->cas tree snapshot as one
+      atomic, deterministic, lossless command each, reusing EXT-33
+      records/auto-checkpoints/restore and pinning the pre-flip state.
+      The owner is asked to RATIFY this closure (the item the 2026-08-21
+      draft deferred), as REVISED per review.
+
+   o  DEFAULT + GRANULARITY (REVISED per F6).  CAS is the strict default
+      (recommended).  v1 is WHOLE-SPACE only; PER-PREFIX is an UNRESOLVED
+      DESIGN GAP (region-vs-whole-space manifest-version identity --
+      Section 4.4), NOT a fast-follow, and MUST be resolved before it is
+      built.  A whole-space-only daemon MUST reject a per-prefix flip PUT
+      with 400, never silently widen it.
+
+   o  LIVE-DOC path (DECIDED per ratification / F3).  FLUSH-FIRST is the
+      PRIMARY path: the flip requires the region's live docs be flushed
+      to blobs (else refused), and leader-flatten (serialized at the
+      flip's log position, result stamped) is the documented FALLBACK for
+      a doc still live at the flip (Sections 4.7.1(b), 4.11.2).  [ This
+      REVERSES the memo's earlier "leader-flatten primary"; owner
+      re-confirms it now matches the ratified "flush-first, flatten as
+      fallback." ]
+
+   o  HELD LEASES ON A cas->realtime FLIP (DECIDED per ratification).
+      REFUSE the flip with 409 leases_held until leases are released
+      (Section 5.4).  The "release as a logged effect" alternative is NOT
+      chosen (dropped, per ratification).
+
+   o  CONFIRM STRICTNESS (Section 4.3.1).  Exact-count echo, re-evaluated
+      IN APPLY (finding F9); an implementation MAY additionally require a
+      typed region name.  (Recommendation: count echo required; typed
+      name optional.)
+
+   o  REALTIME BULK GUARD ON THE SNAPSHOT COMMIT (Section 5.5, corrected
+      per F10).  The snapshot commit IS EXT-34-measured where bulkguard
+      is present (the ratified "IS," not "SHOULD"), for the
+      confirm/disposition plumbing; but the guard against a CONTENT-
+      DROPPING flip is the in-flip losslessness/entry-count invariant
+      (T-31), NOT ext-34 net loss (which is ~0 vs an empty prior manifest
+      for a born-realtime region).
+
+   o  THE REACHABILITY AMENDMENT (Section 4.8.4, REVISED per F1 -- owner
+      RE-CONFIRMS).  The original "NO acp-1 amendment needed (union of the
+      two existing §15 rules)" was FALSIFIED by the review: as worded,
+      acp1-15-gc-realtime-tree excluded CAS-mode regions, so a
+      realtime->cas flip unpinned the retained trash's blobs.  The fix
+      REVISES acp1-15-gc-realtime-tree (EXT-28 §4.9) to be presence-based
+      and mode-independent, and this memo now DEPENDS on that revision
+      rather than proposing no amendment.  The owner must re-confirm this
+      change to the ratified decision.
+
+
+Appendix A.  New and Changed Data Types
+
+   SpaceConfig (per space, replicated admin state):
+      { "fs_mode": "cas" | "realtime",              ; default "cas"
+        "prefixes": { <pathPrefix>: "cas"|"realtime" }? }
+   Replicated command:
+      fs.mode.set { "region": <prefix or "/">,
+                    "mode": "cas"|"realtime",
+                    "now": <rfc3339>,                ; leader-stamped
+                    "confirm": { region, from, to, entries },
+                    "seed"?:     <deterministic node ids/placements>,  ; cas->realtime
+                    "snapshot"?: { version, entries:[{path,hash,size}],
+                                   empty_dirs:[<path>] } ; realtime->cas
+                    "checkpoint": <auto/fsmode-...-v<V>> }  ; MANDATORY pin
+   Recovery (CAS-mode surface for pre-flip trash, Section 4.7.4):
+      GET  /v1/fs/trash?checkpoint=<auto/fsmode-realtime-to-cas-v<V1>>
+      POST /v1/fs/trash/restore { node_id, checkpoint }  ; forward commit
+   Event:
+      fs.mode.changed { before:{mode}, after:{mode}, region, at, actor,
+                        from_version?, to_version?, checkpoint }
+   Error:
+      409 wrong_fs_mode { region, mode }             ; write to non-matching surface
+      428 fs_mode_confirm_required { region, from, to, entries,
+                                     trashed?, from_version?, leases_held }
+      428 fs_mode_confirm_mismatch                   ; also re-checked IN APPLY (F9)
+      409 leases_held { count }                      ; cas->realtime with leases
+      409 live_docs_unflushed { paths }              ; realtime->cas, flush-first (F3)
+      409 unrepresentable_path { paths }             ; illegal/over-length path (F7)
+      409 checkpoint_cap_at_capacity                 ; mandatory pre-flip pin (F5)
+      400 per_prefix_unsupported                     ; whole-space-only v1 (F6)
+   stats "fsmode" block:
+      { per-region mode, last_flip:{region, from, to, version, at}? }
+   (Retention/recovery types are EXT-33's, REUSED; the realtime
+   structure is EXT-28's TreeDoc, SELECTED.)
+
+
+Appendix B.  Worked Examples (the lossless round trip)
+
+   B.1.  Flip a CAS project to realtime (seed).  Space S is CAS at
+      version V0 with docs/a.md (hash Ha) and src/b.go (hash Hb).  Admin
+      PUT fs_mode=realtime -> 428 { entries: 2, from_version: V0 }.  Admin
+      re-PUTs with confirm echoed.  fs.mode.set seeds: folders docs, src
+      under ROOT; file nodes a.md -> {blob:Ha}, b.go -> {blob:Hb}; ids
+      from (leader stamp, canonical order); auto/fsmode-cas-to-realtime-
+      v<V0> pins V0.  GET /v1/fs/tree on every replica shows the two
+      files; no blob re-uploaded; V0 still readable via the checkpoint.
+
+   B.2.  Flip a realtime workspace to CAS (tree snapshot).  Space S is
+      realtime with a blob file x.md (Hx), a live-doc file plan.md, and
+      two concurrently-created notes.md (winner + loser
+      notes.md~<nodeId>).  Admin flips to cas.  FLUSH-FIRST (primary):
+      the 428 pre-flight reports plan.md as unflushed; the client flushes
+      it to a blob Hp; the admin re-PUTs with confirm echoed.  fs.mode.set
+      materializes the live tree: x.md -> {Hx}; plan.md -> {Hp} (now a
+      blob); notes.md -> {winner hash}; notes.md~<nodeId> -> {loser hash}
+      at its INJECTIVE disambiguated path; produces manifest V1 with 4
+      entries; the MANDATORY auto/fsmode-realtime-to-cas-v<V1> pins V1
+      (the flip is refused if the space is at max_checkpoints).  A file
+      trashed yesterday stays recoverable -- its blob stays GC-pinned by
+      the revised presence-based amendment, and it is listable/restorable
+      through GET /v1/fs/trash?checkpoint=... / POST /v1/fs/trash/restore
+      (Section 4.7.4) for its remaining window.  (Had plan.md NOT been
+      flushed and the fallback been enabled, the leader would flatten it
+      AS OF THE FLIP'S LOG POSITION and refuse doc ops from there on.)
+      Nothing dropped, nothing merged.
+
+   B.3.  Lossless round trip (the guarantee).  From B.1, immediately flip
+      the realtime space back to CAS: the tree snapshot reproduces a
+      manifest whose entry set (docs/a.md->Ha, src/b.go->Hb) equals V0's
+      exactly (Section 11, T-32).  No file changed identity or bytes
+      crossing the road twice.
+
+   B.4.  Wrong surface (no shadow state).  A stale client POSTs
+      /v1/commit to space S after B.1 flipped it to realtime -> 409
+      wrong_fs_mode { mode:"realtime" }; no manifest is written; the
+      client re-reads GET /v1/space/config and switches to POST
+      /v1/fs/ops.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .  It is customer-sourced,
+   supersedes the EXT-31 draft of
+   2026-08-21, discharges EXT-28 Section 8.4, and composes EXT-28, EXT-33,
+   EXT-34, EXT-27, EXT-7, ACP/1 Section 10, the CRDT file path, and the
+   virtual-FS facade.

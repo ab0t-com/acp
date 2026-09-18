@@ -1,0 +1,1413 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-28                                     ab0t.com
+Updates: ACP/1                                                September 2026
+Category: Extension Proposal                                       ISSN: n/a
+Supersedes: the EXT-28 draft of 2026-08-21
+
+
+        ACP Extension Proposal 28: CRDT Directory Tree
+     -- An Opt-In, Conflict-Free Directory Structure Whose Deletes
+        Are Bounded, Pinned, and Recoverable (the "no more 409 /
+                        just works" keystone)
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies the CRDT DIRECTORY TREE:
+   an OPTIONAL, per-space, opt-in mode in which the directory structure
+   -- the mapping of names to files and sub-folders -- is a structured
+   Conflict-free Replicated Data Type instead of the compare-and-swap
+   (CAS) manifest of ACP/1 Section 11.  File placement, creation,
+   rename, move, and delete become commutative, leader-stamped
+   operations that CONVERGE without a version conflict: concurrent
+   create/rename/move/restructure by many workers land with NO 409 and
+   NO client pull+diff3+retry loop.
+
+   This memo SUPERSEDES the EXT-28 draft of 2026-08-21.  The earlier
+   draft modeled folders as bare Observed-Remove Maps and left the
+   garbage-collection of removed-node tombstones as an OPEN QUESTION.
+   That question is the item the roadmap flags "close the GC bound
+   first" and is a RATIFICATION PREREQUISITE.  This revision CLOSES it
+   in the specification (Section 4.4): (1) the tree does not accumulate
+   per-name Observed-Remove tombstones, because convergence here rests
+   on ACP's single leader-stamped total-order log and its snapshot, not
+   on peer-to-peer anti-entropy; (2) a DELETE is modeled as a move of
+   the node to a reserved TRASH root (composing with EXT-14's move),
+   so a deleted node is a first-class RETAINED node, recoverable within
+   the history window, not an unbounded tombstone; and (3) trashed
+   nodes and the blobs they hold are retained, GC-pinned, and reclaimed
+   by exactly the EXT-33 retention machinery -- a leader-driven,
+   deterministic, replicated prune -- so trash is HARD-BOUNDED, deleted
+   bytes are RECOVERABLE for the retention window, and a pruned node is
+   never resurrected.
+
+   HONESTY UP FRONT (normative).  The CRDT directory tree is an OPT-IN
+   MODE, NOT a replacement for the CAS manifest.  The CAS manifest gives
+   a LINEAR, TOTALLY-ORDERED, AUDITABLE version history -- every change
+   is a named commit at a monotonic version, and the event log, audit,
+   provenance (EXT-18), manifest history (EXT-33), and the bulk-change
+   guard (EXT-34) all lean on that total order and on there being a
+   single atomic COMMIT to measure.  A CRDT tree trades that linear
+   history for convergence.  Some customers NEED the linear audit and
+   the commit-time bulk guard; therefore both modes MUST coexist,
+   selected per space (EXT-31 is the toggle).  CAS is the DEFAULT and
+   the auditable path.  This memo specifies the realtime half and
+   weakens nothing in CAS.
+
+   The feature is negotiated by the capability string "crdtfs".  Nothing
+   changes the wire version "acp/1": additive endpoints and fields,
+   gated by capability; a peer without it, and any space left in CAS
+   mode, interoperates unchanged.
+
+Status of This Memo
+
+   This is an EXTENSION PROPOSAL published for review (Request For
+   Comment).  It SUPERSEDES the EXT-28 draft of 2026-08-21 (same
+   provisional number).  It is CUSTOMER-SOURCED (the single most
+   compelling idea in a customer-suggestions review).  The reference
+   implementation SHIPS this extension and advertises the capability
+   string "crdtfs"; realtime spaces are opt-in.  The extension number
+   EXT-28 is PROVISIONAL and its ACP/1 amendment (below) is NOT yet
+   finally ratified — it is normative only when the protocol owner
+   ratifies; the memo is published now for review.
+
+   It builds on the ACCEPTED+IMPLEMENTED EXT-5 (structured JSON CRDT,
+   leader-stamped LWW, deterministic materialization) and EXT-14
+   (identity-preserving "mv", the stamp-ordered validity pass, the
+   stays-put cycle rule), and on the IMPLEMENTED EXT-33 (manifest
+   history, retention, GC-pin, restore-as-a-commit) whose retention and
+   reachability machinery it REUSES for the tree's trash.  It is the
+   realtime structure that EXT-31 (filesystem-mode negotiation) selects,
+   and it records the realtime gap that EXT-34 (bulk-change guard)
+   leaves and how it is covered (Section 5.7).  It proposes ONE dated,
+   unsigned amendment to ACP/1 Section 15 (garbage-collection
+   reachability for a realtime space), written with markers per the
+   RFC/EXT amendment SOP and NORMATIVE ONLY WHEN THE OWNER RATIFIES.
+   The base protocol version string remains "acp/1".  Distribution is
+   unlimited.
+
+   Published 2026-09-12 (draft, superseding 2026-08-21).
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Motivation -- the CAS-retry loop, and the bound the first draft left open
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Design
+       4.1.  Capability and mode selection (opt-in; CAS unchanged)
+       4.2.  The CRDT model: nodes, placements, and the trash
+       4.3.  Why this model (add-wins existence, remove-wins deletion)
+       4.4.  The tombstone / GC bound -- the closure (ratification prerequisite)
+       4.5.  Files under the tree
+       4.6.  Data model and data-model delta
+       4.7.  Wire API additions
+       4.8.  Section 17 determinism and the snapshot format
+       4.9.  Amendment to ACP/1 Section 15 (reachability for a realtime space)
+   5.  Interaction with Other Extensions
+   6.  The space stays the only hard boundary
+   7.  Value
+   8.  Capability Negotiation, Rollout and Migration
+   9.  Wire API Summary
+   10. Security Considerations
+   11. Test Specification (the merge bar for an implementation)
+   12. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  Worked Examples
+   Authors' Addresses
+
+
+1.  Motivation -- the CAS-retry loop, and the bound the first draft
+    left open
+
+   1.1.  The manifest is compare-and-swap.
+
+      ACP/1 Section 11 makes the manifest a content-addressed map from
+      path to blob hash, mutated by POST /v1/commit under a monotonic
+      base_version CAS: a commit carries the version it believes is
+      current, and the authority rejects it (409) if the manifest has
+      moved on.  This gives a clean, auditable, totally-ordered history
+      -- version 57, then 58, then 59 -- which the event log, the audit
+      and provenance story (EXT-18), manifest history (EXT-33) and the
+      bulk-change guard (EXT-34) all depend on.  It is exactly right for
+      the "git-like, explicit, reviewable" posture ACP was designed
+      around, and it stays the default.
+
+   1.2.  But concurrency on DIFFERENT files still conflicts.
+
+      The CAS is over the WHOLE manifest version, not per-path.  Two
+      workers that touch entirely DIFFERENT files -- one writes
+      docs/a.md, the other src/b.go -- still race on the single
+      base_version: whoever commits second sees a 409, must pull the new
+      manifest, rebase (diff3), and retry.  Under a handful of workers
+      this is fine; under MANY concurrent workers the CAS-retry loop
+      dominates -- each retry is a fresh pull, a re-merge, and another
+      race, and a hot directory can livelock a worker behind faster
+      peers.  The customer review recorded this as the top DX/perf
+      friction: an agent has to THINK about push/pull/version conflicts
+      instead of the writes just working.
+
+   1.3.  The structural fix: make the tree converge, not conflict.
+
+      Structure -- who lives where, what is named what, what moved -- is
+      exactly the kind of state a CRDT resolves without a conflict.  If
+      the tree is a set of identity-bearing nodes each with a converging
+      placement, then "create docs/a.md" and "create src/b.go" are
+      operations on disjoint state that commute: both land, in any order,
+      on any replica, with no version to race.  Rename and move reuse
+      EXT-14's identity-preserving "mv".  The result is the "just works"
+      experience for filesystem STRUCTURE (EXT-31 is the toggle).
+
+   1.4.  The bound the first draft left open (this revision's subject).
+
+      The 2026-08-21 draft modeled each folder as a bare Observed-Remove
+      Map (name -> node id) and listed, under Open Questions, "garbage
+      collection of node ids: removed nodes leave observed-remove
+      tombstones; confirm no new unbounded-growth surface."  That is not
+      a footnote for a system whose ONE promise is that your data is
+      safe.  A directory CRDT can fail two ways at once: (a) it can grow
+      WITHOUT BOUND, retaining a tombstone for every name ever deleted so
+      that convergence is preserved; and (b) it can lose the safety
+      guarantees the CAS path just earned in EXT-33/EXT-34 -- a deleted
+      file's bytes must stay RECOVERABLE for the retention window, and a
+      pruned node must never RESURRECT.  A structure that solves (a) by
+      hard-deleting tombstones can reintroduce the mass-delete-permanent
+      class (data-loss finding F-1); a structure that solves it by never
+      deleting them grows forever.  The roadmap therefore makes "close
+      the GC bound first" a ratification prerequisite.  Section 4.4 is
+      that closure, and it is the reason this memo supersedes the draft
+      rather than merely extending it.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the definitions of ACP/1 (manifest, path, commit,
+   base_version, blob, content hash, event, space, role, replicated
+   command, snapshot), EXT-5 (the structured JSON CRDT, leader-stamped
+   LWW, OR-Set/OR-Map semantics, deterministic sorted-key
+   materialization, the epoch barrier), EXT-14 (identity-preserving
+   "mv", node identity, the stamp-ordered validity pass, VALID/INVALID
+   placement, the stays-put rule, "delete beats a concurrent move to a
+   deleted target"), EXT-27 (read_prefix, read scope, no-oracle) and
+   EXT-33 (version record, retention policy, history_ttl,
+   history_min_versions, max_history_bytes, GC-pin, checkpoint,
+   restore-as-a-commit, the leader-driven prune command) without
+   restating them.
+
+   CRDT DIRECTORY TREE (the TREE):  The per-space structure of Section
+      4.2: a set of identity-bearing NODES, each with a converging
+      PLACEMENT, rooted at a reserved ROOT node, with a reserved TRASH
+      node holding deleted subtrees.
+
+   NODE:  A folder or a file, carrying a stable NODE ID (EXT-14
+      identity) independent of its current name and position.  A folder
+      is an interior node; a file is a leaf carrying a CONTENT reference
+      (Section 4.5).
+
+   PLACEMENT:  A leader-stamped assertion that a node is a child of a
+      given parent under a given name: the triple (nodeId, parentId,
+      name).  Rename, move, create and delete are all placements of a
+      node id (EXT-14).  A node has exactly one EFFECTIVE placement at
+      any materialized state -- the greatest-stamped VALID one.
+
+   ROOT:  The reserved node id that is the tree's top; it has no parent
+      and cannot be moved, deleted, or renamed.
+
+   TRASH:  The reserved node id under which deleted subtrees are
+      parented.  A node whose effective placement is under TRASH is a
+      TRASHED NODE; it is not part of the live path->content view but is
+      RETAINED (Section 4.4.2) and RECOVERABLE (Section 5.6) for the
+      space's history window.
+
+   LIVE NODE:  A node reachable from ROOT by effective placements
+      without passing through TRASH.  The materialized filesystem is the
+      set of live nodes.
+
+   REALTIME MODE:  A space (or path region) whose structure is the CRDT
+      directory tree of this memo, selected by EXT-31.  CAS MODE is the
+      ACP/1 Section 11 manifest; the two are mutually exclusive for a
+      given path region (Section 4.1).
+
+   RETENTION WINDOW:  The EXT-33 policy (history_ttl_sec,
+      history_min_versions, max_history_bytes) that governs how long a
+      trashed node and its blobs are kept before eviction (Section 4.4).
+
+   fs.prune {now}:  The leader-driven replicated command that evicts
+      trashed nodes past the retention window (Section 4.4.4), the tree
+      analogue of EXT-33's history.prune.
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Converge, never conflict, for STRUCTURE.  Every structural
+      mutation is a commutative, leader-stamped CRDT operation; no
+      structural operation returns 409.  Content (file bytes) converges
+      by the existing file paths or is a pinned blob (Section 4.5).
+
+   3.2.  Delete is recoverable, not erasure.  A delete moves the node to
+      TRASH.  The bytes are kept, GC-pinned, and reclaimed only by the
+      deterministic prune after the retention window.  This is the same
+      "trash, not erased" guarantee EXT-33 gives the CAS manifest; the
+      realtime mode does not get a weaker data-safety story than the
+      default mode.
+
+   3.3.  The tombstone bound is a first-class requirement, not an open
+      question.  The tree MUST NOT accumulate unbounded per-name
+      tombstones, and MUST NOT purchase that bound by making a delete
+      unrecoverable.  Section 4.4 discharges both, and Section 11's
+      exploit-first tests are the merge bar.
+
+   3.4.  Nothing vanishes and nothing duplicates.  A concurrent create,
+      a merge-induced name collision, and a merge-induced cycle each
+      resolve DETERMINISTICALLY to a state in which every created node
+      still exists exactly once (EXT-14's principle, extended to
+      creation and naming; Sections 4.2.4, 4.2.6).
+
+   3.5.  Deterministic and replicated (ACP/1 Section 17).  Every
+      operation is leader-stamped on ingress; materialization is a pure
+      function of the replicated op set and the snapshot; the eviction
+      set is a pure function of (now-in-command, policy, replicated
+      state).  No wall-clock, no node-local state, no I/O in the apply
+      path (Section 4.8).
+
+   3.6.  CAS is the default and is never weakened.  Realtime mode exists
+      only for spaces (or regions) EXT-31 has explicitly selected;
+      everything else is byte-identical to ACP/1 today (Section 4.1).
+
+   3.7.  Non-goals.  This memo does NOT: provide a linear, totally-
+      ordered version history for a realtime region (that is CAS +
+      EXT-33; a realtime region cannot be a source for EXT-18 total-
+      order attestation or EXT-30/EXT-33 version pinning of the WHOLE
+      tree -- Section 5); define per-file content merge (that is the
+      text/JSON CRDT path, reused as-is); define mode MIGRATION between
+      CAS and realtime (deferred to EXT-31); or specify the client
+      virtual-FS facade (a separate client epic).  It composes them.
+
+
+4.  Design
+
+   4.1.  Capability and mode selection (opt-in; CAS unchanged).
+
+      The capability string "crdtfs", advertised on GET /v1/healthz and
+      /v1/stats (EXT-1 Section 7 convention), asserts ALL of Sections
+      4.2 through 4.9.  An authority MUST NOT advertise "crdtfs" unless
+      every one of them is enforced, and MUST NOT advertise it unless it
+      also advertises EXT-33's "history" -- the trash retention, GC-pin
+      and prune of Section 4.4 ARE the EXT-33 machinery, and a realtime
+      mode whose deletes are not recoverable is not this feature.
+
+      A space is placed in realtime mode ONLY by explicit selection
+      (EXT-31).  ABSENT that selection a space is in CAS mode and behaves
+      EXACTLY as ACP/1 Section 11 today -- byte-identical manifest,
+      byte-identical commit semantics, byte-identical 409s, byte-
+      identical EXT-33 history and EXT-34 guard.  A daemon MAY advertise
+      "crdtfs" and still run every space in CAS mode; the capability
+      advertises the AVAILABILITY of the mode, not that any space uses
+      it.  This memo NEVER changes CAS behaviour.
+
+   4.2.  The CRDT model: nodes, placements, and the trash.
+
+      4.2.1.  Nodes are an add-wins set keyed by node id.  A CREATE
+         introduces a new node id (EXT-14 identity) into the space's
+         node set.  The node set is an add-wins Observed-Remove Set
+         (EXT-5) keyed by node id: creating a node is monotone and
+         commutative, and -- critically -- a node, once created, is
+         never removed from the set by any concurrent operation.
+         "Deleting a file" does NOT remove its node from the set; it
+         changes the node's PLACEMENT (Section 4.2.3).  Because a node
+         id is minted fresh per create (leader-stamped, globally unique
+         within the space), two concurrent creates mint two DIFFERENT
+         node ids and both nodes exist; there is no add/add conflict on
+         a node id, and therefore no per-node-id tombstone is ever
+         required (Section 4.4.1).  Node-id allocation is MONOTONIC and an
+         id, once used, is NEVER re-minted -- not even after its node is
+         evicted (Section 4.4.4).  This is a spec INVARIANT on which BOTH
+         the no-tombstone closure (Section 4.4.1) and the no-resurrection
+         guarantee (Section 4.4.5) depend, and it is tested (Section 11,
+         T-08).
+
+      4.2.2.  Placement is an EXT-14 leader-stamped move register.  Each
+         node has a PLACEMENT: the triple (nodeId, parentId, name).  A
+         node's placement is a last-writer-wins register whose writer
+         order is the EXT-14 leader-stamp.  CREATE writes the node's
+         first placement; RENAME writes a placement with the same parent
+         and a new name; MOVE writes a placement with a new parent.  All
+         are EXT-14 "mv" operations on one node id, so identity, per-node
+         content and per-node history survive every rename and move.
+         The effective placement at a materialized state is the
+         greatest-stamped placement that is VALID under EXT-14's
+         stamp-ordered validity pass (Section 4.2.6).
+
+      4.2.3.  Delete is a move to TRASH, made STICKY (remove-wins,
+         recoverable).  A DELETE of a node writes a placement whose
+         parent is the reserved TRASH node, leader-stamped like any move,
+         AND records the op as a distinct DELETE op kind (Section 4.2.5)
+         carrying the node's pre-trash ORIGIN (Section 4.6).  The node
+         and its entire subtree leave the live view (a subtree under a
+         trashed folder is trashed with it).  Modeling delete as a move
+         to TRASH -- rather than as an Observed-Remove of a name key --
+         is the pivot of this revision: it composes with EXT-14 (a delete
+         rides the same placement register, so cycles, stays-put and
+         identity apply to the LIVE location) and it makes a deleted node
+         a RETAINED, first-class node (Section 4.4.2) rather than a
+         tombstone.
+
+         Remove-wins is NOT a plain last-writer-wins tie-break and is NOT
+         "inherited unchanged" from EXT-14.  EXT-14's own concurrent
+         delete-vs-move rule is ADD-WINS (a node moved concurrently with
+         a delete SURVIVES at its new location) -- the OPPOSITE of what a
+         recoverable-delete filesystem needs.  This memo therefore
+         defines a NEW arbitration rule: the TRASH placement is STICKY
+         (Section 4.2.6).  Once a node's effective state is TRASHED at
+         stamp s (a DELETE placement under TRASH), a later ordinary
+         placement (MOVE or RENAME) at stamp > s is INVALID and does NOT
+         lift the node out of TRASH; ONLY a distinct RESTORE op (Section
+         4.2.5), which the arbitration recognizes as a separate op kind,
+         may return a still-RETAINED node to a live parent.  Consequently
+         a concurrent DELETE-vs-live-MOVE of the SAME node converges to
+         the node TRASHED on every replica, in EITHER stamp order
+         (remove-wins), and a delete is never silently reverted by a
+         peer's concurrent move -- neither a move OF the node nor a move
+         INTO the deleted subtree (Section 4.3; exploit-first test
+         T-03a).
+
+      4.2.4.  Name collisions resolve deterministically; nothing is
+         dropped.  Two live nodes may, after a merge, hold placements
+         with the SAME (parentId, name) -- e.g. two workers each create
+         "notes.md" in the same folder.  Both nodes EXIST (Section
+         4.2.1); the collision is resolved at MATERIALIZATION, not by
+         discarding a placement: the greatest-stamped placement holds the
+         exact name; every other colliding node is surfaced under a
+         DETERMINISTIC disambiguated name derived purely from replicated
+         state.  The disambiguation form is "<name>~<nodeId>" using the
+         FULL node id (NOT a truncated/"short" id -- a truncated id is
+         not injective: two colliding-name nodes whose short ids also
+         collide would produce the SAME path, i.e. two live nodes at one
+         materialized path).  Node ids are globally unique within the
+         space and never re-used (Section 4.2.1), so the full-id suffix
+         is unique per node; and to stay injective against a REAL file
+         whose literal name already looks like the suffix (e.g. one
+         literally named "notes.md~<id>"), materialization ESCAPES a
+         literal "~" in a real name (a real "~" is doubled to "~~"), so a
+         single unescaped "~<nodeId>" tail in a materialized segment
+         appears ONLY on a generated disambiguation and the encoding is
+         REVERSIBLE.  This is the same injective, reversible tree-name ->
+         manifest-path encoding a realtime->cas flip relies on so that no
+         two manifest entries collide (EXT-31 finding F7).  A
+         client MAY rename the loser to a name of its choice with an
+         ordinary RENAME; until it does, no create is lost and no two
+         nodes are merged.  (This is EXT-5/EXT-14's "nothing vanishes,
+         nothing duplicates" applied to naming.)
+
+      4.2.5.  Operations.  All structural mutation is expressed as
+         EXT-5/EXT-14 CRDT operations on the space's TreeDoc, pushed
+         through POST /v1/fs/ops (Section 4.7):
+
+            o  CREATE  (parentId, name, content) -- mint a node id, add
+               it to the node set, write its first placement, and set
+               its content reference (Section 4.5).
+            o  RENAME  (nodeId, name) -- an EXT-14 placement with the
+               same parent.
+            o  MOVE    (nodeId, newParentId, name) -- an EXT-14 placement
+               with a new parent.
+            o  DELETE  (nodeId) -- a leader-stamped placement under
+               TRASH, carrying a distinct DELETE op kind (Section 4.2.3)
+               and recording the node's pre-trash ORIGIN (its parentId
+               and name at the delete, Section 4.6) for scoped listing
+               and restore.
+            o  RESTORE (nodeId, parentId, name) -- a leader-stamped
+               placement of a trashed node back under a live parent,
+               carrying a distinct RESTORE op kind the arbitration
+               recognizes as SEPARATE from a MOVE (Section 4.2.6),
+               permitted only while the node is still RETAINED (Section
+               4.4.2); a restore of an evicted node id is a no-op
+               (Section 4.4.5).
+
+         The op KIND (create/rename/move/delete/restore) is part of the
+         leader-stamped, replicated op, so every replica arbitrates the
+         same kinds in the same total order.  Operations to DISJOINT node
+         ids commute and both land; operations to the SAME node id
+         resolve deterministically by the Section 4.2.6 validity pass
+         (EXT-14 stamp order for the LIVE location, PLUS the sticky-TRASH
+         rule for delete/restore), with NO 409 returned to any client.
+
+      4.2.6.  Move, cycles, stays-put (EXT-14), and the sticky-TRASH
+         rule (NEW).  Two independently legal moves can merge into an
+         illegal state -- a parent cycle A under B under A.  This memo
+         inherits EXT-14's resolution UNCHANGED for the LIVE location:
+         cycles are resolved by the deterministic STAMP-ORDERED VALIDITY
+         PASS at materialization; a placement that would create a cycle
+         is INVALID and is ignored, and the node STAYS PUT at its
+         greatest-stamped valid placement.  ROOT and TRASH are never
+         valid children of any node.
+
+         On TOP of that live-location pass, a node's TRASHED-ness is
+         decided by a deterministic rule the arbitration applies FIRST,
+         over that node's DELETE and RESTORE placements ONLY:
+
+            let d = the greatest-stamped DELETE placement of the node
+                    (parent TRASH), if any;
+            let r = the greatest-stamped RESTORE placement of the node,
+                    if any;
+            the node is TRASHED iff d exists and (r does not exist OR
+            stamp(r) < stamp(d)); otherwise it is LIVE.
+
+         If the node is TRASHED, its effective placement is (TRASH, the
+         name recorded at d) and every ordinary MOVE/RENAME placement is
+         IGNORED -- the TRASH placement is STICKY, so a MOVE stamped
+         AFTER the delete does NOT resurrect the node (remove-wins).  If
+         the node is LIVE, its parent/name is the greatest-stamped VALID
+         CREATE/RENAME/MOVE/RESTORE placement under the EXT-14 pass
+         above; DELETE placements contribute only trashed-ness, never a
+         live location.  A subtree under a trashed folder is trashed with
+         it by REACHABILITY (it is not reachable from ROOT without passing
+         through TRASH), independent of this per-node rule.  This rule is
+         a pure function of replicated state and is identical on every
+         replica; it is the ONE arbitration EXT-28 adds beyond EXT-14, and
+         no new cycle machinery is introduced.
+
+   4.3.  Why this model (add-wins existence, remove-wins deletion).
+
+      The classic CRDT question "add-wins or remove-wins" is answered
+      SEPARATELY for the two things a directory tracks, and the split is
+      the point:
+
+      o  NODE EXISTENCE is ADD-WINS.  A node, once created, is never
+         removed by a concurrent operation (Section 4.2.1).  Rationale:
+         creating content is never destructive (the same principle
+         EXT-34 Section 4.2.3 states for the CAS path); an agent's
+         freshly-created file must not vanish because a peer concurrently
+         reorganized the folder.  Add-wins existence is what guarantees
+         "nothing vanishes."
+
+      o  NODE DELETION is REMOVE-WINS, via the STICKY move-to-TRASH rule
+         (Section 4.2.6).  A DELETE beats a concurrent MOVE or RENAME of
+         the same node, and a subtree under a trashed folder is trashed
+         with it.  Rationale: "delete means delete" is the safe default
+         -- a delete must not be silently un-done by a peer's concurrent
+         edit or move, which would be a RESURRECTION (a data-integrity
+         surprise, and a confidentiality/compliance surprise if the
+         delete was a redaction).  Remove-wins here is a NEW arbitration
+         rule this memo defines (Section 4.2.6), NOT a tie-break inherited
+         from EXT-14 -- EXT-14's own concurrent delete-vs-move rule is
+         add-wins (the moved node survives), so the sticky-TRASH rule is
+         precisely the piece EXT-28 adds to make deletion win while
+         keeping the loser recoverable.
+
+      The two choices appear to pull opposite ways ("don't lose a
+      create" vs "make a delete stick") and are reconciled by the trash:
+      because remove-wins here means "moved to RECOVERABLE trash" and not
+      "bytes erased," making deletion win costs NOTHING in durability --
+      the loser of a delete-vs-move race can be restored by name within
+      the window (Section 5.6).  A pure add-wins tree would risk
+      resurrection; a pure remove-wins tree (a two-phase set) would lose
+      creates AND accumulate remove-tombstones forever.  The hybrid
+      -- add-wins existence, remove-wins placement-into-trash, bounded
+      recoverable trash -- is the only combination that satisfies all
+      four lenses (see the companion discussion.md).
+
+   4.4.  The tombstone / GC bound -- the closure (ratification
+         prerequisite).
+
+      This section discharges the requirement the roadmap states as
+      "close the GC bound first."  It has two independent unbounded-
+      growth surfaces to bound (CRDT metadata, and retained bytes) and
+      one integrity invariant to hold (no resurrection).
+
+      4.4.1.  No unbounded Observed-Remove tombstones.  Classic OR-Set /
+         OR-Map convergence retains a tombstone for every removed element
+         so that a replica which has NOT YET SEEN the remove, and which
+         re-gossips the add via anti-entropy, is told "this was removed,
+         do not resurrect."  ACP is NOT such a system.  Every operation
+         is LEADER-STAMPED and appended to a SINGLE TOTAL-ORDER log
+         (ACP/1 Section 8, Section 14), and every replica APPLIES that
+         log in the identical order or bootstraps from a SNAPSHOT of the
+         materialized state (Section 4.8).  There is no peer-to-peer
+         anti-entropy path by which a stale ADD can arrive after a
+         REMOVE out of causal order.  Consequently the tree needs NO
+         per-name and NO per-node-id resurrection tombstone: (a) node
+         ids are minted fresh and, by the monotonic-allocation invariant
+         (Section 4.2.1), never re-used even after eviction, so there is
+         never an add/add that a tombstone would have to arbitrate; (b) a
+         superseded placement is simply an older log entry, and old log
+         entries are bounded by the EXISTING EXT-5 / ACP/1 Section 12.5
+         epoch-barrier compaction -- the same bound the shipped JSON CRDT
+         already lives under, introducing no new metadata-growth surface.
+         The materialized state a snapshot carries is O(live nodes +
+         retained trashed nodes), not O(all names ever used).
+
+      4.4.2.  Trashed-node retention (composes with EXT-33).  A trashed
+         node carries the leader-stamped time of its DELETE placement as
+         its `trashed_at`.  Eviction -- removing a trashed node from
+         replicated state -- happens ONLY inside the replicated fs.prune
+         command (Section 4.4.4).  fs.prune evicts a trashed node when
+         the EXT-33 retention policy would no longer retain a version of
+         that age; equivalently, a trashed node is EVICTABLE by prune
+         when NONE of the following holds:
+
+            (now - trashed_at <= history_ttl_sec)
+            OR (it is among the newest history_min_versions trashed
+                nodes by trashed_at)
+            OR (it is pinned by a checkpoint, Section 5.5).
+
+         Until fs.prune evicts it, a trashed node is RETAINED -- present
+         in replicated state -- and this PRESENCE, NOT a re-read of its
+         age, is what GC reachability keys on (Section 4.4.3, the §15.2
+         amendment): "retained" means "the retention policy has not
+         evicted it," verbatim-parallel to the ratified EXT-33 twin
+         acp1-15-gc-retained-history §15.1(b).  The retention predicate
+         above is evaluated ONLY at prune time, from the leader-stamped
+         `now` carried in the prune command, never inside a GC sweep and
+         never from a follower clock (Section 4.4.4).
+
+         This is deliberately the SAME policy object EXT-33 defines
+         (history_ttl_sec 30 d, history_min_versions 100,
+         max_history_bytes unbounded, all per-space, replicated via
+         quota.set) -- one retention story for the whole filesystem, CAS
+         or realtime, so an operator tunes ONE set of knobs and a
+         customer hears ONE promise ("your deletes are recoverable for
+         30 days").  The promise is phrased in TIME (the 30-day window);
+         note that history_min_versions counts DIFFERENT units per mode
+         -- newest trashed NODES in realtime, manifest version RECORDS in
+         CAS (Section 4.4.6) -- so an operator relying on the COUNT rather
+         than the window should read it per mode.
+
+      4.4.3.  The GC-pin: reachability widened.  Blob GC (ACP/1 Section
+         15) for a realtime-mode space MUST treat a blob as reachable if
+         it is referenced by (a) any LIVE node, OR (b) any RETAINED
+         trashed node (a trashed node the retention policy has NOT
+         evicted -- i.e. still PRESENT in replicated state; eviction is
+         solely via fs.prune, Section 4.4.4), OR (c) any node pinned by a
+         live checkpoint.  A blob reachable under (a), (b) or (c) MUST NOT
+         be reclaimed; the grace window (grace_sec) continues to apply to
+         unreachable blobs exactly as before.  Reachability is a pure
+         function of PRESENCE in replicated state -- never a re-read of a
+         node's age and never a clock -- and the eviction of a trashed
+         node (which can make a blob unreachable) is itself a replicated,
+         leader-driven command (Section 4.4.4) and MUST NOT be performed
+         inside the GC sweep.  This is the natural extension of EXT-33's
+         GC-pin from "current manifest union retained version records" to
+         "live tree union retained trash," verbatim-parallel to
+         acp1-15-gc-retained-history, and it is written as a dated
+         amendment to Section 15 in Section 4.9.
+
+      4.4.4.  fs.prune {now}: deterministic, leader-driven eviction.
+         Trashed nodes past the retention window are removed by a
+         replicated command fs.prune {now}, the tree analogue of EXT-33's
+         history.prune: the leader proposes it on a bounded interval
+         (implementation choice, RECOMMENDED <= 1 h) and only when its
+         pre-computation finds something to evict; POST
+         /v1/admin/fs/prune proposes the same command.  Every node's
+         APPLY recomputes the eviction set from (now-in-command, policy,
+         the trashed-node set with their trashed_at, the pins) -- never
+         from a follower clock, never from on-disk sizes.  Eviction
+         removes the trashed node from the node set (this is the ONE
+         place a node id leaves the add-wins set, and it is safe because
+         it happens in total order, after the window, and is idempotent
+         -- Section 4.4.5) and appends an event fs.pruned {after:
+         {evicted, oldest_trashed_at}}.  Prune removes RECORDS; it never
+         unlinks blob bytes -- that remains the separate GC step
+         (Section 4.4.3), so the two-step "prune then GC" discipline of
+         EXT-33 is preserved.
+
+      4.4.5.  No resurrection (the invariant).  Once a node id is evicted
+         (Section 4.4.4), any later operation naming that node id -- a
+         MOVE, a RENAME, or a RESTORE -- MUST be a NO-OP: the node id is
+         not in the node set, and an operation on an absent node id adds
+         nothing (the same rule EXT-34 Section 4.2.2 states for "a delete
+         of a path absent from the manifest").  By the monotonic-
+         allocation invariant (Section 4.2.1) the evicted id is NEVER
+         re-minted, so a later CREATE cannot resurrect it under the same
+         id either.  Because eviction and all
+         operations are applied in a single total order, a client's stale
+         RESTORE of an already-evicted node cannot race the eviction to
+         resurrect it; it is ordered after the eviction and is dropped.
+         An operation is idempotent by its op-id (EXT-5), so a network
+         retry of a delete or restore neither doubles nor resurrects.  A
+         RESTORE is permitted ONLY against a node that is still retained;
+         the exploit-first test T-04 proves an evicted node stays gone.
+
+      4.4.6.  The bounds (footprint cap over a HARD FLOOR; visible).  The
+         retained-trash FOOTPRINT -- the canonical size of retained
+         trashed-node records plus the size of blobs referenced ONLY by
+         retained trashed nodes (deduplicated by hash, computed from
+         replicated `size` fields, never from disk, per the EXT-33
+         accounting rule) -- is bounded by max_history_bytes exactly as
+         EXT-33 bounds history footprint, with EXT-33's RATIFIED hard
+         floor (ratify decision #2, 2026-09-11): when the cap is set and
+         the footprint exceeds it, prune evicts the OLDEST trashed nodes
+         kept ONLY by TTL (those above the history_min_versions floor and
+         not checkpoint-pinned), one at a time, until it fits.  The cap
+         MUST NOT evict a trashed node kept by the newest-
+         history_min_versions floor or by a checkpoint: history_min_
+         versions is a HARD FLOOR the cap NEVER crosses, and
+         recoverability is NEVER sacrificed to the cap.  When the floor
+         holds the footprint above max_history_bytes, the authority
+         HONORS the floor and /v1/stats reports
+         `crdtfs.history_bytes_over_cap: true` with a loud warning -- the
+         SAME semantics and stat name EXT-33 §4.3.2 defines (one retention
+         story, one behaviour, realtime and CAS alike).  [ REVISED PER
+         REVIEW 2026-09-12: this SUPERSEDES the earlier "prune evicts the
+         oldest first, overriding TTL and min-versions / min_versions_unmet"
+         wording, which INVERTED EXT-33's ratified hard-floor precedence
+         and would have made realtime LESS safe than CAS under disk
+         pressure.  Owner re-confirms. ]  Live-node count is bounded by
+         the EXT-7 entry/quota limits exactly as the manifest is.
+
+         Two kinds of bound, stated honestly.  The CRDT-METADATA bound is
+         STRUCTURAL and unconditional: superseded placements are old log
+         entries bounded by the EXT-5 / §12.5 epoch-barrier compaction,
+         and a snapshot is O(live + retained trash), never O(names ever
+         used) (Section 4.4.1) -- no operator action is required for this
+         bound to hold.  The retained-trash FOOTPRINT bound (TTL eviction
+         and the byte cap) is enforced by fs.prune, so it holds PROVIDED
+         fs.prune runs (Section 4.4.4): a leader that never proposes
+         fs.prune lets trash grow up to what the log/snapshot retains,
+         with no apply-time back-pressure.  An authority therefore MUST
+         expose, in the /v1/stats crdtfs block, a footprint-over-cap /
+         prune-stalled signal computed INDEPENDENTLY of prune actually
+         running, and this liveness dependence is recorded as a hazard
+         (HLP) at build.  There is thus no SILENT unbounded-growth
+         surface: metadata is bounded structurally (4.4.1), and trash
+         footprint is bounded by retention + the byte cap whenever prune
+         runs, with a loud signal when it does not.
+
+   4.5.  Files under the tree.
+
+      A file node's CONTENT is referenced the way it best suits the
+      client, and this memo permits two, per file:
+
+         o  a BLOB reference (a content hash, exactly ACP/1 Section 11)
+            for whole-file bytes -- the file is a leaf whose value is a
+            hash, uploaded by the ordinary idempotent, content-addressed
+            POST /v1/blobs BEFORE the placement op (harmless by
+            construction: an unreferenced blob is GC's concern, and the
+            GC-pin of Section 4.4.3 keeps a referenced one alive); OR
+         o  a live CRDT DOCUMENT reference (ACP/1 Section 12 text CRDT or
+            EXT-5 structured CRDT) for a file being co-edited live.
+
+      STRUCTURE converges via this memo; per-file CONTENT converges via
+      the existing CRDT file path or is a pinned blob hash.  The blob or
+      document a trashed file references is retained under Section 4.4 for
+      the window, so a restored file comes back with its bytes (Section
+      5.6).  The composition of "CRDT structure + CRDT/blob files,
+      surfaced through the virtual-FS facade" is what EXT-31's realtime
+      mode presents to an agent as ordinary readFile/writeFile.
+
+   4.6.  Data model and data-model delta.
+
+      DATA MODEL (realtime space):
+         TreeDoc (one per realtime space or region):
+            nodes:    add-wins OR-Set< nodeId >             ; Section 4.2.1
+                      ; node ids minted MONOTONICALLY and NEVER re-used
+                      ; -- an evicted id is never re-minted (invariant,
+                      ; Sections 4.2.1, 4.4.5)
+            place:    Map< nodeId -> LWW< (parentId, name) >; Section 4.2.2
+                      ; leader-stamped; parentId may be TRASH
+            trashed:  Map< nodeId -> { trashed_at, origin } >; Section 4.4.2
+                      ; present iff the node is TRASHED (Section 4.2.6);
+                      ; `origin` = the IMMUTABLE pre-trash (parentId,
+                      ; name) captured at DELETE time (leader-stamped,
+                      ; deterministic), so the pre-trash path survives
+                      ; EXT-14 compaction and drives trash scope-filter
+                      ; and listing (Sections 4.7, 5.3)
+            content:  Map< nodeId -> { "blob": <hash> }     ; whole file
+                                    | { "doc":  <docName> } >; live CRDT
+            reserved: ROOT, TRASH node ids
+         Retention policy: the EXT-33 per-space object, REUSED verbatim
+            (history_ttl_sec, history_min_versions, max_history_bytes,
+            max_checkpoints).
+
+      DATA-MODEL DELTA vs acp/1:
+         + one CRDT TreeDoc per realtime space/region (an EXT-5 document
+           specialization) -- ADDITIVE; exists only for spaces EXT-31 has
+           put in realtime mode.
+         + node identity + placements are EXT-14 constructs, REUSED.
+         + trashed_at, the immutable pre-trash `origin` (parentId, name),
+           and the retained-trash reachability term are new, but the
+           RETENTION POLICY and PRUNE MECHANISM are EXT-33's, REUSED.
+         ~ the CAS manifest (ACP/1 Section 11) and EXT-33 history are
+           UNCHANGED and remain the model for every CAS-mode space; a
+           space is in exactly one mode for a given region (Section 4.1).
+         (No change to leases, mailbox, presence, events, or spaces.)
+
+   4.7.  Wire API additions.
+
+      New (all gated by "crdtfs"; realtime-mode space):
+         POST /v1/fs/ops       ; writer; push structural CRDT ops
+                               ;   (create/rename/move/delete/restore) to
+                               ;   the space TreeDoc; MAY carry a batch of
+                               ;   ops applied atomically; RETURNS the
+                               ;   applied result (op-ids, epoch), NEVER a
+                               ;   409/CAS conflict
+         GET  /v1/fs/tree      ; reader; the materialized path->node view
+                               ;   (deterministic walk + validity pass),
+                               ;   the realtime analogue of GET
+                               ;   /v1/manifest, filtered by read_prefix
+                               ;   (EXT-27) exactly as the manifest is
+         GET  /v1/fs/trash     ; reader; retained trashed nodes visible in
+                               ;   scope (name, nodeId, trashed_at,
+                               ;   original path), for restore/undo;
+                               ;   filtered by read_prefix
+         POST /v1/admin/fs/prune ; admin; propose fs.prune {now}
+
+      Modified:
+         GET /v1/healthz, /v1/stats  + "crdtfs" capability + a "crdtfs"
+                               ;   stats block; per-scope `nodes` and
+                               ;   `trashed` counts are read_prefix-
+                               ;   filtered, while the space-GLOBAL
+                               ;   retention accounting (footprint_bytes,
+                               ;   history_bytes_over_cap, policy) is
+                               ;   ADMIN-ONLY and OMITTED for a read-
+                               ;   scoped token (Section 5.3; no volume
+                               ;   oracle)
+
+      No change to POST /v1/commit or GET /v1/manifest: those remain the
+      CAS surfaces for CAS-mode spaces.  All new endpoints follow ACP/1
+      Section 6 conventions (JSON, X-ACP-Space, bearer auth, the standard
+      error model).  The "acp/1" wire string is unchanged.
+
+   4.8.  Section 17 determinism and the snapshot format.
+
+      Convergence is DETERMINISTIC and side-effect-free, as EXT-5/EXT-14
+      already are, and this section states the snapshot the owner asked
+      for explicitly.
+
+      4.8.1.  Leader-stamped ingress.  Every structural op is LEADER-
+         STAMPED on ingress: the leader assigns the node id (on CREATE),
+         the placement stamp/actor, and the leader time (which becomes a
+         node's trashed_at on a DELETE) at the log position; followers
+         replay the identical stamped op.  No node-local wall-clock, no
+         ordering derived from arrival time at a follower.  fs.prune
+         carries the leader's `now`; the apply uses that `now`, never a
+         follower clock.  `trashed_at` rides the leader clock at the
+         delete's log position: it is DETERMINISTIC (every replica reads
+         the same stamped value, so convergence is unaffected), but a new
+         leader with a skewed clock can shift a node's retention timing
+         early or late -- the same posture EXT-33 records for its version
+         records.
+
+      4.8.2.  Materialization is a pure function.  GET /v1/fs/tree is the
+         EXT-5 deterministic sorted-key walk composed with EXT-14's
+         stamp-ordered validity pass and the Section 4.2.4 name-collision
+         disambiguation, over the replicated node/placement/content
+         state.  It yields a byte-identical live tree on every replica
+         for the same committed state.  No I/O, no clock read, no
+         randomness in the FSM.
+
+      4.8.3.  The snapshot format (ACP/1 Section 14.3).  A realtime
+         space's replicated snapshot carries, and ONLY carries, state
+         that is a pure function of the command stream: the node set with
+         its add-tags; each node's leader-stamped placement register
+         (including trashed nodes' TRASH placements, their trashed_at,
+         and their immutable pre-trash `origin` -- Section 4.6); each
+         node's content reference; the reserved ROOT /
+         TRASH ids; the retention policy and checkpoint set (EXT-33); and
+         the op-log epoch (EXT-5 / Section 12.5).  A node bootstrapped
+         from this snapshot has a BYTE-IDENTICAL live tree AND byte-
+         identical trash and retention state -- so a lagging or rejoining
+         follower cannot resurrect a deleted or evicted node (Section
+         4.4.5).  On-disk blob sizes are node-local and MUST NOT enter
+         any replicated computation (the acp1-17-node-local-state
+         amendment); footprint accounting uses replicated `size` fields.
+
+      4.8.4.  Atomicity across leader changes.  A tree op (or an atomic
+         batch on POST /v1/fs/ops) is one replicated command; the single
+         Raft log IS the coordinator, as for every ACP write.  fs.prune
+         and a concurrent tree op are totally ordered by the log; there
+         is no prune-vs-op race (the check-then-act race is
+         structurally excluded because eviction is decided in apply, not
+         at the edge).
+
+      There is NO blocking I/O, NO ML, NO network call, and NO wall-clock
+      scheduling inside coordd's apply path -- the Section 17 requirement,
+      and the reason this fits the authority where a plugin doing I/O
+      (EXT-6, HELD) does not.
+
+   4.9.  Amendment to ACP/1 Section 15 (reachability for a realtime
+         space).
+
+      Realtime-mode reachability (Section 4.4.3) is a change to Section
+      15's garbage-collection reachability and is therefore proposed as a
+      DATED, UNSIGNED amendment, per the RFC/EXT amendment SOP.  This
+      worker did NOT edit PUBLIC_REPO/rfc/acp-1.txt.  The block below is
+      the text to add under Section 15 (alongside the EXT-33 block
+      acp1-15-gc-retained-history) WHEN the owner ratifies; it tightens
+      (GC keeps MORE) and relaxes nothing.
+
+====== BEGIN UNSIGNED AMENDMENT · id=acp1-15-gc-realtime-tree · proposed 2026-09-12 · REVISED 2026-09-12 per design review · NOT normative until ratified ======
+   [ AMENDMENT -- PROPOSED 2026-09-12 (engineering, EXT-28 CRDT
+     Directory Tree), REVISED 2026-09-12 per the independent design
+     review: finding B (reachability keyed on eviction STATE, not a
+     clock/age read) and, jointly with EXT-31 finding F1, the post-flip
+     reachability gap (a retained realtime tree/trash must stay pinned
+     after a realtime->cas flip).  Extends Section 15's garbage-
+     collection reachability to a space that HAS an EXT-28 realtime
+     directory tree in replicated state; it tightens (GC keeps MORE), it
+     relaxes nothing.  Composes with amendment acp1-15-gc-retained-
+     history (EXT-33).  REVISED PER REVIEW -- the owner must RE-CONFIRM
+     before the core build.  NOT normative until the protocol owner
+     ratifies. ]
+
+   15.2.  Garbage-Collection Reachability for a Realtime Directory Tree
+
+   For a space (or path region) that HAS an EXT-28 CRDT directory tree in
+   replicated state -- whether the region is CURRENTLY in realtime mode,
+   OR retains a pre-flip realtime tree and trash from a prior EXT-31
+   realtime->cas flip that is still within its retention window -- an
+   authority MUST compute blob reachability for POST /v1/admin/gc as the
+   union of the blob hashes referenced by:
+
+      (a) every LIVE node of the tree (reachable from ROOT without
+          passing through TRASH), AND
+      (b) every RETAINED trashed node (those the space's retention policy
+          has NOT evicted -- i.e. still PRESENT in replicated state;
+          eviction is solely via EXT-28 fs.prune), AND
+      (c) every node pinned by a live checkpoint (EXT-33).
+
+   A blob reachable under (a), (b) or (c) MUST NOT be reclaimed.  The
+   grace window (grace_sec) continues to apply to unreachable blobs
+   exactly as before.  The reachability set MUST be derived solely from
+   PRESENCE in replicated state (Section 17); an authority MUST NOT key
+   reachability on a re-read of a node's age or on any clock.  The
+   eviction of a retained trashed node -- which can make a blob
+   unreachable -- MUST be a replicated, leader-driven command (EXT-28
+   fs.prune) and MUST NOT be performed inside the GC sweep.  A file node
+   whose content is a live CRDT document (Section 12) is reachable
+   through that document's own reachability, unchanged.
+
+   Because reachability keys on the PRESENCE of the retained realtime
+   tree/trash and NOT on the region's current mode, a realtime->cas flip
+   (EXT-31) does NOT narrow this reachability: a region's retained
+   pre-flip trash stays pinned for the remainder of its EXT-28 retention
+   window, and is evicted only by fs.prune, exactly as before the flip.
+
+   A space that has NEVER had a realtime tree (a CAS-only space with no
+   retained pre-flip realtime structure) has empty (a),(b),(c); this rule
+   does not apply to it (Section 15 and amendment acp1-15-gc-retained-
+   history govern).
+====== END UNSIGNED AMENDMENT · id=acp1-15-gc-realtime-tree ======
+
+
+5.  Interaction with Other Extensions
+
+   5.1.  EXT-5 (JSON CRDT).  The TreeDoc IS an EXT-5 document (the node
+      set is an OR-Set, placements are leader-stamped registers); this
+      memo is a specialization, not a new CRDT engine, and inherits
+      EXT-5's leader-stamping, deterministic materialization and
+      epoch-barrier compaction (Section 4.4.1).
+
+   5.2.  EXT-14 (mv).  Create, rename, move, delete and restore all write
+      the one node's leader-stamped placement register; cycles,
+      stays-put, "a move INTO a deleted target is itself trashed," and
+      identity preservation are inherited from EXT-14 UNCHANGED for the
+      LIVE location (Sections 4.2.2, 4.2.6).  What is NOT inherited is the
+      concurrent DELETE-vs-MOVE-of-the-same-node outcome: EXT-14 resolves
+      that ADD-WINS (the moved node survives), whereas EXT-28 needs
+      REMOVE-WINS, so this memo ADDS the sticky-TRASH arbitration rule
+      (Section 4.2.6) and a distinct RESTORE op kind on top of the EXT-14
+      pass.  DELETE and RESTORE are recognized as distinct op kinds by the
+      arbitration; they are not plain MOVEs.
+
+   5.3.  EXT-27 (read_prefix).  GET /v1/fs/tree, GET /v1/fs/trash and the
+      per-scope COUNTS of the /v1/stats crdtfs block are PATH-SHAPED read
+      surfaces and MUST be filtered by read_prefix exactly as GET
+      /v1/manifest is, with the same no-oracle discipline: an out-of-
+      scope subtree is missing-shaped, the per-scope `nodes`/`trashed`
+      counts shown to a read-scoped token are the FILTERED counts, and a
+      trashed node is visible in trash only if its STORED pre-trash
+      ORIGIN path (Section 4.6, captured at DELETE time and immune to
+      EXT-14 compaction) is in scope.  The space-GLOBAL retention
+      accounting -- `footprint_bytes`, `history_bytes_over_cap`, `policy`
+      -- is NOT meaningfully per-scope filterable and would leak the size
+      and disk-pressure of out-of-scope trash; it is therefore ADMIN-ONLY
+      and MUST be OMITTED from the crdtfs stats block returned to a read-
+      scoped token (no volume oracle).  The RESTORE-possession rule
+      mirrors EXT-33 Section 5.1: a read-scoped token may restore a
+      trashed node only if that node's stored origin path is in scope, so
+      it can recover its own deleted files but learns nothing about
+      out-of-scope trash.
+
+   5.4.  EXT-22 (scoped watch).  Structural change events (node created /
+      placed / trashed / restored / pruned) are watchable and subtree-
+      filterable exactly as manifest change events are.
+
+   5.5.  EXT-33 (history, retention, GC-pin, checkpoints, restore).
+      This memo REUSES EXT-33's retention policy object, its GC-pin
+      discipline, its prune pattern, and its checkpoints: a CHECKPOINT in
+      a realtime space pins the CURRENT tree state (the set of live nodes
+      and their content) as a named, immutable, retained snapshot, so
+      those blobs are exempt from GC and the tree at that point is
+      readable/restorable.  A realtime checkpoint is NOT a linear version
+      number (a realtime region has no total order of whole-tree
+      versions -- Section 3.7); it is a content pin.  EXT-33's manifest
+      HISTORY (GET /v1/manifest?version=N) and restore-as-a-CAS-commit
+      apply to CAS-mode regions only; the realtime analogue of restore is
+      the RESTORE operation (Section 4.2.5) and per-node trash recovery
+      (Section 5.6).  The trashed-node retention of Section 4.4 is the
+      realtime expression of the EXT-33 data-safety promise, so a space
+      does not lose recoverability by choosing realtime mode.
+
+   5.6.  Per-node recovery (the realtime "undo").  A deleted file or
+      folder is recovered by a RESTORE op (Section 4.2.5) naming its node
+      id, placing it back under a live parent, at any time while it is
+      RETAINED (Section 4.4.2).  GET /v1/fs/trash lists what is
+      recoverable, in scope.  Because the node kept its identity, a
+      restored file returns with its content, its per-file live-edit
+      state, and its subtree.  This is the realtime counterpart of EXT-33
+      restore-as-a-commit; the reference client SHOULD expose it as `acp
+      restore` / an "undelete" verb (contract deferred to the client
+      epic).
+
+   5.7.  EXT-34 (bulk-change guard) -- the realtime gap, stated and
+      covered.  EXT-34 measures net loss inside the ATOMIC CAS COMMIT and
+      refuses/denies a bulk commit; it explicitly does NOT cover a
+      realtime region, because a realtime region "has no manifest commit
+      to measure" (EXT-34 Sections 3.9, 6.6), and it cites this as a
+      reason realtime is opt-in where blast radius matters.  This memo
+      does not leave that gap unaddressed:
+
+      o  COST is bounded regardless.  A realtime mass-delete moves N nodes
+         to TRASH; every one is RECOVERABLE for the retention window
+         (Section 4.4.2, 5.6).  So the WORST case of a runaway agent in
+         realtime mode is the same worst case EXT-33 already bounds for
+         CAS: recoverable, not permanent.  A realtime space is therefore
+         never LESS safe than pre-EXT-33 CAS was.
+
+      o  PREVENTION for batched ops (the CONCENTRATED case only).  Because
+         there is no single "wipe the tree" commit, a single-op stream is
+         throttled ONLY by ACP/1 Section 5.4 rate limiting -- which caps
+         requests/second, NOT cumulative deletes, so a whole-tree delete
+         SPLIT across many single-op /v1/fs/ops calls stays under the
+         rate limit and is NOT caught by any batch measurement.  The one
+         concentrated risk a batch guard can catch is a single POST
+         /v1/fs/ops carrying a large DELETE batch.  An authority
+         advertising both "crdtfs" and "bulkguard" SHOULD apply EXT-34's
+         measurement to such a batch: count the net DELETE placements-
+         into-TRASH in one /v1/fs/ops call against the token's measurement
+         scope, and if it crosses the space's bulk threshold, refuse with
+         the EXT-34 428 confirm / 403 bulk_denied protocol, honoring the
+         token's bulk DISPOSITION (writer denied by default, EXT-34
+         Section 4.5).  So the disposition "wall" reaches the CONCENTRATED
+         batch in realtime mode, but it does NOT bound a split mass-delete
+         -- for that, RECOVERABILITY (every deleted node retained and
+         restorable within the window) is the SOLE bound, and it is the
+         load-bearing safety property.  (The earlier claim that "the
+         disposition wall applies in realtime mode too" overstated the
+         batch guard's reach; op-splitting bypasses it, so recoverability,
+         not the guard, is what truly bounds a distributed mass-delete.)
+         Whether the batch guard is REQUIRED in v1 or deferred is an owner
+         question (Section 12); the recoverability guarantee above stands
+         either way.
+
+   5.8.  EXT-18 (provenance).  The linear-history caveat (Abstract) is
+      the reason realtime mode is opt-in: EXT-18's total-order audit
+      chain is a property of the CAS/event line; a customer who needs it
+      keeps that region in CAS mode.  Structural events are still logged
+      and watchable (Section 5.4), but they are not a totally-ordered
+      whole-tree version line.
+
+   5.9.  EXT-21 (multi-primitive atomic batch).  POST /v1/fs/ops MAY
+      carry a batch applied atomically (Section 4.7); whether a
+      create-file-and-place op is additionally made atomic with the
+      file's first CONTENT op via EXT-21 is parked until EXT-21 lands
+      (Section 12), and is not required for convergence.
+
+
+6.  The space stays the only hard boundary
+
+   A realtime space is still ONE space (ACP/1 Section 7): the CRDT tree,
+   its trash, and its checkpoints live inside the space, never span two,
+   and confer no cross-space reach.  ROOT and TRASH are per-space.
+   read_prefix (EXT-27) narrows CONTENT within a space but is hygiene,
+   not confinement (EXT-27 Section 6).  The SPACE remains the only hard
+   isolation boundary; this memo does not add, weaken, or cross one.
+
+
+7.  Value
+
+   7.1.  Value to the framework.
+
+      o  Eliminates the #1 DX/perf friction (the CAS-retry loop / 409
+         churn under many workers) WITHOUT abandoning the CAS audit story
+         or the EXT-33/EXT-34 data-safety guarantees -- both modes
+         coexist, and realtime mode carries the SAME recoverable-delete
+         promise.
+      o  Closes the ratification blocker: the tombstone/GC bound is a
+         SPEC-LEVEL closure (Section 4.4) with exploit-first tests
+         (Section 11), not an open question deferred to the build.
+      o  A clean extension of the live-CRDT thesis (EXT-5 + EXT-14 +
+         EXT-33 REUSED, not re-invented), fully deterministic (Section
+         17-safe), and contained -- no new coordination primitive, no I/O
+         in the authority, no new retention story.
+      o  Keeps the framework honest: the trade-off (convergence vs linear
+         audit and the commit-time bulk guard) is stated and made an
+         explicit per-space choice, not hidden.
+
+   7.2.  Value to customers.
+
+      o  "It just works": concurrent create/rename/move/restructure by
+         many agents converge with NO 409, NO pull+diff3+retry, NO
+         version-conflict handling in client code.
+      o  Deletes are still safe: a deleted file is recoverable for the
+         same 30-day window as in CAS mode, by name, with its content and
+         history intact -- the realtime mode does not cost the customer
+         the data-safety guarantee they just got.
+      o  Renames and moves preserve identity (EXT-14): a moved file keeps
+         its history and any per-file live-edit state; nothing is
+         duplicated or lost, even under a concurrent cycle or name
+         collision.
+      o  Customers who need the linear, auditable history or the commit-
+         time bulk wall keep them -- CAS mode is unchanged and is the
+         default; realtime is opt-in per space (EXT-31).
+
+
+8.  Capability Negotiation, Rollout and Migration
+
+   8.1.  Negotiation.  Clients feature-detect "crdtfs" (and "history",
+      which it requires).  A client uses the realtime surfaces (/v1/fs/*)
+      for a realtime region and the CAS surfaces for a CAS region, per
+      the EXT-31 space config; the virtual-FS facade hides which.
+
+   8.2.  Backward compatibility.  Byte-identical for every CAS-mode
+      space and every existing endpoint.  A peer without "crdtfs" simply
+      cannot select realtime mode (EXT-31 refuses), and sees only CAS
+      spaces.
+
+   8.3.  Cluster upgrade order (mixed-version cluster hazard).  A node WITHOUT
+      "crdtfs" cannot apply /v1/fs/ops or fs.prune commands; a realtime
+      space on a mixed cluster would diverge.  Therefore an authority
+      MUST NOT advertise "crdtfs", and MUST NOT allow a space to be put
+      in realtime mode, while it knows a cluster member lacks the
+      capability; operators upgrade EVERY node before enabling realtime
+      mode on any space.  Documented as an operational rule with a hazard
+      record where no inter-node version exchange exists (same posture as
+      EXT-27 HZ-ACPDB-12 and EXT-33 Section 8.3).
+
+   8.4.  Migration between modes.  A one-way "snapshot the realtime tree
+      into a CAS manifest" (and the reverse "seed the realtime tree from
+      the current manifest") for a space that changes its mind is
+      DEFERRED to EXT-31 (its mode-migration open question); it is not
+      required for this memo and interacts with EXT-33 restore.
+
+
+9.  Wire API Summary
+
+   New (gated by "crdtfs"; ACP/1 Section 6 conventions):
+
+      POST /v1/fs/ops           ; writer; create/rename/move/delete/
+                                ;   restore; atomic batch; never 409
+      GET  /v1/fs/tree          ; reader; materialized tree; read_prefix
+      GET  /v1/fs/trash         ; reader; retained trash in scope
+      POST /v1/admin/fs/prune   ; admin; propose fs.prune {now}
+      GET  /v1/healthz, /v1/stats  + "crdtfs" capability + crdtfs block
+
+   Replicated commands: fs.ops (leader-stamped node ids/placements/
+   times), fs.prune {now}.  No change to POST /v1/commit, GET
+   /v1/manifest, or any CAS-mode surface.  One dated amendment to ACP/1
+   Section 15 (Section 4.9).  The "acp/1" wire string is unchanged.
+
+
+10. Security Considerations
+
+   10.1.  No oracle.  Every realtime read surface is read_prefix-filtered
+      with EXT-27's no-oracle discipline (Section 5.3): an out-of-scope
+      node, an out-of-scope trashed node, and a name-collision loser
+      outside scope are all missing-shaped; counts are filtered counts;
+      restore-possession is scoped (Section 5.3).
+
+   10.2.  No resurrection is a security property, not only an integrity
+      one.  A delete may be a redaction (removing data a viewer must no
+      longer see).  Section 4.4.5 guarantees a pruned node cannot be
+      resurrected by any later op, and remove-wins deletion (Section 4.3)
+      guarantees a delete is not silently reverted by a concurrent move;
+      until prune, the data is in scope-filtered trash, visible only to a
+      token whose scope covered it.
+
+   10.3.  Retention is a disclosure window.  A deleted file's bytes are
+      retained (recoverable) for history_ttl_sec.  An operator handling
+      must-forget data sets the policy accordingly (the same
+      consideration EXT-33 records); "delete is immediate erasure" is NOT
+      the realtime promise, by design, and is documented so.
+
+   10.4.  Bulk destruction.  Section 5.7: recoverability bounds the cost
+      of a runaway realtime mass-delete, and the bulk DISPOSITION grant
+      (EXT-34) SHOULD gate a large delete batch; unattended agent tokens
+      are denied bulk by default.
+
+   10.5.  The space is the boundary (Section 6); realtime mode neither
+      adds nor weakens an isolation boundary.
+
+
+11. Test Specification (the merge bar for an implementation)
+
+   An implementation MUST NOT advertise "crdtfs" until every test below
+   exists as a NAMED test in its suite and passes.  Tests marked
+   (exploit-first) MUST first be shown to FAIL on a naive implementation
+   with the loss/resurrection reproduced.  The clause-to-test map is
+   maintained outside the memo (CONFORMANCE-stub.md).
+
+   11.1.  Convergence (the no-409 promise).
+      T-01 TestConcurrentDisjointCreatesBothLand -- N workers each create
+           a distinct file concurrently; all N land, no 409, tree
+           identical on 3 replicas.
+      T-02 TestConvergenceFuzz -- random interleavings of create, rename,
+           move, delete, restore on random node ids across 3 replicas;
+           after draining the log every replica's materialized tree AND
+           trash state are byte-identical; property: the result equals a
+           reference materialization of the op set.
+      T-03 TestConcurrentMoveRenameDeleteConverges -- the three-way race
+           (A moves X, B renames X, C deletes X) converges to one
+           deterministic state on all 3 replicas; X exists exactly once
+           and, because DELETE is STICKY (Section 4.2.6), X is TRASHED
+           (not live) whenever a DELETE is present -- the test MUST assert
+           WHICH, not merely "live or trashed."
+      T-03a TestConcurrentDeleteVsLiveMoveIsRemoveWins (exploit-first) --
+           X is live under F1; peer A `DELETE X` (stamp s); peer B (never
+           saw the delete) `MOVE X -> live F2` (stamp > s).  In BOTH stamp
+           orders, all 3 replicas converge to X TRASHED (remove-wins,
+           Section 4.2.6), recoverable by RESTORE, NOT resurrected live
+           under F2.  On a naive greatest-stamp LWW impl the later MOVE
+           resurrects X -- the test MUST first be shown FAILING that way
+           (the resurrection the sticky-TRASH rule closes; the T-03 gap
+           the design review found).
+
+   11.2.  The tombstone / GC bound (the ratification blocker).
+      T-04 TestDeletedNodeRecoverableWithinWindowThenEvicted (exploit-
+           first) -- delete a file; within history_ttl it is in trash,
+           its blob survives GC, RESTORE brings back exact bytes; advance
+           now past the window; fs.prune evicts it; GC then reclaims the
+           blob; a RESTORE of the evicted node id is a NO-OP (never
+           resurrects).  On a naive OR-Map implementation the blob is
+           gone immediately after delete+GC (the F-1 repro) OR the
+           tombstone is never reclaimed.
+      T-05 TestNoUnboundedTombstoneGrowth -- create-and-delete the same
+           name 10 000 times; the snapshot size is O(retained trash under
+           the policy), NOT O(names ever used); after prune it returns to
+           O(live).
+      T-06 TestGCPinKeepsRetainedTrashBlobs (fuzz) -- GC never reclaims a
+           blob referenced by a live node, a retained trashed node, or a
+           checkpoint; reclaims it once no retained node references it.
+      T-07 TestPruneIsLeaderDrivenAndDeterministic -- eviction only via
+           fs.prune {now}; 3 nodes with skewed clocks evict the identical
+           set; no follower clock; prune removes records, never unlinks
+           bytes.
+      T-08 TestNoResurrectionAfterEviction (exploit-first) -- a client's
+           stale RESTORE/MOVE/RENAME of an already-evicted node id,
+           ordered after the eviction, is a no-op on every replica; a
+           retried delete/restore neither doubles nor resurrects; and
+           node-id allocation is MONOTONIC -- an evicted id is never
+           re-minted (Section 4.2.1), so a later CREATE cannot reuse it.
+      T-09 TestRetainedTrashFootprintByteCapHonorsHardFloor --
+           max_history_bytes forces oldest-first eviction of nodes kept
+           ONLY by TTL (above the history_min_versions floor); the cap
+           NEVER evicts a node kept by the newest-history_min_versions
+           floor or by a checkpoint (recoverability is never sacrificed
+           to the cap); `crdtfs.history_bytes_over_cap: true` is reported
+           when the floor holds the footprint above the cap; footprint
+           computed from replicated sizes, never disk (matches the
+           EXT-33 §4.3.2 ratified hard-floor precedence).
+
+   11.3.  Structure integrity (nothing vanishes / duplicates).
+      T-10 TestConcurrentCreateSameNameDisambiguatesInjectively -- two
+           creates of "notes.md" in one folder: both nodes exist,
+           greatest-stamp holds the name, the loser gets the
+           deterministic FULL-id disambiguated name "notes.md~<nodeId>",
+           identical on 3 replicas; neither is dropped or merged.
+           INCLUDES the injective case: a real file literally named
+           "notes.md~<id>" coexists with a disambiguated
+           "notes.md~<nodeId>" WITHOUT collision (the literal "~" is
+           escaped, Section 4.2.4).
+      T-11 TestMoveCycleStaysPut -- A-under-B and B-under-A merge: the
+           lower-stamped placement is INVALID, the node stays put, no
+           duplication, no vanish (EXT-14 inherited).
+      T-12 TestDeleteBeatsConcurrentMoveIntoDeletedSubtree -- delete D
+           while a peer moves X into D: X is trashed with D (remove-wins
+           subtree), recoverable, not silently live.
+      T-13 TestRestorePreservesIdentityAndContent -- a restored file
+           returns with its node id, blob/doc content, and subtree.
+
+   11.4.  Determinism, snapshot, HA (Section 17).
+      T-14 TestMaterializationIsPureFunction -- same op set, no clock/IO/
+           randomness, byte-identical tree.
+      T-15 TestSnapshotCarriesTreeTrashAndPolicy -- a node bootstrapped
+           from a snapshot has byte-identical live tree, trash,
+           trashed_at, checkpoints and policy; cannot resurrect a
+           deleted/evicted node.
+      T-16 TestFailoverPreservesTreeAndTrash -- a leader change between an
+           op and a prune loses no node and double-evicts none (real Raft
+           InstallSnapshot/failover).
+      T-17 TestDeterministicCheckIncludesFsOpsAndPrune -- the Section 17
+           determinism check compares node sets, placements, trash,
+           reachability and stats across 3 nodes with a stream of every
+           op class + policy changes.
+
+   11.5.  Scope, no-oracle (EXT-27).
+      T-18 TestTreeAndTrashReadsAreScopeFiltered -- out-of-scope live and
+           trashed nodes are missing-shaped; counts are filtered; two
+           tokens with identical in-scope views and different out-of-
+           scope trees get byte-identical bodies; timing smoke.
+      T-19 TestScopedRestorePossession -- a read-scoped token may restore
+           only a trashed node reachable via an in-scope path; an out-of-
+           scope node id is missing-shaped, not restorable.
+
+   11.6.  EXT-34 tie (Section 5.7).
+      T-20 TestRealtimeMassDeleteIsRecoverable -- deleting the whole tree
+           via /v1/fs/ops leaves every node in retained trash; all
+           restorable within the window.
+      T-21 TestBulkDeleteBatchHonorsDisposition (if the batch guard of
+           Section 5.7 is ratified) -- a writer denied bulk cannot land a
+           threshold-crossing DELETE batch in one /v1/fs/ops; 403
+           bulk_denied; a single-op stream is unaffected.
+
+   11.7.  Interop and capability.
+      T-22 TestCrdtfsNotAdvertisedWithoutHistory -- "crdtfs" requires
+           "history"; a build lacking either does not advertise crdtfs.
+      T-23 TestCasSpaceByteIdenticalWithCrdtfsAvailable -- a CAS-mode
+           space's manifest, commit, history and bulk-guard behaviour are
+           byte-identical whether or not crdtfs is advertised.
+      T-24 TestMixedVersionClusterIsDocumentedHazard -- a node lacking
+           crdtfs cannot apply fs.ops; realtime mode refused/undeclared on
+           a mixed cluster; hazard record.
+
+
+12. Open Questions
+
+   o  REVISED PER INDEPENDENT DESIGN REVIEW (2026-09-12) -- OWNER MUST
+      RE-CONFIRM.  Three items were CHANGED after review and are no longer
+      the text the owner first ratified: (1) REMOVE-WINS is now a NEW
+      "sticky-TRASH" arbitration rule (Section 4.2.6), NOT "inherited from
+      EXT-14" -- EXT-14 is add-wins for concurrent delete-vs-move, so the
+      original claim would have RESURRECTED a deleted node under a
+      concurrent move (finding A); (2) the §15.2 amendment
+      acp1-15-gc-realtime-tree is now PRESENCE-based and MODE-INDEPENDENT
+      (finding B + EXT-31 F1), keying reachability on "not yet evicted"
+      rather than a clock/age read, so a realtime->cas flip does not drop
+      retained trash; (3) the byte cap now HONORS EXT-33's ratified hard
+      floor (finding C), reporting `history_bytes_over_cap` and never
+      evicting below history_min_versions.  See REVIEW-FIXES-20260912.md.
+
+   o  THE GC BOUND (ratification prerequisite -- for confirmation, not
+      re-opening).  Section 4.4 closes it: no unbounded tombstones
+      (total-order log, not gossip; delete = move-to-trash),
+      recoverable-for-the-window trash reusing EXT-33 retention + GC-pin,
+      deterministic fs.prune eviction, no resurrection, a hard byte cap.
+      The owner is asked to RATIFY this closure as the precondition the
+      roadmap names.
+
+   o  DEFAULT MODE.  Realtime is opt-in and CAS is the default here.  The
+      owner ratifies that default and the trade-off (a realtime region
+      has no linear totally-ordered manifest history, no EXT-18 whole-
+      tree attestation, no commit-time EXT-34 wall).  Whole-space only,
+      or per-path-prefix (releases/ CAS while docs/ realtime)?  (Shared
+      with EXT-31.)
+
+   o  REALTIME BULK GUARD (Section 5.7).  REQUIRE the batch DELETE
+      measurement + disposition in v1, or ship v1 relying on
+      recoverability alone and add the batch guard when EXT-34 lands?
+      (Recommendation: rely on recoverability for v1 correctness; apply
+      the disposition to large batches as soon as "bulkguard" is present,
+      since the grant plumbing already exists.)
+
+   o  REALTIME RETENTION KNOBS.  Reuse EXT-33's exact policy object (this
+      memo's choice, one story) vs a separate crdtfs.trash_ttl.
+      (Recommendation: reuse -- one promise, one knob.)
+
+   o  NAME-COLLISION DISAMBIGUATION FORM.  The RECOMMENDED
+      "<name>~<nodeId>" (the FULL id, with a literal "~" escaped so the
+      encoding is injective and reversible, Section 4.2.4) vs surfacing
+      the loser only in a "conflicts" side-view.  (Recommendation: the
+      deterministic suffix -- it keeps every file addressable by a real
+      path.)
+
+   o  CONTENT-plus-STRUCTURE atomicity (EXT-21).  Whether create-file-
+      and-place must be atomic with the file's first content op; parked
+      until EXT-21 lands (Section 5.9).
+
+   o  CHECKPOINT OF A REALTIME TREE.  Section 5.5 defines a realtime
+      checkpoint as a content pin (no linear version).  Confirm this is
+      the intended semantics vs deferring realtime checkpoints entirely.
+
+   o  op VOCABULARY on POST /v1/fs/ops vs reusing the raw EXT-5/EXT-14 op
+      wire directly -- an ergonomics choice for the build.
+
+
+Appendix A.  New and Changed Data Types
+
+   TreeDoc (per realtime space; EXT-5 document specialization):
+      nodes    : add-wins OR-Set< nodeId >
+      place    : Map< nodeId -> LWW< {parentId, name} > >   ; leader-stamped
+      content  : Map< nodeId -> {"blob": <hash>} | {"doc": <docName>} >
+      trashed  : Map< nodeId -> {trashed_at, origin:{parentId,name}} >
+                 ; trashed_at = leader time of the DELETE; origin =
+                 ; IMMUTABLE pre-trash placement (Sections 4.6, 5.3)
+      reserved : ROOT, TRASH
+      (node ids MONOTONIC, never re-minted -- Sections 4.2.1, 4.4.5)
+   Retention policy: EXT-33 object, REUSED (history_ttl_sec,
+      history_min_versions, max_history_bytes, max_checkpoints).
+   Replicated commands: fs.ops (batch of create/rename/move/delete/
+      restore; leader-stamped ids/stamps/times), fs.prune {now}.
+   Events: fs.node_created, fs.placed (rename/move), fs.trashed,
+      fs.restored, fs.pruned {after:{evicted, oldest_trashed_at}}.
+   stats "crdtfs" block: per-scope {nodes, trashed} (read_prefix-
+      filtered) + ADMIN-ONLY {footprint_bytes, history_bytes_over_cap,
+      policy} (omitted for a read-scoped token -- Section 5.3).
+
+
+Appendix B.  Worked Examples
+
+   B.1.  Concurrent disjoint create (the no-409 case).  Worker A: CREATE
+      (ROOT,"a.md",blobA).  Worker B: CREATE (ROOT,"b.go",blobB).
+      Disjoint node ids, disjoint names; both placements land in either
+      log order; GET /v1/fs/tree shows both on every replica; no 409.
+
+   B.2.  Delete then recover (the data-safety case).  DELETE nodeX ->
+      placement (X, TRASH, "x.md"), trashed_at = t.  Within
+      history_ttl: GET /v1/fs/trash lists X; its blob survives GC (pin
+      15.2(b)); RESTORE (X, ROOT, "x.md") returns it with content.  Past
+      the window: fs.prune evicts X; GC reclaims the blob; RESTORE X is a
+      no-op.
+
+   B.3.  Concurrent same-name create (nothing vanishes).  A: CREATE
+      (ROOT,"notes.md",blobA) stamp 5.  B: CREATE (ROOT,"notes.md",blobB)
+      stamp 7.  Both nodes exist; node B (stamp 7) holds "notes.md"; node
+      A is surfaced as "notes.md~<idA>"; a client may rename A.  No
+      create lost, no merge.
+
+   B.4.  Delete beats move-into-deleted (remove-wins, recoverable).  A:
+      DELETE folderD (stamp 9).  B: MOVE fileX into D (stamp 8).  D and
+      X are trashed together; both recoverable within the window; X is
+      not left silently live.
+
+   B.5.  Delete beats a concurrent live-move of the SAME node (remove-
+      wins, the sticky-TRASH rule).  X is live under F1.  A: DELETE X
+      (stamp 100).  B (never saw the delete): MOVE X -> live F2 (stamp
+      101).  Although the MOVE is later-stamped, the TRASH placement is
+      STICKY (Section 4.2.6): the MOVE is INVALID and X converges to
+      TRASHED on every replica, recoverable by RESTORE -- NOT resurrected
+      live under F2.  A naive greatest-stamp LWW would resurrect X; this
+      is exactly the case the sticky-TRASH rule and test T-03a close.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .  It is customer-sourced,
+   supersedes the EXT-28 draft of 2026-08-21, and composes with
+   EXT-5, EXT-14, EXT-27, EXT-31, EXT-33 and EXT-34.

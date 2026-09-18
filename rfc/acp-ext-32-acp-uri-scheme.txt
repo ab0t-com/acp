@@ -1,0 +1,820 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-32                                     ab0t.com
+Updates: ACP/1                                                    August 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+        ACP Extension Proposal 32: The acp:// URI Scheme and Resolver
+       -- A Uniform, Stable, Forward-Compatible Address for Every ACP
+          Resource, Reducible Always to the Frozen acp/1 HTTPS Wire
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies the "acp://" URI SCHEME
+   and its CLIENT-SIDE RESOLVER: a uniform, stable way to NAME an ACP
+   resource -- an "acp://<authority>/<space>/<path>" string that a client
+   or SDK deterministically RESOLVES to the existing acp/1 HTTPS wire
+   ("https://<authority>/v1/..." with the "X-ACP-Space" header).  It is
+   the "URL of the agent filesystem": one string that addresses a space
+   and a path, that a person can paste, that an OS or browser can hand to
+   a protocol handler, that a mount command can point at, and that always
+   reduces back to plain HTTPS.
+
+   The scheme adds NO write path and NAMES no new resource: every
+   "acp://" URI denotes a resource acp/1 already exposes.  The resolver
+   is client/SDK machinery; the ONLY daemon-side affordance is an
+   OPTIONAL, read-only discovery document (".well-known/acp") a resolver
+   MAY use to bootstrap.  The space remains the only hard isolation
+   boundary (ACP/1 Section 7); "acp://" implies TLS exactly as "https"
+   does.
+
+   Because a URI scheme is a FOREVER commitment -- you cannot break its
+   grammar later without breaking every stored link -- this memo reserves
+   the room it will need before it is needed: a RESOURCE-TYPE DIMENSION
+   (a reserved leading segment) so the scheme can grow to address a CRDT
+   document, the event log, a channel, or a mailbox WITHOUT a breaking
+   revision, while the bare, common form addresses the FILESYSTEM; a
+   reserved "?query" (version pinning; the capability parameters); and a
+   "#fragment" that is client-only and never sent to the server.
+
+   Two authentication models are defined, with one ironclad rule.  A
+   bare "acp://" URI is a pure ADDRESS: authentication comes from the
+   local client's own "acp" profile (host/space keyed), for your own
+   access and mounts.  A SHAREABLE "acp://" URI carries an EXT-3-style
+   signed, scoped, expiring CAPABILITY in its query parameters --
+   self-authorizing, hand-outable.  THE RAW BEARER OR SPACE TOKEN MUST
+   NEVER APPEAR IN AN "acp://" URL (EXT-3's leak lesson): the only
+   in-URL credential is a signed capability, and it is scoped and
+   expiring.
+
+   The feature is negotiated by the capability string "acpuri".  Nothing
+   changes the wire version "acp/1": the resolver is client-side and the
+   discovery document is additive and read-only; a peer without the
+   extension, and any client that never speaks "acp://", interoperates
+   unchanged.
+
+Status of This Memo
+
+   ACCEPTED and IMPLEMENTED (ratified by the protocol owner, 2026-09-18).
+   The extension number EXT-32 is PROVISIONAL; the protocol owner
+   assigns final numbers on acceptance.  It REUSES the signing
+   discipline of EXT-3 (blob capability URLs, ACCEPTED + IMPLEMENTED)
+   for its shareable form, and it is the ADDRESS layer for naming ACP
+   resources across the surfaces ACP exposes.  It COMPOSES with EXT-27
+   (read_prefix) and other ACP extensions that expose addressable
+   resources by NAMING what those memos expose, never by changing them.
+   The base protocol version string remains "acp/1".  Distribution is
+   unlimited.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Motivation -- one stable name for every resource
+   2.  Conventions and Terminology
+   3.  Design
+       3.1.  Capability
+       3.2.  Grammar
+       3.3.  The resource-type dimension (forward compatibility)
+       3.4.  Query and fragment (reserved now)
+       3.5.  Resolution to the acp/1 wire (deterministic)
+       3.6.  Authentication -- BOTH models, one ironclad rule
+       3.7.  Canonicalization and normalization
+       3.8.  Daemon side -- read-only discovery only (.well-known/acp)
+       3.9.  Section 17 determinism compliance
+       3.10. The space stays the only hard boundary
+   4.  Value
+   5.  Dependencies
+   6.  Open Questions
+   Authors' Addresses
+
+
+1.  Motivation -- one stable name for every resource
+
+   1.1.  ACP resources have no portable name.
+
+      Today an ACP resource is addressed by an ad-hoc bundle: a base
+      URL, an "X-ACP-Space" header, a "/v1/..." path, and a bearer
+      token in an "Authorization" header.  That is correct for an
+      agent's SDK call, but it is not a NAME: you cannot paste it, hand
+      it to a colleague, register it with an operating system, print it
+      in a doc, or type it into a mount command.  Every other durable
+      store people talk to has a single-string address -- "https://...",
+      "s3://...", "file://..." -- and ACP does not.
+
+   1.2.  The mount, the share, and the protocol handler all want the
+         same string.
+
+      Three uses converge on exactly one missing primitive: a client
+      that mounts a space as a local filesystem wants a target to point
+      at; a person wants to PASTE a link to a file or a space to a
+      teammate; an OS or browser wants a "protocol handler" target it
+      can hand to the SDK.  Each
+      needs a stable, uniform ADDRESS for an ACP resource.  Rather than
+      invent three, this memo defines ONE.
+
+   1.3.  A URI scheme is a forever commitment -- design it once.
+
+      Unlike an endpoint, a URI grammar cannot be revised without
+      breaking every link already stored in a doc, a config, an OS
+      registration, or a database.  So this memo does the unglamorous
+      forward-compatibility work UP FRONT (Sections 3.3, 3.4): it
+      reserves a resource-type dimension, a query namespace, and a
+      fragment, so the scheme that addresses the filesystem today can
+      address a document, a log, a channel, or a mailbox tomorrow with
+      NO breaking revision.  It NAMES existing resources; it never adds
+      a new write path or a new resource.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].  URI terminology (scheme, authority, userinfo, host, port,
+   path, query, fragment, percent-encoding, dot-segment) is used as in
+   [RFC3986].
+
+   This document uses the definitions of ACP/1 (space, manifest, path,
+   blob, event log, mailbox, capability negotiation, the "X-ACP-Space"
+   header, TLS transport) and EXT-3 (capability URL, signing key, kid,
+   expiry, the canonical signed string, fail-closed validation order)
+   without restating them.
+
+   ACP URI:  A string of the "acp" scheme naming one ACP resource
+      (Section 3.2).
+
+   AUTHORITY (of an ACP URI):  "host[:port]" of a coordd or gateway.  It
+      MUST NOT contain a userinfo component (Section 3.6).
+
+   RESOLVER:  The client/SDK function that maps an ACP URI to a concrete
+      acp/1 HTTPS request (Section 3.5).  There is no server-side
+      resolver.
+
+   RESOURCE-TYPE SEGMENT:  A reserved leading path segment selecting a
+      non-filesystem resource type (Section 3.3).  Its absence selects
+      the FILESYSTEM.
+
+   PROFILE:  The local "acp config" entry keyed by host (and space) that
+      supplies a credential for a bare ACP URI (Section 3.6).
+
+   CAPABILITY (in-URL):  An EXT-3-style signed, scoped, expiring token
+      carried in the query of a SHAREABLE ACP URI (Section 3.6).
+
+
+3.  Design
+
+   3.1.  Capability.
+
+      The capability string "acpuri", advertised on GET /v1/healthz and
+      /v1/stats (per the EXT-1 Section 7 convention), asserts the
+      OPTIONAL discovery document of Section 3.8.  The scheme and
+      resolver themselves are client-side and require no capability to
+      USE (a resolver can address any acp/1 daemon whether or not it
+      advertises "acpuri"); "acpuri" advertises only that the daemon
+      serves the ".well-known/acp" bootstrap document.  Absent "acpuri",
+      a resolver falls back to a configured or user-supplied endpoint
+      base (Section 3.8).
+
+   3.2.  Grammar.
+
+      An ACP URI has the shape:
+
+         acp://<authority>/<space>/<path>
+
+         acp-uri    = "acp://" authority "/" space [ "/" path ]
+                      [ "?" query ] [ "#" fragment ]
+         authority  = host [ ":" port ]        ; NO userinfo (Sec 3.6)
+         space      = segment-nz               ; the space name (ACP/1 §7)
+         path       = segment *( "/" segment ) ; a resource in the space
+
+      o  <authority> is a coordd or gateway "host[:port]".  It MUST NOT
+         carry a userinfo component ("user:pass@host"): userinfo is where
+         a credential would leak, and Section 3.6 forbids it outright.
+      o  <space> is the FIRST path segment and is the HARD ISOLATION
+         BOUNDARY (ACP/1 Section 7).  It is REQUIRED and non-empty; a URI
+         with no space names no addressable resource (the sole exception
+         is the bare-host discovery form "acp://<authority>/", Section
+         3.8).
+      o  <path> is the remainder.  With no resource-type segment
+         (Section 3.3) it is a FILESYSTEM path within the space (the
+         common case), validated by the resolver against ACP/1 Section
+         11.4 path rules before it is used.
+      o  "acp://" IMPLIES TLS.  A resolver MUST resolve to "https://"
+         and MUST NOT fall back to cleartext (Section 3.5); there is no
+         "acp+http" form.
+
+      Examples (all name existing resources):
+
+         acp://coordd.example:8443/team/docs/spec.md
+            -> the file "docs/spec.md" in space "team"
+         acp://coordd.example:8443/team/docs/
+            -> the "docs/" collection (a directory listing)
+         acp://coordd.example:8443/team/
+            -> the root of space "team" (the whole manifest/tree)
+
+   3.3.  The resource-type dimension (forward compatibility) [NORMATIVE].
+
+      A URI scheme cannot gain a new addressing dimension after the fact
+      without breaking existing links, so this memo reserves one NOW,
+      even though v1 implements only the filesystem.
+
+      RESERVATION.  A path segment whose FIRST OCTET is "@" (U+0040) is
+      a RESOURCE-TYPE SEGMENT and is RESERVED.  "@" is chosen because it
+      is NOT a legal first octet of an ACP filesystem path (the ACP/1
+      Section 11.4 / EXT-7 Section 10.7 name charset is
+      [A-Za-z0-9._:/-], which excludes "@"), so a resource-type segment
+      can NEVER collide with a real filesystem path.  [The charset claim
+      in this sentence is CORRECTED by the 2026-09-11 amendment below;
+      the reservation itself stands.]  The dimension sits immediately
+      after the space:
+
+         acp://<authority>/<space>/@<type>/<sub-address>
+
+      AMENDMENT (2026-09-11, pre-ratification; engineering, from the
+      first-slice implementation review).  Two corrections, implemented
+      by the reference resolver and pinned by its tests:
+
+      (a) The charset premise above is FALSE against the shipped
+          reference implementation.  ACP/1 Section 11.4 (and the
+          daemon's manifest path validation) bound the SHAPE of a path
+          (no empty, ".", "..", absolute or backslash segments), NOT its
+          charset; EXT-7 Section 10.7's [A-Za-z0-9._:/-] applies to
+          SCOPE PREFIXES, not to manifest names.  "@doc/x" is therefore
+          a LEGAL manifest name today, and the sigil cannot rely on
+          charset exclusion to avoid collisions.
+
+      (b) The sigil is recognised on the RAW, pre-percent-decoding
+          segment, and collisions are avoided by ENCODING, not charset:
+          o  a bare "@" first octet in a path segment is RESERVED SYNTAX
+             -- the resource-type dimension when it is the segment
+             immediately after the space, and REFUSED (fail-closed) in
+             any later segment;
+          o  a filesystem name whose first octet is a literal "@" MUST
+             be written with that octet percent-encoded: "%40doc/x"
+             addresses the file "@doc/x"; a resolver decodes "%40" to a
+             literal "@" AFTER the sigil check, never before;
+          o  the canonical form (Section 3.7) KEEPS a leading "%40"
+             encoded (it is an octet that "MUST be encoded" in that
+             position), so "acp://host/space/@doc/x" (a reserved type)
+             and "acp://host/space/%40doc/x" (a file) are distinct
+             resources that can never be confused, while "@fs/%40doc/x"
+             and "%40doc/x" are the same file.
+          Mount-relative paths handed to a mounted filesystem are plain
+          manifest paths, not URIs; a literal "@" needs no encoding
+          there.  The reserved names, the fail-closed rule and the v1
+          scope below are unchanged.
+
+      o  With NO leading "@"-segment, the URI addresses the FILESYSTEM
+         (the default resource type).  "acp://host/space/docs/x.md" and
+         the explicit synonym "acp://host/space/@fs/docs/x.md" denote the
+         SAME resource; the bare form is canonical (Section 3.7).
+      o  RESERVED type names (v1 defines their meaning; only "@fs" is
+         IMPLEMENTED):
+            @fs    the filesystem (manifest/tree + blobs) -- the default
+            @doc   a collaborative CRDT document (ACP/1 Section 12 /
+                   EXT-5), sub-address = the doc name
+            @log   the event log (ACP/1 Section 8), sub-address =
+                   optional filter (EXT-22 entities/actors)
+            @mail  a mailbox (ACP/1 Section 9)
+            @chan  a channel (EXT-1)
+      o  FAIL-CLOSED (normative).  A resolver that does not implement a
+         given "@<type>" MUST REJECT the URI, NOT silently treat the
+         "@"-segment as a filesystem path.  This is what makes the
+         dimension safe to grow: an old resolver refuses a future type
+         rather than mis-resolving it.  Unknown "@<type>" -> error.
+      o  A daemon advertising "acpuri" MUST NOT be assumed to serve any
+         "@<type>" beyond "@fs" unless the discovery document (Section
+         3.8) or the relevant extension's capability
+         ("crdtjson"/"channels"/"watch"/...) is present.
+
+      v1 SCOPE: only "@fs" (bare form) is resolvable.  "@doc", "@log",
+      "@mail", "@chan" are RESERVED NAMES with no v1 resolution -- their
+      exact sub-address grammar is an Open Question (Section 6), fixed
+      before any is implemented.  Reserving them now is the whole point:
+      the scheme never needs a breaking revision to add them.
+
+   3.4.  Query and fragment (reserved now) [NORMATIVE].
+
+      QUERY ("?...").  The query is a resolver-interpreted parameter
+      space.  Reserved keys:
+
+         v=<manifest_version>   Pin the read to a manifest version
+                                (ACP/1 Section 11) so a link is
+                                REPRODUCIBLE; the resolver reads that
+                                version (composing with EXT-30
+                                checkpoints where present).  Absent = the
+                                current version.
+         cp=<checkpoint_name>   Pin the read to a NAMED EXT-30 checkpoint
+                                (a frozen, GC-exempt snapshot) so a link
+                                survives compaction/GC.  RESERVED now;
+                                resolution is defined when EXT-30 ships;
+                                mutually exclusive with v=.  (A URI scheme's
+                                query namespace grows only additively after
+                                ratification, so this key is reserved now.)
+         h=<blobhash>           DESIGN DECISION 2026-09-11 (D1, see the
+                                ticket DECISION-acp-uri-scheme.md): the blob
+                                hash a SHAREABLE, capability-signed FILE
+                                link carries.  With the capability params
+                                below, the resolver maps the link to the
+                                tokenless GET /v1/cap/blob/<blobhash>
+                                (the shipped EXT-3 fetch path).  Present
+                                only on a capability file link; MUST equal
+                                the signed hash.  (Version-pinned share; the
+                                path-signed "living link" awaits the EXT-3
+                                successor.)
+         (capability params)    The EXT-3-style signed capability of a
+                                SHAREABLE URI (Section 3.6): the exact
+                                parameter set is EXT-3's (sp, e, k, s),
+                                carried verbatim so the discipline is
+                                identical.
+
+      A resolver MUST ignore an unknown query key it does not understand
+      (additive-and-negotiated, ACP/1 Section 18) UNLESS the key sits in
+      the reserved capability namespace, which is fail-closed (a
+      malformed capability is an error, never an unsigned read -- Section
+      3.6).  No query key ever carries a raw bearer or space token
+      (Section 3.6).
+
+      FRAGMENT ("#...").  The fragment is CLIENT-SIDE sub-addressing and
+      MUST NEVER be sent to the server (the [RFC3986] fragment rule).
+      It addresses WITHIN a fetched resource -- e.g. a line/anchor in a
+      file, a node id within a "@doc", a seq within "@log" -- and is
+      interpreted entirely by the client that dereferences the URI.  Its
+      per-type grammar is deferred with the types themselves (Section 6).
+
+   3.5.  Resolution to the acp/1 wire (deterministic).
+
+      The resolver is a PURE, client-side mapping from an ACP URI to a
+      concrete acp/1 HTTPS request; it adds no new wire and no new write
+      path.  For the filesystem ("@fs", the v1 scope):
+
+         acp://H/S/P            (a file)
+            -> GET https://H/v1/manifest         (locate P's hash)
+               then GET https://H/v1/blobs/<hash>
+               with header  X-ACP-Space: S
+         acp://H/S/P/           (a collection)
+            -> GET https://H/v1/manifest  (listing filtered to prefix P/)
+               with header  X-ACP-Space: S
+         acp://H/S/             (space root)
+            -> GET https://H/v1/manifest        (whole tree)
+               with header  X-ACP-Space: S
+         ?v=<ver>              -> the read is pinned to manifest version
+                                  <ver>
+         a WRITE to acp://H/S/P (when a client mutates a named resource)
+            -> PUT https://H/v1/blobs + POST https://H/v1/commit (CAS),
+               OR the EXT-28 CRDT ops surface, per the EXT-31 "fsmode"
+               of that space/region -- NO new write path is introduced;
+               the URI merely NAMES the target.
+
+      Rules:
+      o  Scheme -> "https".  The authority maps 1:1 to the HTTPS
+         authority; TLS is mandatory (Section 3.2).
+      o  The FIRST path segment (space) becomes the "X-ACP-Space" header,
+         NOT part of the "/v1/..." path -- so the space is carried the
+         acp/1 way and stays the isolation boundary.  A resolver MUST
+         NOT place the space in the URL path of the resulting HTTPS
+         request, and MUST NOT let a query/fragment override it.
+      o  A realtime-mode region (EXT-31) resolves reads to "/v1/fs/tree"
+         and writes to "/v1/fs/ops" (EXT-28); a CAS region resolves to
+         "/v1/manifest" + "/v1/commit".  The resolver discovers the mode
+         via GET /v1/space/config (EXT-31) exactly as any client does.
+      o  Resolution is DETERMINISTIC: the same canonical URI (Section
+         3.7) against the same daemon state maps to the same request.
+
+   3.6.  Authentication -- BOTH models, one ironclad rule.
+
+      THE IRONCLAD RULE (stated first, on purpose).  A raw bearer token
+      or space token MUST NEVER appear anywhere in an "acp://" URL --
+      not in the authority userinfo, not in a path segment, not in a
+      query parameter, not in the fragment.  URLs leak: into browser
+      history, referrer headers, proxy and server logs, screenshots,
+      chat pastes, OS "recent" lists.  This is EXACTLY the leak EXT-3
+      was created to prevent, and the same discipline is mandatory here.
+      A resolver MUST REFUSE to construct or accept a URI whose
+      authority carries userinfo, and MUST NOT be configured to embed a
+      token in any component.
+
+      Given that rule, authentication has TWO legitimate models:
+
+      (1) PROFILE-BASED (the URI is a pure address).  For your own
+          access and mounts, the "acp://" URI carries NO credential at
+          all; the resolver supplies auth from the LOCAL client's "acp"
+          profile -- the existing "acp config" entry keyed by host (and
+          space).  The credential lives in local config, exactly where
+          it lives today; the URI is just the address.  This is the
+          default for a personal mount or CLI use.
+
+          AMENDMENT (2026-09-11, RATIFIED by the protocol owner
+          2026-09-11 -- one movement, nothing released; engineering,
+          from the Go parity build; marker:
+          ext32-3.6-connection-address).  The memo's
+          "one-string connect" (Section 4.2: point a tool at a single
+          "acp://" string instead of base URL + space header + token)
+          needs a defined ADDRESS FORM so every client tool refuses the
+          same things.  A CONNECTION ADDRESS is the SPACE-ROOT form
+          only:
+
+             acp://<authority>/<space>[/]
+
+          It names "this space on this daemon" for a session (a CLI, an
+          MCP bridge, a mount's endpoint).  A resolver given a connection
+          address:
+          o  MUST bind the session's space from the address and its
+             endpoint from the authority (default port, Section 3.7);
+          o  MUST take the credential from the local profile whose
+             server host:port equals the address's (space-preferred),
+             never from the address (the ironclad rule above), and MUST
+             NOT fall back to a credential bound to another host;
+          o  MUST REFUSE, before any request, an address that carries a
+             path, a "v=" pin, or a capability (a session is neither
+             pinned to one manifest version nor authorised by a one-blob
+             grant; silently dropping the path would connect a pasted
+             file link to its whole space) -- the refusal names the
+             root form to use;
+          o  MAY ignore a "#fragment" and unknown query keys (client-only
+             and additive, Section 3.4).
+          Reference: the Go "acp" CLI ("--uri", ACP_URI) and "acp-mcp"
+          bridge; the TS SDK's clientForACPURI is unaffected (it
+          resolves any resource, not a session).
+
+      (2) CAPABILITY-SIGNED (for SHAREABLE links).  When a URI must be
+          HANDED to someone (or to an untrusted client) who has no
+          profile, it carries an EXT-3-style CAPABILITY in its query --
+          a signed, scoped, expiring grant that is SELF-AUTHORIZING:
+
+          o  It reuses EXT-3's machinery UNCHANGED: HMAC-SHA256 over a
+             domain-separated canonical string binding the grant to a
+             space + resource + expiry; a "kid" for rotation; an "exp";
+             the single-occurrence parameter rule (each of sp/e/k/s
+             exactly once, else 400); the fail-closed validation order
+             (parse -> expiry(410) -> signature(403) -> existence(404));
+             constant-time comparison.
+          o  For the BLOB resource this IS an EXT-3 capability URL: a
+             minted "acp://" file link resolves to EXT-3's tokenless
+             GET path, and the query parameters ARE EXT-3's (sp, e, k,
+             s).  Nothing new is signed or validated.
+          o  For a broader resource (a manifest PATH, a subtree, a
+             "@doc") the capability is a GENERALIZATION of EXT-3 along
+             the exact axis EXT-3's own Open Questions name ("manifest /
+             multi-blob capability URLs"); ext-32 NAMES that shape and
+             DEPENDS on the EXT-3-successor that signs it (Section 5,
+             Section 6).  v1's in-URL capability is therefore the
+             already-shipped single-blob EXT-3 capability; anything
+             wider is gated on that successor -- honestly, not faked.
+          o  The capability is the ONLY credential that may ride in a
+             URL, and it is signed + scoped + expiring by construction.
+             It grants no more than the minter held (EXT-3 Section
+             10.7): read of one resource, in one space, until one
+             deadline.
+
+      A resolver picks the model by what it holds: a local profile for
+      its own address; a capability for a link it was handed.  A URI MAY
+      carry a capability OR rely on a profile, never a raw token.
+
+   3.7.  Canonicalization and normalization [NORMATIVE].
+
+      Two URIs that name the same resource MUST canonicalize to
+      byte-identical strings, so caches, dedup, and access checks cannot
+      be confused (a confused-deputy hazard: a mount cache or a
+      capability check that treats two spellings of one path as
+      different is a bug).  The canonical form:
+
+      o  SCHEME and HOST are lowercased ("acp", DNS host).  The space and
+         the path are BYTE-SIGNIFICANT and case-SENSITIVE (ACP/1 names
+         are bytes) -- they are NOT lowercased.
+      o  DEFAULT PORT: DESIGN DECISION 2026-09-11 (D3, see the ticket
+         DECISION-acp-uri-scheme.md): the "acp://" default port is
+         8443 (the daemon's conventional TLS port).  A port-less URI
+         resolves to that port; an explicit port overrides.  In the
+         canonical form an explicit :8443 is ELIDED and any non-default
+         port is preserved (mirrors how "https" elides :443).  A
+         port-less URI and an explicit :8443 compare EQUAL.
+      o  PERCENT-ENCODING: unreserved characters ([RFC3986]) that are
+         percent-encoded are DECODED to their literal form; octets that
+         MUST be encoded stay encoded; hex digits are uppercased.  Two
+         URIs compare equal only after this normalization.
+      o  DOT-SEGMENTS: "." and ".." are resolved and removed per
+         [RFC3986] Section 5.2.4; a URI that would escape the space root
+         (a "../" above "/<space>/") is REJECTED (ACP/1 Section 11.4
+         traversal rule -- a resolver MUST NOT emit an out-of-space
+         request).
+      o  TRAILING SLASH is SIGNIFICANT: a trailing "/" denotes a
+         COLLECTION (directory listing); its absence denotes a FILE.
+         The canonical form keeps exactly one trailing slash for a
+         collection and none for a file, and never a doubled "//"
+         internal segment (empty segments are rejected).
+      o  QUERY: reserved keys are ordered canonically (RECOMMENDED
+         ascending by key) for comparison; a capability query is compared
+         by its exact signed parameters.  The FRAGMENT is NOT part of
+         resource identity (it never reaches the server) and is excluded
+         from the canonical form used for caching/access.
+
+      Equality: two ACP URIs denote the same resource IFF their
+      canonical forms (fragment excluded) are byte-equal.
+
+   3.8.  Daemon side -- read-only discovery only (.well-known/acp).
+
+      The ONLY daemon-side addition is an OPTIONAL, READ-ONLY discovery
+      document, so a resolver can bootstrap from a bare host:
+
+         GET https://<authority>/.well-known/acp     (no auth)
+            -> { "endpoint": "https://<authority>/v1",
+                 "protocol": "acp/1",
+                 "capabilities": [ ... ],
+                 "tls_fingerprint": "sha256:...",   ; cert pin hint
+                 "default_space": "<name>"? }        ; OPTIONAL
+
+      o  It is a STATIC read, unauthenticated like GET /v1/healthz,
+         returning the same capability information a client can already
+         read from /v1/healthz -- it adds NO new authoritative state, NO
+         FSM change, NO write path.  It exists so "acp://<authority>/"
+         can be resolved without a prior configured endpoint.
+      o  The "tls_fingerprint" is a PIN HINT for a first-time resolver
+         (defense in depth over ordinary CA trust); it is advisory, not
+         a new trust root.
+      o  Discovery is negotiated by "acpuri".  A daemon MAY omit it
+         entirely; a resolver then uses a configured/user-supplied
+         endpoint base (Section 3.1).  Whether discovery is even in
+         scope for v1 or deferred is an Open Question (Section 6).
+      o  NO other daemon change.  The scheme introduces no new endpoint,
+         no FSM behaviour, and no capability beyond the discovery flag;
+         the wire stays frozen at "acp/1" and the space stays the only
+         hard boundary.
+
+      ====== BEGIN AMENDMENT · id=ext32-3.8-discovery-doc · RATIFIED
+      2026-09-11 (protocol owner; single movement, nothing released;
+      engineering proposal) ======
+
+      This amendment RESOLVES the Open Question "discovery in v1 or
+      deferred" (Section 6): discovery IS in scope for v1.  It defines
+      the document sketched above NORMATIVELY (the sketch's illustrative
+      field names are superseded by this block) and the resolver's fetch
+      contract.  It tightens; it relaxes nothing.
+
+      (a) THE DOCUMENT.  "GET https://<authority>/.well-known/acp" MUST
+          return, with status 200, a UTF-8 JSON OBJECT of at most 65536
+          octets:
+
+             protocol         string  REQUIRED  MUST be "acp/1" (the wire
+                                      version exactly as GET /v1/healthz
+                                      reports it).
+             endpoint         string  REQUIRED  An "https" ORIGIN:
+                                      "https://<host>[:<port>]" -- no
+                                      userinfo, no path (empty or "/"),
+                                      no query, no fragment.  The acp/1
+                                      wire is served at <endpoint>/v1/...
+                                      <host> MUST equal the discovery
+                                      address's host (ASCII case-folded,
+                                      one trailing dot stripped; an IPv6
+                                      literal compares bracketed).  The
+                                      port MAY differ from the address's
+                                      (the https default 443 applies when
+                                      omitted).
+             capabilities     array   REQUIRED  The capability strings
+                                      GET /v1/healthz advertises (EXT-1
+                                      Section 7); each a non-empty string.
+             spaces           array   OPTIONAL  Space names the daemon
+                                      chooses to PUBLISH, each valid per
+                                      ACP/1 Section 7.  ABSENT means
+                                      undisclosed (authenticate, then GET
+                                      /v1/spaces).  A daemon SHOULD omit
+                                      it unless an operator opts in.
+             default_space    string  OPTIONAL  A hint for a first-contact
+                                      client that holds only a host: the
+                                      space to offer.  A client MUST NOT
+                                      connect on it without the user.
+             cert_fingerprint string  OPTIONAL  "sha256:" + 64 lowercase
+                                      hex: SHA-256 over the DER leaf
+                                      certificate the endpoint presents.
+                                      Semantics in (c).
+
+          Any other top-level key MUST be IGNORED by a resolver (additive
+          growth, ACP/1 Section 18).  Keys whose first octet is "@" are
+          RESERVED for document metadata and are ignored until a later
+          amendment defines them.  A REQUIRED key that is absent, null or
+          of the wrong type, and an OPTIONAL key of the wrong type, make
+          the document MALFORMED; an OPTIONAL key that is null reads as
+          absent.
+
+      (b) THE FETCH (resolver side).  A DISCOVERY ADDRESS is the bare-host
+          form "acp://<authority>[/][#fragment]" -- no space, no path and
+          NO query (a query on a bare host is refused; a credential-shaped
+          key is refused as such) -- or any valid ACP URI, whose authority
+          is used after every refusal of Sections 3.2-3.6 has applied.  A
+          resolver:
+          o  MUST send exactly "GET https://<host>:<port>/.well-known/acp"
+             (<port> = the explicit port or the default of Section 3.7)
+             with NO request headers that identify or authenticate the
+             caller -- no Authorization, no X-ACP-Space, no X-ACP-Agent;
+          o  MUST verify TLS exactly as for any acp/1 request; nothing in
+             the document MAY relax that verification;
+          o  MUST NOT follow a redirect: any 3xx response is a refusal
+             (the host-bound "endpoint" is the only way to point elsewhere);
+          o  MUST treat 404 as "discovery not served" (fall back to a
+             configured or user-supplied endpoint base, Section 3.1) and
+             any other non-200 status as a refusal;
+          o  MUST refuse, FAIL-CLOSED, a body over 65536 octets, a body
+             that is not a JSON object, a "protocol" other than "acp/1",
+             an "endpoint" that is not an https origin, an "endpoint"
+             whose host differs from the address's host, and any
+             malformed field of (a) -- never a "best-effort" result;
+          o  MUST NOT connect to any space on the strength of the
+             document alone.
+          A resolver MUST continue to refuse a bare host wherever a
+          RESOURCE is expected (Section 3.2): the bare form is consumed
+          only by discovery.
+
+      (c) THE CERT FINGERPRINT is an ADVISORY PIN HINT, never a downgrade:
+          o  a client MAY store it (trust-on-first-use) and MAY warn or
+             refuse, under its own policy, when a later connection
+             presents a different certificate;
+          o  it is NEVER a trust root: no client path MAY accept a
+             certificate because the fingerprint matched;
+          o  when the client can observe the leaf certificate presented
+             on the discovery connection, a "cert_fingerprint" that
+             differs from it MUST refuse the document (a document that
+             misdescribes its own transport is malformed); where the
+             certificate is not observable (a browser fetch), the client
+             MUST report the pin as unverified rather than verified;
+          o  an operator whose TLS terminates at a gateway MUST omit the
+             field or publish the gateway's certificate fingerprint.
+
+      (d) THE DAEMON serves the document read-only and unauthenticated
+          (auth-exempt exactly like GET /v1/healthz), built from committed
+          configuration and its listener certificate -- a static read,
+          Section 3.9 -- and advertises "acpuri" ONLY while it serves the
+          document (Section 3.1).
+
+      ====== END AMENDMENT · id=ext32-3.8-discovery-doc ======
+
+   3.9.  Section 17 determinism compliance.
+
+      The scheme adds essentially nothing to the replicated state
+      machine, and what little it touches is §17-clean:
+
+      o  RESOLUTION is client-side and stateless: a pure function of
+         (canonical URI, negotiated config) -> an acp/1 request.  It
+         never enters coordd's apply path.
+      o  The DISCOVERY document (Section 3.8) is a STATIC READ of
+         already-replicated config/capability data -- no wall-clock, no
+         I/O in the FSM, no per-request nondeterminism; every node
+         returns the same document for the same committed state.
+      o  CAPABILITY validation (Section 3.6) is EXT-3's, which is
+         node-local pure HMAC over shared configuration and already
+         §17-compliant (EXT-3 Section 9): minting is a read, validation
+         is node-local, the signing key is out-of-band config, never
+         replicated state.
+      o  The reads/writes a URI ultimately drives are the EXISTING acp/1
+         (CAS) or EXT-28 (CRDT) surfaces, each already §17-compliant.
+         This memo composes deterministic surfaces behind a naming
+         layer; it adds no I/O, no ML, no wall-clock scheduling to the
+         apply path.
+
+   3.10. The space stays the only hard boundary.
+
+      The space is the FIRST path segment of every ACP URI and resolves
+      to the "X-ACP-Space" header, never to a URL path the daemon could
+      confuse with another space (Section 3.5).  A URI names WITHIN one
+      space; it confers no cross-space reach and cannot be rewritten
+      (by query, fragment, or header) to another space -- the resolver
+      MUST bind the space from the URI's first segment and MUST ignore
+      any attempt to override it, exactly as EXT-3 binds the space into
+      the signature and ignores a header (EXT-3 Section 5.4).  read_prefix
+      (EXT-27) still narrows CONTENT within a space and is hygiene, not
+      confinement.  This memo neither adds nor weakens a boundary.
+
+
+4.  Value
+
+   4.1.  Value to the framework.
+
+      o  A UNIFORM, STABLE ADDRESS for every ACP resource -- the "URL of
+         the agent filesystem" -- that always reduces to the frozen
+         acp/1 HTTPS wire.  One naming layer serves the mount target,
+         the shareable handle, and the OS/browser protocol-handler
+         target, instead of three ad-hoc conventions.
+      o  FORWARD-COMPATIBLE BY CONSTRUCTION: the resource-type dimension,
+         the query namespace, and the fragment are reserved now, so the
+         scheme grows to address docs/logs/channels/mailboxes with NO
+         breaking revision -- the one property a URI scheme must get
+         right on the first try.
+      o  MINIMAL, §17-CLEAN CORE: the resolver is client-side; the only
+         daemon surface is an optional read-only discovery doc.  No wire
+         change, no new write path, no FSM behaviour; the space stays
+         the only hard boundary.
+      o  IT INHERITS EXT-3's SECURITY DISCIPLINE rather than reinventing
+         it: the one in-URL credential is a signed, scoped, expiring
+         capability, and the raw token is forbidden from the URL --
+         closing the exact leak class EXT-3 exists to close.
+
+   4.2.  Value to customers.
+
+      o  PASTE-A-LINK SHARING: hand a teammate "acp://host/team/docs/
+         spec.md" (profile-auth) or a signed, expiring capability link
+         (no profile needed) -- a link to a file or a space that just
+         works, like any URL.
+      o  ONE-STRING CONNECT: point a tool, an SDK, or a config at a
+         single "acp://..." string instead of assembling base URL +
+         space header + token.
+      o  MOUNTABLE SPACES: a stable target a client can use to mount a
+         space (or a subtree of it) as a local filesystem -- the same
+         name on every platform.
+      o  REPRODUCIBLE LINKS: "?v=<version>" pins a read to a manifest
+         version so a shared link resolves to the same bytes later.
+
+
+5.  Dependencies
+
+   o  EXT-3 (blob capability URLs) -- HARD, SHIPPED: the signing
+      discipline and the v1 in-URL capability (single-blob) the
+      shareable form reuses UNCHANGED.
+   o  A future EXT-3 SUCCESSOR (manifest / subtree / doc capability
+      URLs, EXT-3 Open Questions) -- SOFT: needed only for the BROADER
+      in-URL capability (a path/subtree/"@doc" grant); v1's in-URL
+      capability is the shipped single-blob one, so the scheme ships
+      without it.
+   o  EXT-31 (filesystem mode) -- COMPANION: the resolver reads
+      "fsmode" to pick the CAS vs realtime write surface for a named
+      resource.
+   o  EXT-28 (CRDT directory tree) -- COMPANION: the realtime tree
+      surface ("/v1/fs/tree", "/v1/fs/ops") a realtime-region URI
+      resolves to.
+   o  EXT-27 (read_prefix) -- SOFT: content scoping for a named
+      resource; the scheme works unscoped without it.
+   o  EXT-22 (scoped watch) -- SOFT: the "@log" reserved type's future
+      filter grammar (entities/actors) -- reserved, not v1.
+   o  ACP/1 Section 7 (spaces), Section 11 (blobs/manifest), Section
+      11.4 (path safety) -- HARD, SHIPPED: the resources named and the
+      traversal rule the resolver enforces.
+
+
+6.  Open Questions
+
+   o  RESERVED RESOURCE-TYPE SYNTAX (Section 3.3).  The "@<type>"
+      sigil and the reserved names ("@fs"/"@doc"/"@log"/"@mail"/"@chan")
+      are proposed; the owner must ratify the sigil choice ("@" is
+      chosen because it is outside the ACP path charset) and the exact
+      sub-address grammar and fragment grammar for each non-"@fs" type
+      BEFORE any is implemented.  v1 implements only "@fs".
+
+   o  SCHEME REGISTRATION.  Whether to formally register "acp" as a URI
+      scheme (IANA-style provisional/permanent registration) IF the
+      scheme is ever made public -- required for a real OS/browser
+      protocol handler, and it fixes the grammar externally.  Deferred
+      until public exposure is decided.
+
+      NOTE (2026-09-11, engineering; not a resolution of this question).
+      The PER-MACHINE
+      handler shipped as a client feature: "acp handler install"
+      registers the "acp" scheme with the user's OS (XDG desktop entry
+      + x-scheme-handler/acp; macOS applet bundle with CFBundleURLTypes;
+      Windows HKCU\Software\Classes\acp), pointing at "acp open", whose
+      default is resolve-and-print (no request, no session, no mount;
+      a credential-bearing address is refused before anything is sent).
+      A per-machine handler needs no IANA registration and performs
+      none; the registration question above stays OPEN pending the
+      public-exposure decision.  Nothing normative in Sections 3 changes.
+
+   o  DEFAULT PORT (Section 3.7).  RESOLVED 2026-09-11 (D3): the default
+      port is 8443 (the daemon's conventional TLS port); a port-less URI
+      resolves there and the canonical form elides :8443.  Formal scheme
+      registration (which would let a registered default be assumed by
+      generic URI libraries) remains a separate, additive future step.
+
+   o  DISCOVERY IN V1 OR DEFERRED (Section 3.8).  RESOLVED 2026-09-11
+      (D4, amendment ext32-3.8-discovery-doc): discovery IS in v1.  The
+      ".well-known/acp" document is normative (protocol / endpoint /
+      capabilities REQUIRED; spaces / default_space / cert_fingerprint
+      OPTIONAL; unknown keys ignored, "@"-keys reserved), fetched
+      anonymously with no redirects and validated fail-closed with the
+      endpoint host bound to the address host; the cert fingerprint is an
+      advisory pin hint that can never lower TLS trust.  A bare host stays
+      refused wherever a resource is expected.  Resolver support ships
+      with the client SDKs; the daemon route follows in the core pass.
+
+   o  BROADER IN-URL CAPABILITY (Section 3.6).  The path/subtree/"@doc"
+      capability depends on an EXT-3 successor; sequencing that
+      successor relative to this memo (this scheme first names the
+      shape; the successor signs it) is an owner decision.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .  It reuses EXT-3's signing
+   discipline, is the address layer for naming ACP resources across the
+   surfaces ACP exposes, and composes with EXT-27 and other ACP
+   extensions that expose addressable resources by naming what they
+   expose.

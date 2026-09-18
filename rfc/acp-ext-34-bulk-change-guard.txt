@@ -1,0 +1,1364 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-34                                     ab0t.com
+Updates: ACP/1                                                 September 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+          ACP Extension Proposal 34: The Bulk-Change Guard
+     -- Net-Loss Measurement at Apply, a 428 Confirmation Bound to
+        Exact Counts, Bulk Denied to Writer Grants by Default, and a
+                     Snapshot Before Every Bulk Change
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies the BULK-CHANGE GUARD:
+   the authority MEASURES, inside the replicated commit apply, how many
+   paths a commit would destroy on NET (a delete or overwrite whose
+   prior content is not re-referenced by the same commit -- a rename
+   is not a loss); a commit that crosses a per-space THRESHOLD is BULK;
+   a bulk commit lands only when the caller CONFIRMS it by echoing the
+   exact counts the authority computed (HTTP 428, intent binding); a
+   WRITER grant is DENIED bulk changes by default and must be minted
+   with an explicit opt-in (admin is never denied); and every accepted
+   bulk commit first pins the state it replaces as an auto-checkpoint
+   (EXT-33 "auto/pre-bulk-v<N>"), so the change is undone by one
+   restore.
+
+   It is the PREVENTION half of the shared filesystem's data-safety
+   pair.  EXT-33 (Manifest History) makes a wipe RECOVERABLE; this memo
+   makes it hard to do by accident and impossible for a normal agent
+   token to do at all.  One rule, enforced by the core, applies to
+   every client surface: a raw commit, the CLI's rm and push, the MCP
+   commit tool, a mounted filesystem's directory rename or unlink.
+
+   Nothing changes the wire version "acp/1": one OPTIONAL commit field,
+   one new status code on an existing endpoint, one grant scope field,
+   six per-space quota fields, one whoami field and one stats block --
+   all negotiated by capability.  A commit below the threshold is
+   byte-for-byte unchanged.
+
+Status of This Memo
+
+   ACCEPTED and IMPLEMENTED (ratified by the protocol owner, 2026-09-18).
+   The reference implementation ships it under the capability string
+   "bulkguard".  The extension number EXT-34 is PROVISIONAL; the
+   protocol owner assigns final numbers on acceptance.  It builds on
+   ACP/1 Section 11 (blobs + manifest CAS) and Section 17 (determinism),
+   on the ACCEPTED EXT-7 (scoped grants, quotas, the fail-closed grant
+   envelope), on EXT-9 Section 8.2 (the per-grant deny list), on the
+   ACCEPTED EXT-27 (read-path scoping), and on the ACCEPTED EXT-33
+   (history, checkpoints), whose "history" capability it REQUIRES for
+   the snapshot-before-bulk.  It proposes NO amendment to ACP/1's
+   normative text.  The base protocol version string remains "acp/1".
+   Distribution is unlimited.
+
+   Published 2026-09-11 (draft); ACCEPTED/IMPLEMENTED, ratified 2026-09-18.
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Motivation -- a well-formed wipe is accepted
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  Design
+       4.1.  Capability
+       4.2.  The measurement: net loss
+       4.3.  Policy (per-space quota fields)
+       4.4.  The confirmation protocol (428)
+       4.5.  The grant disposition: bulk denied by default
+       4.6.  Snapshot before bulk
+       4.7.  Audit events
+       4.8.  Whoami and statistics
+   5.  One Rule, Every Surface (client contract)
+   6.  Interaction with Other Extensions
+   7.  Section 17 Determinism and High Availability
+   8.  Capability Negotiation, Rollout and Migration
+   9.  Wire API Additions
+   10. Security Considerations
+   11. Test Specification (the merge bar for an implementation)
+   12. Open Questions
+   Appendix A.  New and Changed Data Types
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Examples
+   Appendix D.  Client Verb Contract (normative for reference clients)
+   Authors' Addresses
+
+
+1.  Motivation -- a well-formed wipe is accepted
+
+   1.1.  What the base protocol checks.
+
+      ACP/1 Section 11 applies a commit atomically under compare-and-
+      swap.  The authority verifies the base version (concurrency),
+      every path (shape), every referenced blob (presence), the token's
+      write scope (EXT-7), leases (Section 10) and, for a read-scoped
+      token, possession (EXT-27 B.3).  It does NOT ask whether the
+      commit is PLAUSIBLE.  A commit carrying two hundred deletions from
+      any writer token is accepted with a 200 exactly like a commit
+      carrying one.
+
+   1.2.  Why that is the owner's central fear.
+
+      The independent data-loss review of the reference implementation
+      reproduced it (finding F-5): one POST /v1/commit with N
+      "deleted" changes, or N overwrites carrying the wrong hash, from
+      any of the client surfaces -- the CLI's rm, a push from a stale or
+      emptied checkout, a mounted filesystem's directory rename or an
+      unlink loop, and above all the MCP commit tool, where a language
+      model composes the change array and no human is in the loop.  An
+      agent that decides to "reorganize" can remove the tree in one
+      call.  Concurrency guards do not help: the request is well-formed
+      and its base is current.
+
+      EXT-33 bounds the COST of that event (the bytes stay for the
+      retention window; undo is one commit).  It does not bound its
+      FREQUENCY, and it does not stop a confused or looping agent from
+      doing it again.  Defense in depth needs the other half.
+
+   1.3.  The fix: measure, confirm, deny by default, snapshot.
+
+      o  MEASURE at apply.  The authority computes, deterministically
+         and against the manifest the commit is applied to, how many
+         paths are destroyed on NET.  A rename (delete + re-add of the
+         same bytes) is not a loss; a no-op delete of a missing path is
+         not a loss; an overwrite with the same hash is not a loss.
+      o  CONFIRM with intent binding.  Above the threshold the commit
+         is refused 428 with the exact counts; the client re-sends the
+         same commit echoing those counts.  A retry that did not read
+         the numbers cannot satisfy it; a client whose view of the tree
+         is stale gets different numbers (or a 409) and is stopped.
+      o  DENY by default.  A writer grant carries no permission to make
+         a bulk change unless it was minted with an explicit opt-in.
+         The confirmation is a speed bump; the grant is the wall.  A
+         normal agent token cannot wipe the tree even if it says the
+         right numbers.
+      o  SNAPSHOT before.  An accepted bulk commit pins the version it
+         replaces as "auto/pre-bulk-v<N>" (EXT-33 Section 4.6.4), in the
+         same atomic apply.  Undo is one restore, and the thing to
+         restore is named.
+
+      The guard lives in the CORE, not in clients: the clients are many
+      and buggy by construction, and a guard only in the CLI protects
+      nobody who uses the mount, the MCP tool or a third-party SDK.
+      Clients add the user experience (Section 5); the core owns the
+      rule.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the definitions of ACP/1 (manifest, entry, blob,
+   content hash, commit, CAS, space, roles, replicated command), EXT-7
+   (grant, scope, path_prefix, quota, the versioned grant envelope),
+   EXT-27 (read_prefix, read scope, no-oracle) and EXT-33 (version
+   record, checkpoint, auto-checkpoint, restore) without restating
+   them.
+
+   BASE MANIFEST (M):  The manifest the commit is applied against: the
+      manifest at the commit's base_version, which the CAS guarantees
+      is the current manifest at the moment of apply.
+
+   EFFECTIVE CHANGE:  For each path named in a commit, the last change
+      naming it (Section 4.2.1).  A commit's effect is the set of its
+      effective changes.
+
+   NET-LOSS DELETE:  An effective delete of a path present in M whose
+      prior hash is not re-referenced by any effective non-delete
+      change of the same commit (Section 4.2.2).
+
+   NET-LOSS OVERWRITE:  An effective non-delete change of a path
+      present in M whose new hash differs from the prior hash and whose
+      prior hash is not re-referenced by any effective non-delete
+      change of the same commit (Section 4.2.3).
+
+   MEASUREMENT SCOPE:  The subset of M's entries the committing token
+      could destroy: those admitted by its write scope and visible under
+      its read scope (Section 4.2.4).  E denotes its size.
+
+   BULK:  A commit whose net-loss counts cross the policy's thresholds
+      (Section 4.2.6).
+
+   CONFIRMATION:  The OPTIONAL CommitRequest field "bulk_confirm" that
+      echoes the authority's counts (Section 4.4).
+
+   DISPOSITION:  Whether a token may land a bulk commit at all:
+      "allowed" or "denied" (Section 4.5).
+
+   PRE-BULK CHECKPOINT:  The EXT-33 auto-checkpoint "auto/pre-bulk-v<N>"
+      created by an accepted bulk commit on the version N it replaced
+      (Section 4.6).
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  The core refuses the improbable; the client explains it.  The
+      measurement, the threshold, the confirmation check and the grant
+      disposition are enforced by the authority, in apply.  Clients
+      MUST route every destructive operation through the ordinary
+      commit so that one rule covers every surface (Section 5).  A
+      client MAY pre-compute the same rule to ask its user early; that
+      is a courtesy, never the enforcement.
+
+   3.2.  Measure NET loss, not gross churn.  A rename, a swap, a
+      re-add, a blind retry and a same-hash rewrite move no content out
+      of the tree and MUST NOT count.  A guard that counts gross deletes
+      fires on every directory move and is turned off within a week
+      (the well-known lesson of sync tools' delete limits).
+
+   3.3.  Blast radius is relative to what the token can reach.  A token
+      confined to one project that deletes that whole project has wiped
+      its world; the fraction is measured against the entries it could
+      have touched, not against the whole space (Section 4.2.4).
+
+   3.4.  Intent binding, not a magic flag.  The confirmation is the
+      authority's own numbers echoed back.  There is no "force" boolean
+      on the wire: a flag can be set by reflex, a number must be read.
+
+   3.5.  A speed bump for humans, a wall for agents.  Confirmation
+      protects against mistakes by a caller who can reconsider.  It does
+      not protect against a caller that always says yes.  For that the
+      grant carries the permission, and by default a writer grant does
+      not have it (Section 4.5).  Admin is never denied: an operator
+      with the admin role is the human in the loop by definition.
+
+   3.6.  Deterministic and replicated (ACP/1 Section 17).  The counts
+      and the decision are a pure function of (the base manifest, the
+      request, the policy, and the leader-stamped facts about the
+      token).  The grant itself is node-local auth data and never
+      enters the replicated log; the leader stamps its disposition and
+      its scope into the command, as EXT-27 already does for the read
+      scope.  No wall-clock, no node-local state, no timer in apply.
+
+   3.7.  The hot path stays byte-identical and cost-neutral.  A commit
+      whose loss counts are below the minimum thresholds MUST serialize
+      exactly as today and MUST NOT pay for a manifest-wide scan
+      (Section 4.2.8).  Confirmation, denial and the pre-bulk
+      checkpoint occur only on bulk commits.
+
+   3.8.  Loud, never silent.  A refused bulk names the exact counts,
+      the threshold, and the remedy.  A denied token is told it is
+      denied and what an operator must do.  Policy is visible in stats;
+      the token's disposition is visible in whoami.
+
+   3.9.  Non-goals.  This memo does NOT: guard collaborative-document
+      truncation (ACP/1 Section 12; the client-side truncation confirm
+      and the authority's truncation hold remain, and document op-log
+      retention is its own memo); guard a realtime-mode region (EXT-28
+      / EXT-31), which has no commit to measure (a further reason
+      realtime is opt-in where blast radius matters); rate-limit
+      deletes over time (blast radius is per request); or replace
+      EXT-33 -- a confirmed bulk change is still a change, and history
+      is what makes it reversible.
+
+
+4.  Design
+
+   4.1.  Capability.
+
+      The capability string "bulkguard", advertised on GET /v1/healthz
+      and /v1/stats (EXT-1 Section 7 convention), asserts ALL of
+      Sections 4.2 through 4.8.  An authority MUST NOT advertise
+      "bulkguard" unless every one of them is enforced, and MUST NOT
+      advertise it unless it also advertises EXT-33's "history" (the
+      pre-bulk checkpoint of Section 4.6 is part of the promise; a
+      guard that refuses without snapshotting is half the feature).
+      Absent the capability, "bulk_confirm" is ignored per ACP/1
+      Section 18, no commit is refused for size, and clients MUST NOT
+      assume any bulk protection exists.
+
+   4.2.  The measurement: net loss.
+
+      All of Section 4.2 is evaluated IN APPLY against the base
+      manifest M (Section 2), after the CAS has established that M is
+      current and after every other precondition of the commit has
+      passed (Section 4.4.5).  It is a pure function of (M, the
+      request, the policy, the leader-stamped measurement scope).
+
+      4.2.1.  Effective changes.  If a commit names the same path more
+         than once, the LAST change naming it is the effective change
+         for that path; earlier ones contribute nothing to the
+         measurement.  (An implementation MAY instead refuse duplicate
+         paths with 400; either way the measurement sees one change per
+         path.)  Let C be the set of effective changes, and let
+         REREF(C) be the set of hashes carried by the non-delete
+         changes in C.
+
+      4.2.2.  Net-loss deletes.  D is the number of effective changes c
+         in C such that:
+
+            c.deleted is true, AND
+            c.path is present in M, AND
+            M[c.path].hash is NOT in REREF(C).
+
+         A delete of a path absent from M is a no-op and counts 0 (so a
+         blind retry of an already-applied delete measures 0).  A delete
+         whose bytes reappear under another path in the same commit is
+         a rename or move and counts 0.  A delete of a path whose bytes
+         also live, untouched, under a DIFFERENT path not named in the
+         commit still counts 1: the rule is commit-local (Section 12
+         records the alternative and why it was rejected).
+
+      4.2.3.  Net-loss overwrites.  O is the number of effective
+         changes c in C such that:
+
+            c.deleted is false, AND
+            c.path is present in M, AND
+            c.hash != M[c.path].hash, AND
+            M[c.path].hash is NOT in REREF(C).
+
+         Writing the same hash again (an mtime refresh) counts 0.  A
+         swap of two files' contents (a <- b's hash, b <- a's hash)
+         counts 0.  Creating a path absent from M counts 0 -- adding
+         content is never destructive.
+
+      4.2.4.  Measurement scope and E.  E is the number of entries of M
+         whose path is admitted by the token's write scope (EXT-7
+         path_prefix; unscoped = every path) AND visible under its read
+         scope (EXT-27 read_prefix; unscoped = every path).  For an
+         unscoped token E is simply M's entry count.  Because EXT-27
+         Section B.6 requires a read-scoped grant's write scope to be
+         read-covered, every path in C is already inside the
+         measurement scope, so D and O need no filtering; only E does.
+         The leader stamps the scope prefixes into the command (Section
+         7.1); the apply MUST NOT consult the grant.
+
+      4.2.5.  Thresholds.  For each tally the policy (Section 4.3)
+         gives a minimum, a fraction and a hard cap.  The threshold is
+         the fraction of E, clamped between the minimum and the hard
+         cap:
+
+            T_D = clamp( ceil(bulk_fraction * E),
+                         bulk_min_paths, bulk_hard_paths )
+            T_O = clamp( ceil(bulk_overwrite_fraction * E),
+                         bulk_overwrite_min_paths,
+                         bulk_overwrite_hard_paths )
+
+         where clamp(x, lo, hi) = min(max(x, lo), hi).  ceil is exact
+         integer arithmetic: ceil(f * E) MUST be computed as
+         (E * num + den - 1) / den with the fraction carried as a
+         rational (Section 4.3.2), never as a floating-point product,
+         so every node rounds identically.  With the defaults
+         (10 / 0.10 / 100) a 50-entry scope has T_D = 10, a 500-entry
+         scope T_D = 50, a 5 000-entry scope T_D = 100.
+
+      4.2.6.  The decision.  A commit is BULK if and only if
+
+            D >= T_D   OR   O >= T_O .
+
+         The two tallies are independent: a commit that edits many
+         files is judged by the overwrite policy, a commit that removes
+         many files by the delete policy, and a commit doing both is
+         bulk if either crosses.  D and O are reported separately in
+         every response that carries them, and both are echoed in the
+         confirmation, so the caller confirms the shape of the change
+         and not only its size.
+
+      4.2.7.  Where it is evaluated.  In the replicated apply of the
+         commit, atomically with the CAS, never only at the HTTP edge
+         (the check-then-act class: state can move between a handler's
+         check and the apply).  A leader MAY pre-compute the same
+         function against its current manifest and refuse pre-propose
+         (keeping a doomed commit off the replicated log); that pre-
+         check is an optimisation and the apply's recomputation is the
+         truth.  When the two disagree (the tree moved between them),
+         the apply's verdict is served.
+
+      4.2.8.  Cost.  D and O are O(|C|): one map lookup per change plus
+         a hash set over C.  E for an unscoped token is O(1).  E for a
+         scoped token is O(|M|) but is needed ONLY when D >= min or
+         O >= min for the respective tally (below the minimum the
+         clamp makes the threshold unreachable), so an implementation
+         MUST short-circuit: a commit with D < bulk_min_paths and
+         O < bulk_overwrite_min_paths is NOT bulk and MUST NOT scan M.
+         The ordinary commit therefore pays |C| lookups it already pays
+         for prior-hash capture, and nothing else.
+
+   4.3.  Policy (per-space quota fields).
+
+      4.3.1.  Fields.  Six OPTIONAL per-space fields are added to the
+         EXT-7 Section 5.1 Quota object (replicated via quota.set),
+         plus one boolean:
+
+            "bulk_min_paths":            <uint32>?  ; default 10
+            "bulk_fraction":             <string>?  ; default "0.10"
+            "bulk_hard_paths":           <uint32>?  ; default 100
+            "bulk_overwrite_min_paths":  <uint32>?  ; default 50
+            "bulk_overwrite_fraction":   <string>?  ; default "0.50"
+            "bulk_overwrite_hard_paths": <uint32>?  ; default 500
+            "bulk_deny":                 <bool>?    ; default false
+
+         As with EXT-33's fields (and unlike EXT-7's own "absent is
+         unbounded"), an ABSENT field means THIS MEMO'S DEFAULT.  The
+         delete defaults are the owner-accepted numbers; the overwrite
+         defaults are this memo's recommendation (Section 12, first
+         question) chosen so that an ordinary multi-file edit is not
+         bulk while a whole-checkout rewrite is.
+
+      4.3.2.  Fraction encoding.  A fraction is carried as a decimal
+         string with at most four fractional digits ("0.10", "0.125")
+         and is interpreted as the exact rational num/10000.  A value
+         outside [0, 1] or with more digits is refused 400 at
+         quota.set.  Implementations MUST NOT parse it into a binary
+         floating-point value for the Section 4.2.5 arithmetic.
+
+      4.3.3.  Bounds and disabling.  min <= hard is REQUIRED (400
+         otherwise).  An operator who wants no guard on a scratch space
+         sets the minima and caps high (up to 2^32-1); the effective
+         policy is visible in /v1/stats (Section 4.8).  There is no
+         separate "off" switch: the numbers are the switch and they are
+         always visible.  A fraction of "0" makes the minimum the
+         threshold; a minimum of 0 makes every net loss bulk (allowed;
+         a space where every deletion must be confirmed).
+
+      4.3.4.  bulk_deny.  When true, a bulk commit in this space is
+         refused 403 bulk_denied for every token whose role is not
+         admin, regardless of the grant's disposition (Section 4.5).
+         A production space where nobody but an operator should ever
+         remove many files sets it.
+
+      4.3.5.  Sub-scopes.  EXT-7 Section 5.5 sub-scope quotas MAY carry
+         the same fields; for a commit that carries a sub_scope label,
+         the space policy and the sub-scope policy are both evaluated
+         and the commit is bulk if EITHER says so (the tighter bound
+         governs).
+
+   4.4.  The confirmation protocol (428).
+
+      4.4.1.  The demand.  A bulk commit whose request carries no
+         "bulk_confirm" MUST be refused, with NO state change:
+
+            428 Precondition Required
+            { "error":  "bulk change: this commit would delete D and
+                         overwrite O of E paths (thresholds T_D / T_O)
+                         at version V; re-send with bulk_confirm
+                         {deletes: D, overwrites: O} to proceed",
+              "code":   "bulk_confirm_required",
+              "bulk":   BulkVerdict }
+
+            BulkVerdict = { "deletes": D, "overwrites": O,
+                            "entries": E, "version": V,
+                            "threshold_deletes": T_D,
+                            "threshold_overwrites": T_O,
+                            "scoped": <bool> }
+
+         V is the base version the counts were computed against (equal
+         to the request's base_version).  "scoped" is true when E was
+         measured within a scope narrower than the space.  The body
+         MUST NOT include the manifest (EXT-27 B.5 write-echo; and the
+         body is bounded).  The numbers are the token's own view: for a
+         read-scoped token E is the filtered count, identical to what
+         GET /v1/manifest shows it (Section 6.1).
+
+      4.4.2.  The echo.  CommitRequest gains
+
+            "bulk_confirm": { "deletes": <uint32>,
+                              "overwrites": <uint32> }?
+
+         The client re-sends the SAME commit (same base_version, same
+         changes) with bulk_confirm set to the D and O it was told.  The
+         apply recomputes D and O and requires EXACT equality of both.
+         On equality the commit proceeds (Section 4.6 then applies).
+
+      4.4.3.  Mismatch.  If bulk_confirm is present and either number
+         differs from the recomputed value, the commit MUST be refused
+         428 with code "bulk_confirm_mismatch", the BulkVerdict of the
+         recomputation, and "confirmed": the numbers the client sent --
+         whether or not the commit is bulk.  A mismatch means the
+         client's model of the tree is wrong (it computed against a
+         stale view, or it computed wrongly); the safe response is to
+         stop and show both numbers, never to land the commit and never
+         to "round up".  Because the counts are a pure function of
+         (M at base_version, C), a client whose base_version matches
+         and whose changes are unchanged can only mismatch by
+         computing wrongly; a client whose base moved gets 409 before
+         the guard runs (Section 4.4.5).
+
+      4.4.4.  Unsolicited confirmation.  A client MAY send bulk_confirm
+         on its first attempt (having computed D and O locally from the
+         manifest it holds -- Section 5 clients do exactly this to save
+         a round trip).  If the commit is not bulk and the numbers are
+         exact, the field is accepted and has no effect; if the numbers
+         are inexact, Section 4.4.3 applies.  Malformed values (missing
+         member, out of range) are 400 bulk_confirm_invalid.
+
+      4.4.5.  Order of preconditions.  The guard is the LAST
+         precondition before the manifest mutates, so that a 428 means
+         "this exact commit will land if you confirm it".  The order
+         within apply is:
+
+            (1) CAS: base_version == current      else 409
+            (2) leases                             else 423
+            (3) path / hash / blob presence /
+                possession validation               else 400
+            (4) the bulk guard:
+                  denied  (Section 4.5)             else 403
+                  confirm required / mismatch       else 428
+            (5) restore_of verification (EXT-33)    else 400/404
+            (6) mutate; write the version record; create the pre-bulk
+                checkpoint (Section 4.6); append events.
+
+         Steps (1)-(3) are today's checks in today's order.  A refusal
+         at any step leaves the manifest, the records and the
+         checkpoints unchanged.
+
+      4.4.6.  A speed bump, not a wall.  Nothing in Section 4.4 stops a
+         client that copies the numbers back reflexively; that is why
+         Section 5 forbids reference clients from doing so without a
+         human or an explicit automation flag, and why Section 4.5
+         exists.  The confirmation's guarantees are exactly: (a) a
+         caller that did not read the authority's numbers cannot land a
+         bulk change; (b) a caller whose picture of the tree differs
+         from the authority's is stopped with both pictures shown;
+         (c) every bulk change that lands was stated in numbers by the
+         caller and recorded in the audit log (Section 4.7).
+
+   4.5.  The grant disposition: bulk denied by default.
+
+      4.5.1.  The surface.  "bulk" is a write SURFACE in the sense of
+         EXT-9 Section 8.2 / EXT-7 scope "deny": the act of landing a
+         bulk commit.  A token's DISPOSITION for the surface is either
+         "allowed" or "denied".
+
+      4.5.2.  The rule.  For a commit that Section 4.2 judges BULK:
+
+            role admin                        -> allowed (always)
+            space bulk_deny = true            -> denied  (non-admin)
+            grant scope deny contains "bulk"  -> denied
+            grant scope allow contains "bulk" -> allowed
+            otherwise (a writer with no disposition recorded)
+                                              -> DENIED
+
+         A denied token's bulk commit is refused 403 with code
+         "bulk_denied" and the BulkVerdict, whether or not it carries a
+         (correct) bulk_confirm -- denial is not confirmable.  The
+         error text MUST name the remedy: mint the grant with the
+         opt-in, or have an admin land the change.  A non-bulk commit
+         from a denied token is unaffected (the disposition is
+         consulted only for bulk).
+
+      4.5.3.  The opt-in field.  The EXT-7 Scope gains
+
+            "allow": [<string>]?        ; known value: "bulk"
+
+         the positive counterpart of "deny".  "deny" wins over "allow"
+         when both name the surface (a scope only narrows).  Unknown
+         values in either list MUST be refused at mint and at load
+         (fail-closed, as the reference implementation already does for
+         "deny": a value a binary cannot enforce never loads as an
+         unenforced no-op).
+
+      4.5.4.  Minting (informative).
+
+            coordd -mkagent bot-7 -role writer              ; denied
+            coordd -mkagent ops-1 -role writer -allow-bulk  ; allowed
+            coordd -mkagent bot-7 -role writer -deny bulk   ; explicit
+
+         An admin API that accepts a grant carrying "allow" MUST either
+         enforce it or reject the grant (400); it MUST NOT store and
+         ignore it.
+
+      4.5.5.  Fail-closed carriage.  A grant carrying "allow" MUST be
+         written in a BUMPED versioned envelope (version 5, one past
+         EXT-27's read-scope version 4), so a binary that predates this
+         memo refuses to start rather than load a grant it cannot
+         interpret.  (A grant carrying deny "bulk" is already refused
+         by such a binary under the unknown-value rule.)  The
+         reference implementation's grant decoder also refuses unknown
+         fields; the envelope bump is the documented, version-checked
+         form of the same guarantee.
+
+      4.5.6.  Pre-existing grants.  A writer grant minted before this
+         memo carries no disposition and is therefore DENIED on
+         upgrade.  This is a deliberate behaviour change in the safe
+         direction: the tokens most likely to be held by unattended
+         agents are exactly the ones minted without thinking about
+         bulk.  It is loud (403 with the remedy; whoami shows the
+         disposition, Section 4.8.1) and the remedy is one re-mint.
+         The operator who wants the old behaviour re-mints with the
+         opt-in.  (Section 12 records the alternative.)
+
+      4.5.7.  Shared-token mode.  A shared token has no grant.  Its
+         disposition follows the daemon's shared-token role: admin
+         (the default) is allowed; writer is denied unless the daemon
+         is started with an explicit opt-in flag (informatively
+         "-shared-token-allow-bulk"); reader cannot commit.
+
+      4.5.8.  Denial is a verdict about the token, not about the tree.
+         The 403 carries the same BulkVerdict a 428 would, computed
+         within the token's measurement scope, so the response reveals
+         nothing the token could not read (Section 10.2).
+
+   4.6.  Snapshot before bulk.
+
+      4.6.1.  When a bulk commit is ACCEPTED (Section 4.5 allowed,
+         Section 4.4 confirmed, every other precondition passed), the
+         apply MUST, in the SAME atomic apply that advances the
+         manifest from V to V+1, create the EXT-33 auto-checkpoint
+
+            name:    "auto/pre-bulk-v<V>"
+            version: V                     ; the version being replaced
+            actor:   the committing actor
+            created: the commit's leader-stamped time
+            note:    "bulk: deletes D, overwrites O of E"
+
+         with EXT-33 Section 4.6.4 semantics: a soft pin that retains
+         V for at least the space's history window regardless of the
+         minimum depth and the byte cap, then ages out; promotable by a
+         user-named checkpoint on V.  The name is unique by
+         construction (one prior version per commit).
+
+      4.6.2.  Never fails the commit.  Per EXT-33 Section 4.6.4, if the
+         space is at max_checkpoints the auto-checkpoint is OMITTED and
+         the commit still lands; the bulk.confirmed event (Section 4.7)
+         then carries "checkpoint": null and an authority SHOULD log a
+         warning.  V is still a retained version record under ordinary
+         retention -- the pin is belt, the record is braces.
+
+      4.6.3.  Not a replicated checkpoint.create.  The checkpoint is a
+         derived effect of the commit apply (a pure function of the
+         command and the applied state), not a separate command; it is
+         therefore identical on every node and atomic with the commit.
+         It appears on GET /v1/checkpoint like any other and is deleted
+         like any other (admin).
+
+      4.6.4.  Undo.  The reference client's "acp undo" (EXT-33 Appendix
+         D) looks for "auto/pre-bulk-v<V>" first: a bulk change is
+         undone with one restore whose source is named.
+
+   4.7.  Audit events.
+
+      The authority SHOULD append, in the commit's apply:
+
+         bulk.confirmed  after:  { version, deletes, overwrites,
+                                   entries, checkpoint: <name>|null }
+                         (on an accepted bulk commit, before the
+                          per-path file.* events)
+         bulk.refused    after:  { code: "bulk_confirm_required" |
+                                   "bulk_confirm_mismatch" |
+                                   "bulk_denied", deletes, overwrites,
+                                   entries, version, confirmed? }
+                         (on a refused bulk commit; the manifest did
+                          not change but the attempt is recorded --
+                          an agent that tried to wipe the tree is a
+                          fact the operator wants in the log)
+
+      Appending on refusal mutates replicated state (the event log) on
+      a refused write; it is deterministic (the verdict is) and bounded
+      by ACP/1 Section 5.4 rate limiting and EXT-7 max_events.  An
+      implementation MAY coalesce repeated refusals from one actor
+      within the leader's rate window; it MUST NOT drop the first.
+
+   4.8.  Whoami and statistics.
+
+      4.8.1.  GET /v1/whoami gains
+
+            "bulk": "allowed" | "denied"
+
+         the token's disposition in the selected space (Section 4.5.2
+         evaluated with bulk_deny), so a client can tell its user up
+         front ("this token cannot make bulk changes") instead of at
+         the end of a long push.
+
+      4.8.2.  GET /v1/stats gains a per-space block
+
+            "bulk": { "policy": BulkPolicy,      ; effective, defaults applied
+                      "deny":   <bool> }
+
+         BulkPolicy echoes the six threshold fields.  Counts of
+         confirmed and refused bulk commits are derivable from the
+         event log and MAY be reported as node-local metrics outside
+         the apply path.
+
+
+5.  One Rule, Every Surface (client contract)
+
+   The following is NORMATIVE for the reference clients and RECOMMENDED
+   for any client.  The principle: no client may bypass, weaken or
+   silently satisfy the core's guard; every client MUST turn the
+   guard's demand into a question its user can answer, or into a
+   refusal.
+
+   5.1.  Route everything through commit.  Every destructive
+      operation -- the CLI's rm and push deletions, the MCP commit tool,
+      a mount's unlink, rmdir and rename -- is expressed as changes in
+      an ordinary POST /v1/commit.  There is no other write path to the
+      manifest, so there is nothing to route around.
+
+   5.2.  Never echo blindly.  A client MUST NOT copy the numbers from a
+      428 into bulk_confirm without one of: (a) a human's answer on an
+      interactive terminal, having been shown the numbers and, where
+      practical, the paths; (b) an explicit automation flag whose
+      documented meaning is "confirm bulk changes" and which the caller
+      wrote knowingly; (c) for a language-model tool, the model itself
+      supplying the numbers as an explicit tool argument after being
+      shown the 428 text.  Reflexive echo turns the guard into a
+      click-through and is a conformance failure.
+
+   5.3.  Local pre-computation is encouraged.  A client holding the
+      manifest SHOULD compute D, O and E with Section 4.2's rule
+      before sending, show them, ask, and send bulk_confirm on the
+      first attempt.  If the authority then answers 428
+      bulk_confirm_mismatch, the client's view was stale or wrong: it
+      MUST show both sets of numbers and ask again (or refuse under
+      automation); it MUST NOT re-send the authority's numbers on its
+      own, even under the automation flag -- the flag confirmed the
+      numbers the user saw, not whatever the server says.
+
+   5.4.  Denied is not retryable.  On 403 bulk_denied a client MUST
+      surface the remedy text and MUST NOT retry with a confirmation.
+      A client SHOULD consult GET /v1/whoami "bulk" up front and warn
+      before starting a large operation with a denied token.
+
+   5.5.  A mount refuses synchronously.  A mounted filesystem cannot
+      ask its user.  It MUST evaluate Section 4.2 locally against its
+      cached manifest plus its pending buffer BEFORE acknowledging the
+      unlink/rmdir/rename that would make the pending batch bulk, and
+      fail that call with a permission error (so an "rm -rf" stops at
+      the first refused unlink, having buffered nothing bulk), unless
+      the mount was created with an explicit option whose documented
+      meaning is "confirm bulk changes" (then it forwards bulk_confirm
+      from its own computation).  If the authority nonetheless answers
+      428 on flush (the cache was stale), the mount MUST keep the
+      buffered changes (never drop acknowledged writes), surface the
+      error through its status surface, and MUST NOT auto-echo.  A
+      directory rename is delete + re-add of the same hashes and
+      measures 0 (Section 4.2.2): moving a tree in a mount is not bulk.
+
+   5.6.  Existing local guards stay.  The reference CLI's local sanity
+      checks (an emptied checkout, deleting what another agent changed
+      since the base) guard different questions with their own flags;
+      this memo's confirmation is additional, never a replacement, and
+      one flag MUST NOT satisfy both (the "one flag, two dangers"
+      lesson).
+
+   Appendix D gives the reference verbs and flags.
+
+
+6.  Interaction with Other Extensions
+
+   6.1.  EXT-27 (read_prefix).  E is measured within the token's read
+      scope (Section 4.2.4) and every count in a 428 or 403 body is the
+      token's own view; a read-scoped token learns nothing about out-
+      of-scope entries from the guard that it could not learn from GET
+      /v1/manifest.  The write-echo rule (B.5) applies: no manifest in
+      the 428/403 bodies.  The per-commit change cap for read-scoped
+      commits (the state-independent cap) is unchanged and precedes
+      the guard.
+
+   6.2.  EXT-7 (scopes, quotas).  The write scope defines the
+      measurement scope together with the read scope (Section 4.2.4);
+      the six fields and bulk_deny ride the Quota object and quota.set;
+      sub-scope policies compose by the tighter bound (Section 4.3.5).
+      The "allow" scope field is the positive twin of "deny" and obeys
+      the same only-narrows rule (deny wins).
+
+   6.3.  EXT-33 (history, checkpoints, restore).  REQUIRED (Section
+      4.1).  The pre-bulk checkpoint is an EXT-33 auto-checkpoint
+      (Section 4.6).  A RESTORE is a commit and is judged like any
+      other: a restore that re-points many paths is bulk, is confirmed
+      with the same echo, and creates its own pre-bulk checkpoint --
+      so a restore is itself undoable by name.  restore_of verification
+      runs AFTER the guard (Section 4.4.5), by design: the guard is
+      about INTENT ("do you mean to change this much?") and restore_of
+      about CORRECTNESS ("is this exactly version N?"); a caller
+      should learn the intent question first, and both refusals leave
+      state unchanged, so the order costs nothing.  A restore that
+      only re-adds paths (the wipe-then-undo case) measures 0 and needs
+      no confirmation.
+
+   6.4.  Leases (ACP/1 Section 10).  Unchanged and evaluated first
+      (423 precedes 428).  A bulk commit under another agent's lease is
+      refused for the lease before the guard is consulted.
+
+   6.5.  EXT-3 (capability URLs) and blob PUT.  Uploading bytes is
+      never destructive and is not measured.
+
+   6.6.  EXT-28 / EXT-31 (realtime regions).  A realtime-mode region
+      has no manifest commit; this memo does not cover it (Section
+      3.9).  A space that needs the guard keeps its regions in CAS mode.
+
+   6.7.  EXT-18 (provenance).  A bulk.confirmed event carrying the
+      caller's stated numbers is an attestation of intent; no coupling
+      is introduced.
+
+
+7.  Section 17 Determinism and High Availability
+
+   7.1.  Replicated command.  The commit command gains a leader-stamped
+      block (shape informative, semantics normative):
+
+         "bulk": { "allowed":  <bool>,       ; the token's disposition
+                                             ; (Section 4.5.2, incl.
+                                             ; role and bulk_deny)
+                   "scope":    [<prefix>]?,  ; write-scope prefixes,
+                                             ; absent = whole space
+                   "confirm":  { deletes, overwrites }? }
+                                             ; copied from the request
+
+      The read scope is already stamped (EXT-27 "read_prefix").  The
+      grant is NEVER read in apply: the leader evaluates role, space
+      bulk_deny (replicated, but folded here for one code path) and the
+      grant's allow/deny and stamps the verdict.  Everything else --
+      D, O, E, T_D, T_O, bulk, mismatch, the checkpoint -- is computed
+      in apply from the command and replicated state.
+
+   7.2.  Invariants.
+      o  No wall-clock, no randomness, no node-local state in apply
+         (ACP/1 Section 17 and amendment acp1-17-node-local-state).
+         The checkpoint's "created" is the commit's leader-stamped
+         time.
+      o  Integer arithmetic only for the thresholds (Section 4.2.5);
+         the fraction is a rational (Section 4.3.2).
+      o  The short-circuit of Section 4.2.8 is an optimisation that
+         yields the same verdict as the full computation on every node.
+      o  The leader's pre-check (Section 4.2.7) is an optimisation; a
+         node that skipped it and applied the command computes the same
+         verdict.
+      o  The pre-bulk checkpoint is a derived effect of the commit
+         apply (Section 4.6.3), in the replicated snapshot with the
+         other checkpoints (EXT-33 Section 7.2).
+      o  Policy fields are replicated via quota.set and part of the
+         snapshot.
+
+   7.3.  Conformance.  The determinism check ACP/1 Section 17 calls for
+      MUST include bulk commits in every outcome (428 required, 428
+      mismatch, 403 denied, 200 confirmed, 200 non-bulk), with scoped
+      and unscoped tokens and with per-space policy changes in the
+      stream, and MUST compare the verdicts, the manifests, the event
+      logs and the checkpoints across nodes (Section 11).
+
+
+8.  Capability Negotiation, Rollout and Migration
+
+   8.1.  Negotiation.  Clients feature-detect "bulkguard".  Without it
+      a client MUST NOT assume the authority refuses anything for size,
+      and SHOULD apply its own Section 5 courtesy checks anyway.
+
+   8.2.  Backward compatibility.  Byte-identical: any commit that is
+      not bulk; every read; every existing endpoint.  A new client
+      sending bulk_confirm to an old authority has the field ignored
+      (ACP/1 Section 18) and the commit lands unguarded -- the client
+      can tell from the missing capability.  An old client talking to a
+      new authority with a bulk commit gets 428, which it has never seen
+      on this endpoint: existing clients treat 409 as "rebase and
+      retry" and would loop, which is precisely why 428 was chosen --
+      old clients fail LOUDLY and stop, the correct failure mode for an
+      unguarded bulk delete.
+
+   8.3.  Cluster upgrade order (Class E3 hazard).  A node WITHOUT this
+      capability applying a commit command that carries the "bulk"
+      block ignores the block, does not measure, does not refuse, and
+      MUTATES -- while the upgraded nodes refuse with 428 or 403 and do
+      not.  The replicated state then DIVERGES (one node's manifest
+      advanced, the others' did not), the worst outcome of the mixed-
+      version class.  Therefore an operator MUST upgrade EVERY node of
+      a cluster before the first commit that follows the upgrade, and
+      an authority MUST NOT advertise "bulkguard" and MUST NOT stamp the
+      "bulk" block while it knows a member lacks the capability.  Where
+      the authority has no inter-node version exchange this is an
+      operational rule and MUST be documented as such, with a hazard
+      record.  (Forward pointer: a replicated-command schema version
+      that old nodes refuse would close this class for every future
+      extension; it is out of scope here.)
+
+   8.4.  Grants.  Existing writer grants become denied (Section 4.5.6);
+      operators re-mint the ones that need bulk.  The v5 envelope is
+      written only when a grant carries "allow".
+
+   8.5.  Rollout.  One phase behind one capability, after EXT-33 has
+      shipped (Section 4.1).  Reference clients (Appendix D) ship with
+      or immediately after the core; until they do, an old client's
+      bulk operation fails loudly with the 428 text, which names the
+      remedy.
+
+
+9.  Wire API Additions
+
+   Modified (all gated by "bulkguard"; ACP/1 Section 6 conventions):
+
+      POST /v1/commit           + OPTIONAL "bulk_confirm"
+                                -> 428 bulk_confirm_required |
+                                   428 bulk_confirm_mismatch |
+                                   403 bulk_denied |
+                                   400 bulk_confirm_invalid
+      GET  /v1/whoami           + "bulk": "allowed"|"denied"
+      GET  /v1/stats            + "bulk" block
+      PUT  /v1/admin/quota      + bulk_min_paths, bulk_fraction,
+                                  bulk_hard_paths,
+                                  bulk_overwrite_min_paths,
+                                  bulk_overwrite_fraction,
+                                  bulk_overwrite_hard_paths, bulk_deny
+      GET  /v1/healthz, /v1/stats  + "bulkguard" capability
+      Grant Scope (EXT-7)       + "allow": ["bulk"]; deny value "bulk"
+      GET  /v1/checkpoint       lists auto/pre-bulk-v<N> (EXT-33)
+
+   No new endpoint.  No ACP/1 amendment: the guard is an additive
+   precondition on an existing operation, and 428 joins Appendix B's
+   status summary as a reference line riding this memo's acceptance.
+
+
+10. Security Considerations
+
+   10.1.  The wall is the grant.  A token that is allowed bulk and
+      always confirms can still wipe the tree; with EXT-33 the wipe is
+      reversible, and with Section 4.7 it is attributed.  Operators
+      SHOULD mint unattended agents WITHOUT the opt-in and reserve
+      bulk-allowed writer grants for humans and reviewed automation.
+      Space bulk_deny makes a production space admin-only for bulk
+      regardless of grants.
+
+   10.2.  No oracle.  Every count in a 428 or 403 is computed within
+      the token's measurement scope; E equals the filtered manifest's
+      entry count; D and O are over paths the token wrote, which are in
+      scope by EXT-27 B.6.  The rename rule (REREF) is commit-local and
+      never consults out-of-scope entries.  A denied token receives the
+      same BulkVerdict shape as an allowed one.  Timing: the Section
+      4.2.8 short-circuit depends only on D and O, which depend only on
+      the token's own changes.
+
+   10.3.  Confirmation fatigue is a vulnerability.  A guard that fires
+      on routine work trains its users to confirm reflexively; the
+      overwrite tally therefore has its own, higher thresholds (Section
+      4.3.1) and net-loss counting removes renames, retries and no-ops.
+      An operator who lowers thresholds to "everything" should do so
+      only on a space where every deletion is genuinely exceptional.
+
+   10.4.  Refusal events as amplification.  bulk.refused appends to the
+      replicated log on a refused write.  It is bounded by rate
+      limiting and max_events and MAY be coalesced (Section 4.7); it
+      MUST NOT be droppable to the point of hiding a first attempt.
+
+   10.5.  The measurement is over the manifest, not the bytes.  A
+      large file overwritten with garbage is one net-loss overwrite; a
+      thousand tiny files deleted are a thousand.  Blast radius here is
+      paths, which is the unit the manifest and the undo operate in;
+      byte-level damage is the domain of history (EXT-33) and hash
+      verification.
+
+   10.6.  Not confidentiality, not authorization.  The guard does not
+      decide WHO may write WHAT (EXT-7 / EXT-24 do); it decides whether
+      a permitted write is plausible.  It composes with, and never
+      widens, any scope.
+
+
+11. Test Specification (the merge bar for an implementation)
+
+   An implementation MUST NOT advertise "bulkguard" until every test
+   below exists as a NAMED test in its suite and passes.  Tests marked
+   (exploit-first) MUST first be shown to FAIL on the pre-fix code with
+   the loss reproduced.  The clause-to-test map is maintained outside
+   the memo.
+
+   11.1.  The guard (the F-5 class).
+      T1  TestBulkDeleteWithoutConfirmIs428 (exploit-first) -- 200
+          files; one commit deleting all 200; 428 bulk_confirm_required
+          with deletes 200, entries 200; manifest, records and
+          checkpoints byte-identical before and after; on the pre-fix
+          code the same request returns 200 and entries 0.
+      T2  TestBulkOverwriteWithoutConfirmIs428 (exploit-first) -- 600
+          files overwritten with new hashes; 428 with overwrites 600.
+      T3  TestBulkConfirmMustMatchExactCounts -- deletes-1, deletes+1,
+          overwrites swapped with deletes, both zero: each 428
+          bulk_confirm_mismatch carrying "confirmed"; exact: 200.
+      T4  TestBulkConfirmOnNonBulkCommitIsExactOrRefused -- a 3-delete
+          commit with bulk_confirm {3,0} lands; with {4,0} is 428
+          mismatch; with no field lands byte-identically to today.
+      T5  TestBulkConfirmMalformedIs400.
+
+   11.2.  Net-loss counting.
+      T6  TestRenameIsNotLoss -- 200 deletes + 200 adds of the same
+          hashes under new paths: D = 0, O = 0, lands without confirm.
+      T7  TestSwapIsZeroLoss -- a <- hash(b), b <- hash(a): O = 0.
+      T8  TestSameHashOverwriteNotCounted -- rewriting the same hash.
+      T9  TestDeleteOfMissingPathNotCounted -- a blind retry of an
+          applied 50-delete commit at the new base measures 0.
+      T10 TestPartialReReferenceCountsOnlyUnreferenced -- delete 20,
+          re-add 5 of their hashes elsewhere: D = 15.
+      T11 TestDuplicatePathLastChangeWins -- (or 400 if the
+          implementation refuses duplicates; either is conformant, the
+          measurement sees one change per path).
+      T12 TestNetLossCountingPropertyFuzz -- random commits (add,
+          overwrite, delete, re-add, rename, swap, duplicate) against
+          random manifests; D and O equal a reference implementation of
+          Section 4.2; invariant: a commit whose post-state references
+          every prior hash of every changed path measures 0.
+
+   11.3.  Thresholds and scope.
+      T13 TestThresholdBoundaryMatrix -- E in {0, 5, 9, 10, 11, 99,
+          100, 101, 999, 1000, 1001, 10000}; for each, D at T_D-1, T_D,
+          T_D+1 and O at T_O-1, T_O, T_O+1; the clamp and the ceil are
+          exact; hard caps bite at 100 / 500.
+      T14 TestOrdinaryMultiFileEditIsNotBulk -- 12 edited files of 50:
+          not bulk (the fatigue case); 30 of 50: bulk by overwrite.
+      T15 TestTalliesAreIndependent -- 9 deletes + 49 overwrites of
+          1000: not bulk; 10 deletes + 0: bulk; 0 + 50 of 60: bulk.
+      T16 TestFractionUsesScopedEntriesForScopedToken -- path_prefix
+          projects/42/ over 50 of 10 000 entries; deleting all 50 is
+          bulk (E = 50); an unscoped token deleting the same 50 is not.
+      T17 TestFractionIsExactRational -- "0.10" of E = 15 is 2 (ceil),
+          identical on nodes with different float behaviour (forced via
+          a table, not a runtime).
+      T18 TestPolicyFieldsDefaultsAndValidation -- absent = default;
+          min > hard is 400; fraction "1.0001" / "-0.1" / 5 digits are
+          400; quota.set replicates; sub-scope tighter-bound governs.
+      T19 TestSpaceBulkDenyMakesBulkAdminOnly -- writer with allow
+          "bulk" is 403 under bulk_deny; admin is 428 then 200.
+
+   11.4.  Disposition.
+      T20 TestWriterGrantDeniedBulkByDefault (exploit-first) -- a plain
+          writer grant: bulk commit is 403 bulk_denied even with the
+          exact bulk_confirm; non-bulk commits from the same grant land;
+          on the pre-fix code the bulk commit lands.
+      T21 TestAllowBulkGrantIsConfirmable -- -allow-bulk: 428 then 200.
+      T22 TestDenyWinsOverAllow -- allow ["bulk"] + deny ["bulk"]: 403.
+      T23 TestAdminNeverDenied -- admin, with and without a grant deny
+          list: 428 then 200.
+      T24 TestMintFlagsAndEnvelopeV5 -- -allow-bulk writes allow
+          ["bulk"] in a v5 envelope; a v4-only binary refuses to start
+          on it; unknown allow/deny values refused at mint and load.
+      T25 TestPreExistingWriterGrantDeniedOnUpgrade -- a v2/v3/v4 grant
+          without disposition loads, and is denied bulk.
+      T26 TestSharedTokenDispositionFollowsRole -- admin allowed;
+          writer denied unless the daemon opt-in flag; reader cannot
+          commit.
+      T27 TestWhoamiReportsBulkDisposition -- per space, honours
+          bulk_deny.
+
+   11.5.  Ordering and state safety.
+      T28 TestBulkEvaluatedAfterCASAndLeases -- stale base: 409 not
+          428; another agent's lease: 423 not 428; missing blob: 400
+          not 428; then the guard.
+      T29 TestRefusedBulkLeavesEverythingUnchanged -- for 428 required,
+          428 mismatch, 403 denied: manifest, version records,
+          checkpoints, blob set byte-identical; only the event log
+          gains bulk.refused.
+      T30 TestLeaderPreCheckIsOptimisationApplyIsTruth -- the leader's
+          pre-check passes on its view, the tree moves before apply:
+          the apply's verdict (409 or a different 428) is served; no
+          state change.
+
+   11.6.  Snapshot before bulk (EXT-33 tie).
+      T31 TestBulkCommitCreatesPreBulkCheckpoint -- after a confirmed
+          200-delete commit at V: auto/pre-bulk-v<V> exists with
+          version V, the commit's actor and time, the note; GET
+          /v1/manifest?version=V is readable; every blob fetchable;
+          a restore with restore_of V brings back 200 entries; the
+          restore itself (bulk) creates auto/pre-bulk-v<V+1>.
+      T32 TestPreBulkCheckpointAtomicWithCommit -- a crash injected
+          between manifest persist and checkpoint persist leaves both
+          or neither.
+      T33 TestPreBulkCheckpointOmittedAtCapNeverFailsCommit -- at
+          max_checkpoints the commit lands, bulk.confirmed carries
+          checkpoint null, the record for V is still retained under
+          ordinary retention.
+      T34 TestPreBulkCheckpointIsSoftPin -- survives min-versions and
+          the byte cap within the window; ages out after; promotable.
+      T35 TestBulkguardNotAdvertisedWithoutHistory.
+
+   11.7.  Determinism and HA.
+      T36 TestBulkGuardDeterministicAcrossReplicas -- 3 nodes, skewed
+          clocks, a stream containing every verdict class, scoped and
+          unscoped tokens, quota.set mid-stream: verdicts, manifests,
+          events and checkpoints byte-identical; no node consults a
+          grant in apply.
+      T37 TestBulkStampNeverReadsGrantInApply -- the apply path has no
+          reference to grant storage (a structural/static test).
+      T38 TestSnapshotCarriesBulkPolicyAndPreBulkCheckpoints.
+      T39 TestOldNodeInMixedClusterIsDocumentedHazard -- at minimum a
+          hazard record and an operations note; where a version
+          exchange exists, refusal to advertise and to stamp.
+
+   11.8.  Hot path.
+      T40 TestNonBulkCommitByteIdentical -- request and response of a
+          9-delete / 49-overwrite commit serialize exactly as before;
+          no bulk.* event; no checkpoint.
+      T41 TestBelowMinimumNeverScansManifest -- with a 100 000-entry
+          manifest and a scoped token, a 9-delete commit performs no
+          manifest-wide iteration (instrumented), a 10-delete commit
+          does.
+
+   11.9.  No oracle.
+      T42 TestBulkNoOracleForReadScopedToken -- E in the 428/403 equals
+          the token's filtered manifest count; bodies for two tokens
+          with identical in-scope views and different out-of-scope
+          trees are byte-identical; timing smoke.
+
+   11.10. Audit.
+      T43 TestBulkConfirmedAndRefusedEvents -- shapes of Section 4.7;
+          refusal recorded once per attempt (or coalesced within the
+          rate window, never dropping the first).
+
+   11.11. Client contract (when built; Appendix D).
+      T44 TestAcpRmShowsCountsAsksAndForwardsConfirm -- TTY asks;
+          non-TTY refuses without --yes; --yes sends the locally
+          computed numbers; a server mismatch is shown and NOT
+          re-echoed even with --yes.
+      T45 TestAcpPushBulkConfirmSeparateFromLocalGuards --
+          --allow-bulk-delete does not confirm the server guard and
+          --yes does not satisfy the local emptied-checkout guard.
+      T46 TestAcpRestoreBulkIsConfirmedLikeAnyCommit.
+      T47 TestMCPCommitNeverAutoEchoes -- the bridge passes
+          bulk_confirm only when the model supplied it; a 428 is
+          returned to the model verbatim with the counts; a
+          bulk_denied is returned with the remedy and no retry.
+      T48 TestMountRefusesCrossingUnlinkSynchronously -- rm -rf stops
+          with a permission error at the first unlink that would make
+          the pending batch bulk; nothing bulk is buffered; with the
+          confirm option the batch flushes with bulk_confirm.
+      T49 TestMountRenameDirIsZeroLoss -- moving a 500-file tree
+          flushes without confirmation.
+      T50 TestMountStaleCacheOn428KeepsBufferAndSurfaces -- no
+          acknowledged write is dropped; no auto-echo.
+      T51 TestAcpUndoUsesPreBulkCheckpoint.
+
+
+12. Open Questions
+
+   o  OVERWRITE THRESHOLDS.  The accepted numbers (10 / 0.10 / 100)
+      were stated for "net destructive paths"; applied to overwrites
+      literally they make a 10-file edit bulk.  This memo gives
+      overwrites their own fields with defaults 50 / 0.50 / 500 and
+      recommends them (Section 10.3).  Owner call: accept, change, or
+      collapse to one set.
+
+   o  PRE-EXISTING WRITER GRANTS DENIED ON UPGRADE (Section 4.5.6).
+      Recommended: yes (safe direction, loud, one re-mint).
+      Alternative: only grants minted after the upgrade default to
+      denied, existing ones keep bulk until re-minted.
+
+   o  "bulkguard" REQUIRES "history" (Section 4.1).  Recommended: yes.
+      Alternative: allow the guard without the snapshot, with the
+      checkpoint clause conditional.
+
+   o  COMMIT-LOCAL vs TREE-GLOBAL RE-REFERENCE.  Section 4.2.2 counts a
+      delete whose bytes survive untouched elsewhere.  The tree-global
+      rule (count 0 if any surviving path references the hash) is more
+      lenient, costs O(|M|) per candidate commit, and makes deleting a
+      thousand identical files (or a thousand empty files) measure 0.
+      Recommended: commit-local.
+
+   o  A WHOLE-SCOPE CLAUSE.  Under the minimum of 10, a 5-entry scope
+      can be emptied without confirmation.  An extra clause "D >= E and
+      E >= 2 is bulk" would catch it at the cost of a second rule to
+      explain.  Recommended: no extra clause; operators of small
+      critical spaces lower bulk_min_paths (visible in stats).
+
+   o  bulk.refused EVENTS on refused writes (Section 4.7).  Recommended:
+      SHOULD, coalescable.  Alternative: log-only, no replicated event.
+
+   o  REFERENCE CLI FLAG NAME for the confirmation: "--yes" (this memo)
+      vs "--confirm-bulk".  Cosmetic; Appendix D uses "--yes".
+
+   o  SHARED-TOKEN WRITER OPT-IN FLAG NAME (Section 4.5.7).
+
+
+Appendix A.  New and Changed Data Types (JSON)
+
+   CommitRequest (ACP/1 Appendix A, extended; EXT-33 fields shown):
+      { "base_version": <uint64>, "changes": [Change],
+        "note": <string>?, "restore_of": <uint64>?,
+        "bulk_confirm": { "deletes": <uint32>,
+                          "overwrites": <uint32> }? }
+
+   BulkVerdict (new; carried in 428 and 403 bodies):
+      { "deletes": <uint32>, "overwrites": <uint32>,
+        "entries": <uint32>, "version": <uint64>,
+        "threshold_deletes": <uint32>, "threshold_overwrites": <uint32>,
+        "scoped": <bool> }
+
+   BulkPolicy (new; effective values, defaults applied):
+      { "bulk_min_paths": <uint32>, "bulk_fraction": <string>,
+        "bulk_hard_paths": <uint32>,
+        "bulk_overwrite_min_paths": <uint32>,
+        "bulk_overwrite_fraction": <string>,
+        "bulk_overwrite_hard_paths": <uint32> }
+
+   Quota (EXT-7 Section 5.1, extended):
+      { ..., "bulk_min_paths": <uint32>?, "bulk_fraction": <string>?,
+        "bulk_hard_paths": <uint32>?, "bulk_overwrite_min_paths":
+        <uint32>?, "bulk_overwrite_fraction": <string>?,
+        "bulk_overwrite_hard_paths": <uint32>?, "bulk_deny": <bool>? }
+
+   Scope (EXT-7, extended):
+      { ..., "deny": [<string>]?,     ; known: "awareness", "bulk"
+             "allow": [<string>]? }   ; known: "bulk"
+
+   Whoami (extended):  { ..., "bulk": "allowed" | "denied" }
+
+   Stats (extended):   "bulk": { "policy": BulkPolicy, "deny": <bool> }
+
+   Checkpoint (EXT-33): auto/pre-bulk-v<N> uses the EXT-33 shape.
+
+
+Appendix B.  New Error Conditions
+
+   428  bulk_confirm_required   the commit is bulk and carries no
+                                confirmation (body: BulkVerdict);
+                                no state change
+   428  bulk_confirm_mismatch   bulk_confirm present and not equal to
+                                the recomputed counts (body:
+                                BulkVerdict + "confirmed"); no change
+   403  bulk_denied             the commit is bulk and the token's
+                                disposition is denied, or the space
+                                sets bulk_deny and the role is not
+                                admin (body: BulkVerdict + remedy);
+                                not confirmable; no state change
+   400  bulk_confirm_invalid    malformed bulk_confirm
+   400  (quota.set)             bulk policy out of range: min > hard,
+                                fraction outside [0,1] or > 4 digits
+   400  (grant mint/load)       unknown "allow"/"deny" value
+   All follow ACP/1 Section 6.3 { "error": <string> } with the code as
+   a stable "code" field.  428 is new to POST /v1/commit; it is not
+   retryable without a changed request and MUST NOT be treated as 409.
+
+
+Appendix C.  Worked Examples
+
+   C.1.  The motivating case, stopped
+
+      > POST /v1/commit {"base_version":12,"changes":[200 x {deleted}]}
+      < 428 {"error":"bulk change: this commit would delete 200 and
+      <   overwrite 0 of 200 paths (thresholds 20 / 100) at version 12;
+      <   re-send with bulk_confirm {deletes: 200, overwrites: 0} to
+      <   proceed","code":"bulk_confirm_required",
+      <   "bulk":{"deletes":200,"overwrites":0,"entries":200,
+      <           "version":12,"threshold_deletes":20,
+      <           "threshold_overwrites":100,"scoped":false}}
+      (manifest still at 12; event bulk.refused appended)
+
+   C.2.  Confirmed by an allowed token; snapshot taken
+
+      > POST /v1/commit {"base_version":12,"changes":[200 x {deleted}],
+      >   "bulk_confirm":{"deletes":200,"overwrites":0}}
+      < 200 {"version":13,"entries":{}}
+      > GET /v1/checkpoint
+      < 200 [{"name":"auto/pre-bulk-v12","version":12,"actor":"ops-1",
+      <       "created":"...","note":"bulk: deletes 200, overwrites 0
+      <       of 200","entries":200}]
+      > POST /v1/commit {"base_version":13,"restore_of":12,
+      >   "changes":[200 x {path,hash,size}],
+      >   "bulk_confirm":{"deletes":0,"overwrites":0}}
+      < 200 {"version":14,"entries":{...200...}}   (re-adds are never
+                                                     destructive: not
+                                                     bulk; the field
+                                                     was exact so it
+                                                     is accepted)
+
+   C.3.  Denied by default
+
+      > POST /v1/commit {... 200 deletes ..., "bulk_confirm":
+      >   {"deletes":200,"overwrites":0}}          (token bot-7, writer)
+      < 403 {"error":"bulk change denied: this grant may not delete 200
+      <   or overwrite 0 of 200 paths; mint it with -allow-bulk or have
+      <   an admin apply the change","code":"bulk_denied",
+      <   "bulk":{...as C.1...}}
+
+   C.4.  A rename is not a loss
+
+      > POST /v1/commit {"base_version":14,"changes":[
+      >   200 x {"path":"old/<p>","deleted":true},
+      >   200 x {"path":"new/<p>","hash":<same>,"size":<same>}]}
+      < 200 {"version":15,...}                     (D = 0: every prior
+                                                     hash is re-referenced)
+
+   C.5.  A stale client is stopped twice
+
+      (client computed 47 deletes from a manifest it fetched an hour
+       ago; another agent since deleted 5 of them)
+      > POST /v1/commit {"base_version":30,...,
+      >   "bulk_confirm":{"deletes":47,"overwrites":0}}
+      < 409 {"error":"manifest version conflict — rebase on current"}
+      (client rebases to 33 and re-sends the surviving 42 deletes with
+       its old number)
+      > POST /v1/commit {"base_version":33,...,
+      >   "bulk_confirm":{"deletes":47,"overwrites":0}}
+      < 428 {"code":"bulk_confirm_mismatch","confirmed":{"deletes":47,
+      <   "overwrites":0},"bulk":{"deletes":42,...}}
+      (the CLI shows both and asks again; it does not re-echo 42)
+
+   C.6.  A scoped token's whole world
+
+      (grant path_prefix projects/42/; 50 of 10 000 entries)
+      > POST /v1/commit {... 50 deletes under projects/42/ ...}
+      < 428 {..."bulk":{"deletes":50,"entries":50,"version":...,
+      <   "threshold_deletes":10,"scoped":true,...}}
+
+   C.7.  Tuning a production space
+
+      > PUT /v1/admin/quota {"space":"prod","bulk_deny":true,
+      >   "bulk_min_paths":5,"bulk_fraction":"0.05"}
+      < 200 {...}
+
+
+Appendix D.  Client Verb Contract (normative for reference clients)
+
+   acp rm <path...>
+      Fetches the manifest, computes D/O/E locally (Section 4.2),
+      prints "this will delete D of E files" with the paths (elided
+      past a screenful), asks y/N on a TTY; without a TTY requires
+      --yes; sends bulk_confirm on the first attempt.  On 428 mismatch:
+      prints both numbers, asks again (TTY) or exits non-zero
+      (--yes).  On 403 bulk_denied: prints the remedy, exits non-zero.
+      --dry-run prints and touches nothing.
+
+   acp push [--yes] [--dry-run]
+      Same, over the derived delete + overwrite set; --yes confirms
+      the server guard ONLY; the existing local guards
+      (--allow-bulk-delete for an emptied checkout, --force-delete for
+      deleting what another agent changed) keep their own flags and
+      neither is implied by --yes.  --dry-run prints the exact change
+      list with D/O/E and touches nothing.
+
+   acp restore --version N [--yes]      (EXT-33 Appendix D)
+      A bulk restore is confirmed like any other commit.
+
+   acp undo
+      Prefers auto/pre-bulk-v<V> when the newest version by this actor
+      was a bulk commit.
+
+   acp whoami
+      Shows "bulk: allowed|denied" for the selected space.
+
+   MCP acp_commit
+      Gains an OPTIONAL "bulk_confirm" {deletes, overwrites} argument.
+      The tool description tells the model: a bulk_confirm_required
+      error means the change would remove or replace many files; re-
+      read the manifest, reconsider, and only if the change is
+      intended call again with bulk_confirm set to exactly the numbers
+      in the error.  The bridge NEVER fills the field itself and never
+      retries a 428 or a 403.  A denied token's 403 is returned with
+      the remedy text so the model can tell its operator.
+
+   Mount (browser virtual filesystem / native mount)
+      Option { bulk: "refuse" | "confirm" }, default "refuse".
+      "refuse": the unlink/rmdir/rename that would make the pending
+      batch bulk fails synchronously with a permission error; nothing
+      bulk is buffered.  "confirm": the mount computes and forwards
+      bulk_confirm; a 428 mismatch or a 403 is surfaced through the
+      mount's status/events surface and the buffer is kept.  Directory
+      rename measures 0 and never trips the guard.
+
+   None of these adds a wire operation beyond Section 9.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .  It builds on ACP/1 Sections 11
+   and 17, EXT-7, EXT-9 Section 8.2, EXT-27 and EXT-33.
