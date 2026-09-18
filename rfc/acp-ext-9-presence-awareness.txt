@@ -42,6 +42,13 @@ Abstract
 
 Status of This Memo
 
+   ACCEPTED + IMPLEMENTED (ratified by the protocol owner, 2026-08-21).
+   Shipped in v0.1.7 (2026-07-28); the `awareness` capability is
+   advertised via /v1/healthz (Section 5). This supersedes the
+   "PROPOSAL" status below, which is retained for history. (The owner
+   had already APPROVED this extension per the 26 Jul 2026 revision
+   note; this block records the acceptance + the implemented state.)
+
    This is a PROPOSAL, not yet part of the normative ACP/1
    specification (rfc/acp-1.txt).  It is published for review by
    implementers and for the protocol owner's approval.  The extension

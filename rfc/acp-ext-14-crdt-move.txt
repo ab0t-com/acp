@@ -46,6 +46,14 @@ Abstract
 
 Status of This Memo
 
+   ACCEPTED + IMPLEMENTED (ratified by the protocol owner, 2026-08-21).
+   Revision B (below) resolved the blocking self-contradiction; the
+   `crdtjson-move` capability is implemented, enforced, tested, and
+   advertised (always-on per the owner's 2026-07-23 rollout decision).
+   This supersedes the "NOT ready for implementation" / "PROPOSAL"
+   wording below, retained for history; the pre-drafted
+   `ext14-status-accepted` amendment is signed with this block.
+
    [ REVISION B APPLIED (2026-07-23): the independent adversarial
      review (tickets/crdt-json-move-20260722/REVIEW_opus_rfc.md) found
      a BLOCKING self-contradiction (its F1): the draft's observed

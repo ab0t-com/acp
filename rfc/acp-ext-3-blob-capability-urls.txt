@@ -337,6 +337,16 @@ Table of Contents
 
 5.  The Tokenless Fetch Path
 
+   [ AMENDMENT NOTE -- 2026-09-11: Section 5 below is the ORIGINAL draft
+     shape and is SUPERSEDED by the owner-amended governing form (see
+     Section 4 / the memo's status block): the shipped path is
+     `GET /v1/cap/blob/{hash}` with query params `sp` (space), `e`
+     (expiry), `k` (key id), `s` (signature) -- NOT the
+     `/v1/blobs/{hash}/get` + `exp/sig/kid` names shown here.  The
+     `sp/e/k/s` form GOVERNS; this section is retained for history and
+     will be reconciled into the body on the next revision.  Marker
+     retained per the amendment-governance SOP. ]
+
    5.1.  Shape.
 
       The minted URL points at a NEW, UNAUTHENTICATED path:

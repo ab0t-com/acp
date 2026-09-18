@@ -1,10 +1,32 @@
 # Changelog
 
-## Unreleased — target v0.2.1 · HELD (built, NOT yet published)
-> ⚠️ **This version is BUILT but NOT RELEASED.** It is intentionally held to batch
-> more features before a public cut — the version number **v0.2.1 is still active
-> for work** (more entries may be added below before it ships). `releases/latest.txt`
-> stays at **v0.2.0** until `release-public`. Do not treat these notes as shipped.
+## v0.2.1 — 2026-09-18
+Patch release. Adds the **agent-safety layer** — a wrong or runaway change is now recoverable, and a
+mass-delete can't happen by accident — plus read-path scoping and one-string `acp://` addressing. Wire
+protocol `acp/1` is unchanged (additive, capability-negotiated); no action required to upgrade.
+
+- **Recover from anything (ext-33; capability `history`).** Every manifest version is retained for a
+  window (default 30 days or the newest 100, whichever is longer), so a wrong overwrite or delete is
+  undoable. `acp history` lists versions and per-file timelines; `acp show <path> --version N` reads a
+  past version; `acp restore --version N` brings file(s) — or the whole tree — back as a normal forward
+  commit (nothing is re-uploaded; retained data is pinned against garbage collection). Named
+  `acp checkpoint`s pin a known-good state. Restore is itself reversible, and history survives compaction.
+  New MCP tools `acp_history` / `acp_restore`.
+- **Can't mass-delete by accident (ext-34; capability `bulkguard`).** A commit that would delete or
+  overwrite a large share of the tree is refused (`428`) until the caller confirms the exact counts
+  (`--confirm-bulk`), and an ordinary writer token is denied bulk changes by default — so a buggy loop
+  cannot wipe a space. Net-loss counting (a rename or same-content swap counts as zero), and an automatic
+  pre-change checkpoint is pinned with every accepted bulk change.
+- **Read-path scoping (ext-27; capability `scopedtokens.read`).** A token can be confined to a slice of
+  the tree for **reads**, not just writes — and an out-of-scope path is indistinguishable from a missing
+  one (no existence oracle). A separate space remains the only hard isolation boundary.
+- **One-string addressing (ext-32; capability `acpuri`).** `acp://host/space/path` names a resource — to
+  connect with, or to share as a signed, expiring, tokenless link; `acp open` routes it at the OS level,
+  and the daemon can serve an optional read-only `/.well-known/acp` discovery document. A raw token is
+  never placed in a URL.
+- **Client quality-of-life.** `acp whoami`; safer bulk `acp rm` / `push` (exact-count confirm); a
+  non-blocking `acp events` log reader; simpler `acp lease release` (no manual fence token); and `ACP_HOME`
+  documented for isolating client profiles + cache from `~/.acp`.
 
 - **Go SDK made externally-consumable (ext-23).** The `pkg/client` Go SDK's method
   signatures now use public wire-type packages (`pkg/wire`, `pkg/crdt`, `pkg/crdtjson`)

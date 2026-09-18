@@ -62,7 +62,7 @@ Grab the auto-generated token and point any client at it:
 docker exec coordd cat /data/token
 ```
 
-Pin a version with `ab0tcom/acp:v0.2.0`. Exposing it beyond localhost? Add `-hosts <your-host>` so
+Pin a version with `ab0tcom/acp:v0.2.1`. Exposing it beyond localhost? Add `-hosts <your-host>` so
 the certificate trusts that name. **Full walkthrough — TLS, configuration, docker-compose,
 clustering — in [docs/DOCKER.md](docs/DOCKER.md).**
 
@@ -73,6 +73,8 @@ clustering — in [docs/DOCKER.md](docs/DOCKER.md).**
 - **Comms** — directed mailbox (`send`/`inbox`) + a totally-ordered event log (`watch`).
 - **Live presence** — ephemeral awareness (cursors, typing, status) that self-expires in seconds and never touches durable storage; optional WebSocket.
 - **Safe concurrency** — TTL leases with fencing tokens; never lose work.
+- **Recover from anything** — every version is retained; `acp history` / `acp restore` undo a wrong overwrite or delete as a normal forward commit, and a named `acp checkpoint` pins a known-good state.
+- **Can't mass-delete by accident** — a commit that would wipe a large share of the tree is refused until you confirm the exact counts (`--confirm-bulk`), and an ordinary writer token can't land a bulk change at all — a runaway loop can't wreck the workspace.
 - **Multi-tenant** — isolated **spaces** on one daemon; per-agent identity + roles.
 - **HA** — run a 3-node **Raft** cluster (auto failover); **mTLS** between nodes; **encryption at rest**.
 - **Storage modes** — file-backed by default, or **server DB mode (ACPDB)**: `coordd-server` embeds a real database for bounded, flat memory at scale. Same protocol, lossless conversion either way, no sidecar — *in server mode, ACP is the database*. → [docs/STORAGE-MODES.md](docs/STORAGE-MODES.md)
@@ -88,6 +90,10 @@ can feature-detect instead of trial-and-erroring requests:
 - `crdtjson` — structured (JSON) CRDT documents, in addition to text CRDT sync.
 - `crdtjson-move` — identity-preserving `mv` op for the JSON CRDT: reorder/relocate a node or array element without losing a peer's concurrent edit to it (safe drag-to-reorder, move-between-columns, reparent).
 - `scopedtokens` — narrower-than-admin token grants.
+- `scopedtokens.read` — confine a token to a subtree for **reads** too, not just writes; an out-of-scope path is indistinguishable from a missing one (no existence oracle).
+- `history` — retained version history + restore/checkpoint: undo a wrong overwrite or delete as a forward commit (nothing re-uploaded; retained data is pinned against GC).
+- `bulkguard` — a commit that would delete/overwrite a large share of the tree is refused (`428`) until the exact counts are confirmed; ordinary writer tokens are denied bulk changes by default.
+- `acpuri` — one-string `acp://host/space/path` addressing, signed + expiring tokenless share links, and an optional read-only `/.well-known/acp` discovery document.
 - `quotas` — per-space resource limits.
 - `tenancy`, `tenancy.subscope` — scoped tokens + quotas + sub-scope project labels within a space (least-privilege; a space remains the only hard isolation boundary).
 - `awareness`, `awareness-ws` — live, self-expiring presence (cursors, typing, status), never written to durable storage; optional WebSocket transport with a 15 Hz server-side coalescing tick.

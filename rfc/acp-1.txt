@@ -530,10 +530,10 @@ Table of Contents
    operations; (4) write the converged text back.  Deriving local edits
    MUST occur before applying remote operations.
 
-====== BEGIN UNSIGNED AMENDMENT · id=acp1-12.6-readwatcher-epoch · proposed 2026-07-28 · NOT normative until ratified ======
-   [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-07-28; awaiting protocol-
-     owner ratification per the amendment-governance SOP; NOT yet normative.
-     Recorded here for review. ]
+====== BEGIN RATIFIED AMENDMENT · id=acp1-12.6-readwatcher-epoch · proposed 2026-07-28 · RATIFIED by the protocol owner 2026-08-21 ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-08-21 (proposed
+     2026-07-28) per the amendment-governance SOP; now NORMATIVE.  The
+     marker block is retained for provenance. ]
 
    A client that tracks a document by the pull cursor of Section 12.4 --
    INCLUDING a read-only watcher that never pushes -- MUST observe the
@@ -544,7 +544,7 @@ Table of Contents
    without checking "epoch" may, after a compaction, misread indices or
    stall.  The push epoch barrier (Section 12.3) protects writers; this
    extends the same barrier to pure readers.
-====== END UNSIGNED AMENDMENT · id=acp1-12.6-readwatcher-epoch ======
+====== END RATIFIED AMENDMENT · id=acp1-12.6-readwatcher-epoch ======
 
 13. Presence
 
@@ -634,6 +634,92 @@ Table of Contents
 
    /v1/admin/* operations REQUIRE the admin role (Section 5.3).
 
+====== BEGIN RATIFIED AMENDMENT · id=acp1-15-gc-retained-history · proposed 2026-09-11 · RATIFIED by the protocol owner 2026-09-11 ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-09-11 (proposed
+     2026-09-11, EXT-33 Manifest History, Retention and GC-Pin) per the
+     amendment-governance SOP; now NORMATIVE.  It extends Section 15's
+     garbage-collection reachability; it tightens (GC keeps MORE), it
+     relaxes nothing.  The marker block is retained for provenance. ]
+
+   15.1.  Garbage-Collection Reachability with Retained History
+
+   An authority that retains historical manifest versions (EXT-33)
+   MUST compute blob reachability for POST /v1/admin/gc as the union of
+   the blob hashes referenced by:
+
+      (a) the current manifest, AND
+      (b) every RETAINED historical version record (those the space's
+          retention policy has not evicted), AND
+      (c) every version record pinned by a live checkpoint.
+
+   A blob reachable under (a), (b) or (c) MUST NOT be reclaimed.  The
+   grace window (grace_sec) continues to apply to unreachable blobs
+   exactly as before.  The reachability set MUST be derived solely from
+   replicated state (Section 17); the eviction of a historical record
+   (which can make a blob unreachable) MUST itself be a replicated,
+   leader-driven command and MUST NOT be performed inside the GC sweep.
+
+   Event-log compaction (Section 8.5) MUST NOT remove historical version
+   records; they are derived state that is independently durable, in the
+   same sense as the manifest and leases.
+
+   An authority that does not implement EXT-33 has no retained records
+   and no checkpoints; for it, (b) and (c) are empty and this rule
+   reduces to the existing text of Section 15.
+====== END RATIFIED AMENDMENT · id=acp1-15-gc-retained-history ======
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-15-gc-realtime-tree · proposed 2026-09-12 · RATIFIED by the protocol owner 2026-09-12 (build direction) ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-09-12 on the
+     strength of the recorded build direction for the realtime-filesystem
+     chain (EXT-28 CRDT Directory Tree), per the amendment-governance SOP;
+     now NORMATIVE.  Extends Section 15's garbage-collection reachability
+     to a space that HAS an EXT-28 realtime directory tree in replicated
+     state; it tightens (GC keeps MORE), it relaxes nothing.  Composes with
+     amendment acp1-15-gc-retained-history (EXT-33).  Revised per the
+     independent design review (finding B: reachability keyed on eviction
+     STATE, not a clock/age read; and, jointly with EXT-31, the post-flip
+     gap: a retained realtime tree/trash stays pinned after a
+     realtime->cas flip).  The marker block is retained for provenance. ]
+
+   15.2.  Garbage-Collection Reachability for a Realtime Directory Tree
+
+   For a space (or path region) that HAS an EXT-28 CRDT directory tree in
+   replicated state -- whether the region is CURRENTLY in realtime mode,
+   OR retains a pre-flip realtime tree and trash from a prior EXT-31
+   realtime->cas flip that is still within its retention window -- an
+   authority MUST compute blob reachability for POST /v1/admin/gc as the
+   union of the blob hashes referenced by:
+
+      (a) every LIVE node of the tree (reachable from ROOT without
+          passing through TRASH), AND
+      (b) every RETAINED trashed node (those the space's retention policy
+          has NOT evicted -- i.e. still PRESENT in replicated state;
+          eviction is solely via EXT-28 fs.prune), AND
+      (c) every node pinned by a live checkpoint (EXT-33).
+
+   A blob reachable under (a), (b) or (c) MUST NOT be reclaimed.  The
+   grace window (grace_sec) continues to apply to unreachable blobs
+   exactly as before.  The reachability set MUST be derived solely from
+   PRESENCE in replicated state (Section 17); an authority MUST NOT key
+   reachability on a re-read of a node's age or on any clock.  The
+   eviction of a retained trashed node -- which can make a blob
+   unreachable -- MUST be a replicated, leader-driven command (EXT-28
+   fs.prune) and MUST NOT be performed inside the GC sweep.  A file node
+   whose content is a live CRDT document (Section 12) is reachable
+   through that document's own reachability, unchanged.
+
+   Because reachability keys on the PRESENCE of the retained realtime
+   tree/trash and NOT on the region's current mode, a realtime->cas flip
+   (EXT-31) does NOT narrow this reachability: a region's retained
+   pre-flip trash stays pinned for the remainder of its EXT-28 retention
+   window, and is evicted only by fs.prune, exactly as before the flip.
+
+   A space that has NEVER had a realtime tree (a CAS-only space with no
+   retained pre-flip realtime structure) has empty (a),(b),(c); this rule
+   does not apply to it (Section 15 and amendment acp1-15-gc-retained-
+   history govern).
+====== END RATIFIED AMENDMENT · id=acp1-15-gc-realtime-tree ======
+
 16. Wire API Reference
 
    All paths are rooted at /v1 and operate within the X-ACP-Space space.
@@ -667,6 +753,30 @@ Table of Contents
    POST /admin/compact?doc=      -> {dropped}              (admin)
    POST /admin/cluster/join      {node_id,raft_addr} -> {} (admin)
    GET  /cluster/status          -> cluster status
+====== BEGIN RATIFIED AMENDMENT · id=acp1-16-history-endpoints · proposed 2026-09-11 · RATIFIED by the protocol owner 2026-09-11 ======
+   [ AMENDMENT -- RATIFIED 2026-09-11 (EXT-33).  Additive reference lines
+     for the history endpoints; gated by the "history" capability. ]
+   GET    /manifest?version=N     past manifest (a version record) | 404
+   GET    /history?limit=&before= retained versions (newest first)
+   GET    /history?path=&...      a path's timeline
+   POST   /checkpoint             {name,version?,note?} -> Checkpoint (writer)
+   GET    /checkpoint[?name=]     -> [Checkpoint] | Checkpoint          (reader)
+   DELETE /checkpoint?name=       -> {ok} | 404                          (admin)
+   POST   /admin/history/prune    -> {evicted,oldest_version}           (admin)
+   POST   /commit                 + OPTIONAL "restore_of" -> 400 restore_mismatch |
+                                    404 version_pruned
+====== END RATIFIED AMENDMENT · id=acp1-16-history-endpoints ======
+====== BEGIN RATIFIED AMENDMENT · id=acp1-16-crdtfs-endpoints · proposed 2026-09-12 · RATIFIED by the protocol owner 2026-09-12 (build direction) ======
+   [ AMENDMENT -- RATIFIED 2026-09-12 (EXT-28 CRDT Directory Tree).
+     Additive reference lines for the realtime directory-tree endpoints;
+     gated by the "crdtfs" capability and served only for a space in
+     realtime mode (a CAS-mode space answers them 409 wrong_fs_mode). ]
+   POST   /fs/ops                 {ops:[create|mkdir|rename|move|delete|restore]} -> {applied} (writer; never 409)
+   GET    /fs/tree                materialized live tree, read_prefix-filtered   (reader)
+   GET    /fs/trash               retained trashed roots in scope                (reader)
+   POST   /admin/fs/prune         -> {evicted,oldest_trashed_at,history_bytes_over_cap} (admin)
+   POST   /admin/fs/mode          {mode:cas|realtime} -> {mode}                   (admin)
+====== END RATIFIED AMENDMENT · id=acp1-16-crdtfs-endpoints ======
 
 17. Determinism Requirements
 
@@ -681,10 +791,10 @@ Table of Contents
    leader.  Conformance SHOULD be verified by applying an identical
    command stream to independent state machines and comparing results.
 
-====== BEGIN UNSIGNED AMENDMENT · id=acp1-17-node-local-state · proposed 2026-07-28 · NOT normative until ratified ======
-   [ PROPOSED AMENDMENT -- UNSIGNED.  Dated 2026-07-28; awaiting protocol-
-     owner ratification per the amendment-governance SOP; NOT yet normative.
-     Recorded here for review. ]
+====== BEGIN RATIFIED AMENDMENT · id=acp1-17-node-local-state · proposed 2026-07-28 · RATIFIED by the protocol owner 2026-08-21 ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-08-21 (proposed
+     2026-07-28) per the amendment-governance SOP; now NORMATIVE.  The
+     marker block is retained for provenance. ]
 
    The prohibited "other non-deterministic inputs" explicitly INCLUDE any
    NODE-LOCAL state: the local filesystem's contents or layout, storage-
@@ -697,7 +807,7 @@ Table of Contents
    NOT influence the applied result.  Such values MAY be read OUTSIDE the
    apply path (for example to serve /v1/stats or an operational metric) but
    MUST NOT change replicated state.
-====== END UNSIGNED AMENDMENT · id=acp1-17-node-local-state ======
+====== END RATIFIED AMENDMENT · id=acp1-17-node-local-state ======
 
 18. Versioning and Compatibility
 

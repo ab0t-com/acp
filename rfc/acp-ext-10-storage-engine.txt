@@ -40,6 +40,13 @@ Abstract
 
 Status of This Memo
 
+   ACCEPTED + IMPLEMENTED (ratified by the protocol owner, 2026-08-21).
+   The Store interface and the server DB mode shipped opt-in in v0.2.0
+   (default remains the file format); introspected via /v1/stats, never
+   advertised as a wire capability (RFC Section 3.1). This supersedes
+   the "PROPOSAL" status below, retained for history. Amendment 1
+   (implementation record) is ratified with this block.
+
    This is a PROPOSAL, not yet part of the normative ACP/1
    specification (rfc/acp-1.txt).  It is published for review by
    implementers and for the protocol owner's approval.  The extension
