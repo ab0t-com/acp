@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.2.2 — 2026-09-19
+Patch release. Adds the **native cross-OS mount** — use a space as an ordinary folder — plus **realtime shared
+spaces**, and a batch of data-integrity fixes. Wire protocol `acp/1` is unchanged (additive; the mount is a pure
+client, adds no wire); no action required to upgrade. (Server/DB-mode operators: see the one-time storage-migration
+note at the end.)
+
+- **Mount a space as an ordinary folder (ext-37 — Mountable ACP).** `acp mount <space> <mountpoint>` presents a space
+  as a **native, read-write directory**: `ls`, `cat`, an editor's save, `cp`, `mv`, `rm`, `grep`, `find`, a build all
+  operate on the shared tree directly — no ACP verbs to learn, no app, no GUI. `acp umount` (or Ctrl-C) detaches;
+  `--daemon` backgrounds it.
+  - **One command, every OS — adapter auto-selected.** Linux → native FUSE; macOS → FUSE (macFUSE) or a kext-less
+    NFS-loopback; Windows → WebDAV mapped to a drive letter (e.g. `Z:`). `--backend=fuse|nfs|webdav` (env
+    `ACP_BACKEND`) overrides.
+  - **Safety for free, on by default.** A runaway bulk delete is refused before it happens (opt in with
+    `--allow-bulk`; every version retained so `acp history`/`acp restore` still undoes it); a same-file race never
+    loses a byte — the loser lands beside the winner as a `.conflict-…` sidecar (`--conflict=error` for a hard
+    failure), journaled to `.acp/conflicts.jsonl`; a teammate's change follows the space live; the cache never serves a
+    stale negative (create-then-stat always works).
+  - **Platform status.** Linux (FUSE) is fully tested on real kernels. macOS and Windows are built + wired and proven
+    on the Linux side, with real-device kernel-mount verification still pending. Per-OS guide:
+    `docs/mount/mounting-walkthrough.md`.
+  - Ships as a separate `acp-mount` binary next to `acp` (static, `CGO_ENABLED=0`).
+
+- **Realtime shared spaces (ext-28 CRDT directory tree + ext-31 filesystem mode).** A space can run in **realtime
+  mode** — a conflict-free directory tree where structure changes (create/rename/move/delete) and live documents
+  converge with no `409`s — or stay in the default **CAS mode** (strict, auditable). The per-space switch is a
+  lossless, atomic, auditable flip and history spans it. The mount presents a realtime space as a live shared drive.
+
+- **Data-integrity fixes across co-editing, sync, and retry.** A concurrent edit is never silently dropped —
+  co-editing (`acp crdt push`), `acp pull` merge, the mount's reconcile, and the MCP document bridge now **rebase**
+  your change onto the latest state instead of re-diffing against a moved base, so a teammate's already-committed edit
+  can't be overwritten when a background compaction lands between your read and your write. A lost acknowledgement no
+  longer fabricates a conflict or a false loss (a retry recognizes its own already-applied write). Opt-in exactly-once
+  for durable writes: `acp log` / `acp send` accept `--idempotency-key`.
+
+- **SDK: live-follow signals the connection on stream open.** The Go SDK reports connected/live as soon as the stream
+  is established (not on the first event), matching the TypeScript SDK. Additive `FollowOptions{OnOpen}`; existing
+  `Follow`/`FollowFiltered` callers unchanged.
+
+- **Server/DB storage mode: one-time migration + never-downgrade.** The server (embedded-DB) build performs a
+  **one-time, lossless, crash-safe on-disk key-layout migration** on first start of this version (fixing a nested-name
+  key-collision in the DB profile). **Do not downgrade a node after it has migrated** — a downgraded-then-re-upgraded
+  node cannot self-heal; rebuild it from a healthy peer. The default `file` storage mode is unaffected.
+
 ## v0.2.1 — 2026-09-18
 Patch release. Adds the **agent-safety layer** — a wrong or runaway change is now recoverable, and a
 mass-delete can't happen by accident — plus read-path scoping and one-string `acp://` addressing. Wire
