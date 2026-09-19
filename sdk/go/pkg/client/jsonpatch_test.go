@@ -58,7 +58,9 @@ func TestJSONPatchMapsEachOp(t *testing.T) {
 			[]crdtjson.Op{{T: crdtjson.OpDel, Path: []any{"nodes", "n1"}}}},
 		{"remove array index", PatchOp{Op: "remove", Path: "/items/0"},
 			[]crdtjson.Op{{T: crdtjson.OpLDel, Path: []any{"items", 0}}}},
-		{"test dropped", PatchOp{Op: "test", Path: "/title", Value: val}, nil},
+		// NOTE: "test" is not in this table — it is not a shape-mapping op. It
+		// is an assertion the doc-less mapper cannot evaluate (returns
+		// ErrNeedsDoc); its behavior is pinned by the CL-8.5 tests below.
 		{"escaped pointer segments", PatchOp{Op: "add", Path: "/a~1b/c~0d", Value: val},
 			[]crdtjson.Op{{T: crdtjson.OpSet, Path: []any{"a/b", "c~d"}, Value: val}}},
 	}
@@ -185,7 +187,6 @@ func TestJSONPatchRoundTripLiquidBoard(t *testing.T) {
 		{Op: "add", Path: "/nodes/n2/children/0", Value: json.RawMessage(`"n0"`)},
 		{Op: "replace", Path: "/nodes/n1/label", Value: json.RawMessage(`"Revenue"`)},
 		{Op: "remove", Path: "/nodes/n2/children/1"},
-		{Op: "test", Path: "/title", Value: json.RawMessage(`"Q3"`)}, // dropped
 	}
 	ops, err := JSONPatchToOps(patch)
 	if err != nil {
@@ -244,6 +245,138 @@ func TestJSONPatchSequentialArrayEdits(t *testing.T) {
 	want := `{"items":["x","a","c","d"]}`
 	if got != want {
 		t.Fatalf("got %s, want %s", got, want)
+	}
+}
+
+// --- CL-8.5: RFC 6902 `test` ops are ASSERTIONS, honored (not dropped) ---
+//
+// The bug: `test` ops were silently discarded by the patch->ops mapper, so a
+// patch RFC 6902 requires to FAIL (its precondition unmet) was applied anyway
+// — a correctness/data-integrity bug. A `test` never mutates and emits no CRDT
+// op; a FAILED test rejects the WHOLE patch atomically (nothing emitted).
+
+// (a) A PASSING test emits no op of its own and lets the rest of the patch
+// apply — proven by round-tripping the emitted ops through the real engine.
+func TestJSONPatchTestOpPassingAppliesRest_CL8_5(t *testing.T) {
+	d := crdtjson.New()
+	seed, err := JSONPatchToOps([]PatchOp{
+		{Op: "add", Path: "/title", Value: json.RawMessage(`"Q3"`)},
+		{Op: "add", Path: "/n", Value: json.RawMessage(`1`)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	materializeOps(t, d, seed, 1)
+	cur, _ := d.CanonicalJSON()
+
+	ops, err := JSONPatchToOpsWithDoc([]PatchOp{
+		{Op: "test", Path: "/title", Value: json.RawMessage(`"Q3"`)}, // holds
+		{Op: "replace", Path: "/n", Value: json.RawMessage(`2`)},
+	}, cur)
+	if err != nil {
+		t.Fatalf("passing test should not error: %v", err)
+	}
+	// The test contributes ZERO ops; only the replace maps to a (set) op.
+	if len(ops) != 1 || ops[0].T != crdtjson.OpSet || !pathEq(ops[0].Path, []any{"n"}) {
+		t.Fatalf("want exactly one set op from the replace, got %+v", ops)
+	}
+	got := materializeOps(t, d, ops, 2)
+	if want := `{"n":2,"title":"Q3"}`; got != want {
+		t.Fatalf("rest of patch did not apply:\n got %s\nwant %s", got, want)
+	}
+
+	// A held test that compares structurally (key order + number form
+	// insignificant, RFC 6902 §4.6) also passes and emits nothing.
+	structural := json.RawMessage(`{"m":{"a":1,"b":2.0}}`)
+	ops, err = JSONPatchToOpsWithDoc([]PatchOp{
+		{Op: "test", Path: "/m", Value: json.RawMessage(`{"b":2,"a":1}`)},
+	}, structural)
+	if err != nil {
+		t.Fatalf("structural/number-normalized equality should hold: %v", err)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("a held test must emit no op, got %+v", ops)
+	}
+}
+
+// (b) A FAILING test rejects the WHOLE patch: NO ops are emitted and the doc is
+// left unchanged — even though a real mutation op PRECEDES the failing test in
+// the batch (proves atomicity, not just "test was last so nothing ran yet").
+func TestJSONPatchTestOpFailingRejectsWholePatch_CL8_5(t *testing.T) {
+	d := crdtjson.New()
+	seed, err := JSONPatchToOps([]PatchOp{
+		{Op: "add", Path: "/title", Value: json.RawMessage(`"Q3"`)},
+		{Op: "add", Path: "/n", Value: json.RawMessage(`1`)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	materializeOps(t, d, seed, 1)
+	cur, _ := d.CanonicalJSON()
+	before := string(cur)
+
+	ops, err := JSONPatchToOpsWithDoc([]PatchOp{
+		{Op: "replace", Path: "/n", Value: json.RawMessage(`2`)},        // a real mutation, FIRST
+		{Op: "test", Path: "/title", Value: json.RawMessage(`"WRONG"`)}, // unmet precondition
+	}, cur)
+	if err == nil {
+		t.Fatal("a failing test must reject the whole patch, got nil error")
+	}
+	if len(ops) != 0 {
+		t.Fatalf("a rejected patch must emit NO ops (atomicity), got %+v", ops)
+	}
+	// The caller applies the (nil) ops -> the doc is untouched.
+	after, _ := d.CanonicalJSON()
+	if string(after) != before {
+		t.Fatalf("doc changed after a rejected patch:\n before %s\n after  %s", before, after)
+	}
+}
+
+// (c) A test against a MISSING path, a TYPE mismatch, or an unequal value fails
+// (RFC 6902 §4.6); the doc-less mapper cannot evaluate a test and says so
+// (ErrNeedsDoc) rather than silently dropping the assertion.
+func TestJSONPatchTestOpMissingPathOrMismatchFails_CL8_5(t *testing.T) {
+	cases := []struct {
+		name string
+		cur  json.RawMessage
+		op   PatchOp
+	}{
+		{"missing path", json.RawMessage(`{"a":1}`),
+			PatchOp{Op: "test", Path: "/missing", Value: json.RawMessage(`1`)}},
+		{"missing array element", json.RawMessage(`{"a":["x"]}`),
+			PatchOp{Op: "test", Path: "/a/5", Value: json.RawMessage(`"x"`)}},
+		{"type mismatch (object vs number)", json.RawMessage(`{"a":{"x":1}}`),
+			PatchOp{Op: "test", Path: "/a", Value: json.RawMessage(`5`)}},
+		{"value mismatch", json.RawMessage(`{"a":1}`),
+			PatchOp{Op: "test", Path: "/a", Value: json.RawMessage(`2`)}},
+		{"missing value", json.RawMessage(`{"a":1}`),
+			PatchOp{Op: "test", Path: "/a"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, err := JSONPatchToOpsWithDoc([]PatchOp{tc.op}, tc.cur)
+			if err == nil {
+				t.Fatalf("expected the test to fail, got nil error (ops=%+v)", ops)
+			}
+			if len(ops) != 0 {
+				t.Fatalf("a failed test must emit no ops, got %+v", ops)
+			}
+			if errors.Is(err, ErrNeedsDoc) {
+				t.Fatalf("a doc-present failing test must not report ErrNeedsDoc: %v", err)
+			}
+		})
+	}
+}
+
+// The doc-LESS mapper cannot honor a test assertion, so it refuses
+// (ErrNeedsDoc) rather than silently discard it — the heart of the CL-8.5 bug.
+func TestJSONPatchTestOpDocLessNeedsDoc_CL8_5(t *testing.T) {
+	ops, err := JSONPatchToOps([]PatchOp{{Op: "test", Path: "/title", Value: json.RawMessage(`"Q3"`)}})
+	if !errors.Is(err, ErrNeedsDoc) {
+		t.Fatalf("doc-less test: err = %v, want ErrNeedsDoc", err)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("doc-less test must emit no ops, got %+v", ops)
 	}
 }
 

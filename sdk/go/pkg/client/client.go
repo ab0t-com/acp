@@ -122,11 +122,24 @@ const maxControlResponse = 64 << 20
 var controlResponseCap int64 = maxControlResponse
 
 // readBounded buffers at most controlResponseCap bytes of an untrusted response
-// body. A truncated body simply fails to parse, which surfaces as the normal
-// decode error — the point is that the process cannot be made to allocate
-// without limit.
-func readBounded(r io.Reader) []byte {
-	data, _ := io.ReadAll(io.LimitReader(r, controlResponseCap))
+// body — the point is that the process cannot be made to allocate without
+// limit. The body READ error is returned, not dropped (G0.8 / F-11): a
+// connection that dies mid-body used to surface only indirectly, because the
+// truncated JSON happened to fail to parse; a control response that is not JSON
+// (or a truncated one that still parses) would have been acted on as complete.
+func readBounded(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, controlResponseCap))
+	if err != nil {
+		return data, fmt.Errorf("reading response body: %w", err)
+	}
+	return data, nil
+}
+
+// readBoundedBestEffort is readBounded for ERROR bodies (status >= 300): the
+// status is the signal; a partial error message is still the best message we
+// have, so the read error is deliberately not fatal there.
+func readBoundedBestEffort(r io.Reader) []byte {
+	data, _ := readBounded(r)
 	return data
 }
 
@@ -157,9 +170,12 @@ func (c *Client) doH(method, path string, headers map[string]string, in, out any
 		return err
 	}
 	defer resp.Body.Close()
-	data := readBounded(resp.Body)
 	if resp.StatusCode >= 300 {
-		return apiErrorFrom(resp.StatusCode, data)
+		return apiErrorFrom(resp.StatusCode, readBoundedBestEffort(resp.Body))
+	}
+	data, err := readBounded(resp.Body)
+	if err != nil {
+		return err
 	}
 	if out != nil && len(data) > 0 {
 		return json.Unmarshal(data, out)
@@ -197,9 +213,12 @@ func (c *Client) doPaged(method, path string, out any) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	data := readBounded(resp.Body)
 	if resp.StatusCode >= 300 {
-		return "", apiErrorFrom(resp.StatusCode, data)
+		return "", apiErrorFrom(resp.StatusCode, readBoundedBestEffort(resp.Body))
+	}
+	data, err := readBounded(resp.Body)
+	if err != nil {
+		return "", err
 	}
 	if out != nil && len(data) > 0 {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -226,6 +245,50 @@ func (e *APIError) Locked() bool   { return e.Status == http.StatusLocked } // 4
 // holds until compaction/GC frees room or an admin raises the quota, so a
 // client MUST NOT blind-retry it (unlike a 429, which is transient).
 func (e *APIError) OverQuota() bool { return e.Status == http.StatusInsufficientStorage }
+
+// bulkCode extracts the stable ext-34 "code" from a refusal body.
+func (e *APIError) bulkCode() string {
+	var b struct {
+		Code string `json:"code"`
+	}
+	json.Unmarshal(e.Raw, &b)
+	return b.Code
+}
+
+// BulkConfirmRequired reports an ext-34 428 bulk_confirm_required: the commit is
+// BULK and carried no confirmation. It is NOT a 409 — a client MUST NOT treat it
+// as "rebase and retry"; it re-sends the SAME commit with bulk_confirm set to the
+// exact counts in BulkVerdict, and only after a human/automation-flag decision.
+func (e *APIError) BulkConfirmRequired() bool {
+	return e.Status == http.StatusPreconditionRequired && e.bulkCode() == "bulk_confirm_required"
+}
+
+// BulkConfirmMismatch reports an ext-34 428 bulk_confirm_mismatch: the confirmation
+// did not match the authority's recomputed counts (a stale/wrong view of the
+// tree). The client MUST show both numbers and re-decide — never re-echo the
+// server's numbers automatically (§5.3).
+func (e *APIError) BulkConfirmMismatch() bool {
+	return e.Status == http.StatusPreconditionRequired && e.bulkCode() == "bulk_confirm_mismatch"
+}
+
+// BulkDenied reports an ext-34 403 bulk_denied: the token's disposition forbids
+// bulk changes. NOT confirmable — the client MUST surface the remedy and MUST NOT
+// retry with a confirmation (§5.4).
+func (e *APIError) BulkDenied() bool {
+	return e.Status == http.StatusForbidden && e.bulkCode() == "bulk_denied"
+}
+
+// BulkVerdict extracts the authority's net-loss counts from a bulk refusal body
+// (428/403). ok is false if the body carries none.
+func (e *APIError) BulkVerdict() (wire.BulkVerdict, bool) {
+	var b struct {
+		Bulk *wire.BulkVerdict `json:"bulk"`
+	}
+	if json.Unmarshal(e.Raw, &b) == nil && b.Bulk != nil {
+		return *b.Bulk, true
+	}
+	return wire.BulkVerdict{}, false
+}
 
 // --- events ---
 
@@ -331,11 +394,44 @@ func (c *Client) ReadEvents(from uint64) ([]wire.Event, error) {
 	return out, c.do("GET", "/v1/events?from="+strconv.FormatUint(from, 10), nil, &out)
 }
 
+// FollowOptions carries optional hooks for a follow stream (Follow /
+// FollowFiltered are the same call with no options). It is a struct — not a
+// bare callback — so future stream knobs can be added without another method.
+type FollowOptions struct {
+	// OnOpen, when set, fires ONCE the follow stream is ESTABLISHED (the daemon
+	// accepted the request, status < 300) and BEFORE the first event is decoded.
+	// It lets a caller flip a "connected" signal on stream OPEN rather than on
+	// the first event, so a healthy-but-quiet stream reports connected honestly
+	// instead of looking dead until traffic arrives (the mount's slice-4 M2
+	// fix; mirrors the TS SDK). It never fires if the open fails (that path
+	// returns the *APIError). A panic in OnOpen propagates to the caller.
+	OnOpen func()
+}
+
 // Follow streams events from `from`, calling fn for each. Blocks until ctx-less
 // stop: it returns when the connection closes; callers loop+reconnect with the
 // last Seq for resilience.
 func (c *Client) Follow(from uint64, fn func(wire.Event) error) error {
-	req, err := c.req("GET", "/v1/events?follow=true&from="+strconv.FormatUint(from, 10), nil)
+	return c.followStream(from, nil, nil, fn)
+}
+
+// followStream is the shared core of Follow / FollowFiltered / FollowFilteredWith.
+// It opens the (optionally filtered) follow stream, fires opts.OnOpen once the
+// stream is ESTABLISHED (status < 300, before the first event), then decodes
+// events and calls fn for each MATCHING one. A nil/empty filter streams
+// everything; a nil opts (or nil OnOpen) is a no-op hook. Behaviour with a nil
+// filter and nil opts is byte-for-byte the old Follow; with a non-empty filter
+// and nil opts it is the old FollowFiltered.
+func (c *Client) followStream(from uint64, f *EventFilter, opts *FollowOptions, fn func(wire.Event) error) error {
+	filtered := !f.empty()
+	if filtered {
+		c.warnIfNoChannels()
+	}
+	path := "/v1/events?follow=true&from=" + strconv.FormatUint(from, 10)
+	if filtered {
+		path += f.query()
+	}
+	req, err := c.req("GET", path, nil)
 	if err != nil {
 		return err
 	}
@@ -345,14 +441,20 @@ func (c *Client) Follow(from uint64, fn func(wire.Event) error) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		data := readBounded(resp.Body)
+		data := readBoundedBestEffort(resp.Body)
 		return apiErrorFrom(resp.StatusCode, data) // uniform taxonomy on stream open too
+	}
+	if opts != nil && opts.OnOpen != nil {
+		opts.OnOpen() // stream established, before the first event (M2)
 	}
 	dec := json.NewDecoder(resp.Body)
 	for {
 		var e wire.Event
 		if err := dec.Decode(&e); err != nil {
 			return err // EOF / connection drop — caller reconnects
+		}
+		if filtered && !f.Match(e) {
+			continue // old daemon streaming unfiltered: drop here, same semantics
 		}
 		if err := fn(e); err != nil {
 			return err
@@ -469,36 +571,17 @@ func (c *Client) EventsFiltered(from uint64, f *EventFilter) ([]wire.Event, erro
 // events (local re-filter covers old daemons). A nil/empty filter is exactly
 // Follow. Callers resume with from=<last seq fn saw>+1 and the SAME filter.
 func (c *Client) FollowFiltered(from uint64, f *EventFilter, fn func(wire.Event) error) error {
-	if f.empty() {
-		return c.Follow(from, fn)
-	}
-	c.warnIfNoChannels()
-	req, err := c.req("GET", "/v1/events?follow=true&from="+strconv.FormatUint(from, 10)+f.query(), nil)
-	if err != nil {
-		return err
-	}
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		data := readBounded(resp.Body)
-		return apiErrorFrom(resp.StatusCode, data) // uniform taxonomy on stream open too
-	}
-	dec := json.NewDecoder(resp.Body)
-	for {
-		var e wire.Event
-		if err := dec.Decode(&e); err != nil {
-			return err // EOF / connection drop — caller reconnects
-		}
-		if !f.Match(e) {
-			continue // old daemon streaming unfiltered: drop here, same semantics
-		}
-		if err := fn(e); err != nil {
-			return err
-		}
-	}
+	return c.followStream(from, f, nil, fn)
+}
+
+// FollowFilteredWith is FollowFiltered plus a FollowOptions hook: opts.OnOpen
+// (when set) fires on stream ESTABLISHMENT, before the first event, so a
+// live-but-idle stream can report "connected" without waiting for traffic (the
+// mount's slice-4 M2 connected-under-report fix). A nil/empty filter streams
+// everything (exactly Follow); a nil opts is exactly FollowFiltered — so this is
+// a strict superset and no existing caller changes.
+func (c *Client) FollowFilteredWith(from uint64, f *EventFilter, opts *FollowOptions, fn func(wire.Event) error) error {
+	return c.followStream(from, f, opts, fn)
 }
 
 // ChannelInfo is one row of the daemon's derived channel registry (ext-1 §4.4).
@@ -591,9 +674,12 @@ func (c *Client) PutBlob(r io.Reader) (string, int64, error) {
 		return "", 0, err
 	}
 	defer resp.Body.Close()
-	data := readBounded(resp.Body)
 	if resp.StatusCode >= 300 {
-		return "", 0, apiErrorFrom(resp.StatusCode, data) // uniform taxonomy (e.g. 507 OverQuota)
+		return "", 0, apiErrorFrom(resp.StatusCode, readBoundedBestEffort(resp.Body)) // uniform taxonomy (e.g. 507 OverQuota)
+	}
+	data, err := readBounded(resp.Body)
+	if err != nil {
+		return "", 0, err
 	}
 	var out struct {
 		Hash string `json:"hash"`
@@ -613,7 +699,7 @@ func (c *Client) GetBlob(hash string) (io.ReadCloser, error) {
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
-		data := readBounded(resp.Body)
+		data := readBoundedBestEffort(resp.Body)
 		resp.Body.Close()
 		return nil, apiErrorFrom(resp.StatusCode, data) // uniform taxonomy (404, 403, ...)
 	}
@@ -964,7 +1050,7 @@ func (c *Client) FollowAwareness(fn func(wire.AwarenessDelta) error) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		data := readBounded(resp.Body)
+		data := readBoundedBestEffort(resp.Body)
 		return apiErrorFrom(resp.StatusCode, data) // uniform taxonomy on stream open too
 	}
 	dec := json.NewDecoder(resp.Body)
@@ -1044,10 +1130,127 @@ func (c *Client) Health() error {
 	if err != nil {
 		return err
 	}
-	data := readBounded(resp.Body)
+	data, rerr := readBounded(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		return apiErrorFrom(resp.StatusCode, data) // uniform taxonomy
 	}
-	return nil
+	return rerr
+}
+
+// Grant is the caller's OWN grant as reported by GET /v1/whoami (ext-7 §4.5
+// grant introspection): agent id, role, and — when the token is scoped — its
+// scope. Scope is nil for an unscoped grant.
+type Grant struct {
+	Agent string      `json:"agent"`
+	Role  string      `json:"role"`
+	Scope *GrantScope `json:"scope,omitempty"`
+	// Bulk is the token's ext-34 §4.8.1 bulk DISPOSITION in the selected space
+	// ("allowed" or "denied", honouring the space's bulk_deny). Empty from a
+	// daemon predating ext-34. Lets a client warn its user up front (before a
+	// long push) instead of only at the 403/428.
+	Bulk string `json:"bulk,omitempty"`
+}
+
+// GrantScope mirrors the daemon's scope shape: write prefixes (path_prefix),
+// the space allowlist, the pinned sub_scope label, and the ext-27 read_prefix
+// list (present ⇒ reads of the tree are FILTERED to these subtrees, and a
+// manifest or listing simply omits everything outside them).
+type GrantScope struct {
+	PathPrefix []string `json:"path_prefix,omitempty"`
+	Spaces     []string `json:"spaces,omitempty"`
+	SubScope   string   `json:"sub_scope,omitempty"`
+	ReadPrefix []string `json:"read_prefix,omitempty"`
+}
+
+// Whoami returns the caller's own grant (an existing endpoint, any role). A
+// client that may DELETE local state based on what the daemon shows it (acp
+// pull) uses it to learn whether its view is read-scoped — a path outside
+// read_prefix is invisible, not deleted (G0.4 / F-9).
+func (c *Client) Whoami() (Grant, error) {
+	var g Grant
+	return g, c.do("GET", "/v1/whoami", nil, &g)
+}
+
+// --- history / checkpoints (ext-33): the retained-version surface ---
+//
+// These wrap the shipped ext-33 endpoints (GET /v1/history, GET
+// /v1/manifest?version=N, /v1/checkpoint). They read/pin retained history and
+// never mutate the tree; a restore is an ORDINARY commit carrying
+// CommitRequest.RestoreOf (see Commit) — the daemon verifies the resulting state
+// equals the named version's record, or fails 400 restore_mismatch with no
+// change. A daemon predating ext-33 404s these paths, surfaced as *APIError.
+
+// History returns the space's retained manifest versions, newest first (ext-33
+// §4.7.2). limit 0 = the daemon default; before 0 = from the newest (else
+// versions strictly older than `before`, for paging via History.NextBefore).
+func (c *Client) History(limit int, before uint64) (wire.History, error) {
+	var out wire.History
+	q := "/v1/history"
+	sep := "?"
+	if limit > 0 {
+		q += sep + "limit=" + strconv.Itoa(limit)
+		sep = "&"
+	}
+	if before > 0 {
+		q += sep + "before=" + strconv.FormatUint(before, 10)
+	}
+	return out, c.do("GET", q, nil, &out)
+}
+
+// PathHistory returns one path's timeline — the retained versions at which its
+// entry changed (ext-33 §4.7.3). An out-of-scope path yields the same empty
+// shape a never-existed path does (no oracle).
+func (c *Client) PathHistory(path string, limit int, before uint64) (wire.PathHistory, error) {
+	var out wire.PathHistory
+	q := "/v1/history?path=" + url.QueryEscape(path)
+	if limit > 0 {
+		q += "&limit=" + strconv.Itoa(limit)
+	}
+	if before > 0 {
+		q += "&before=" + strconv.FormatUint(before, 10)
+	}
+	return out, c.do("GET", q, nil, &out)
+}
+
+// ManifestAt returns the manifest RECORD at a retained version (ext-33 §4.7.1):
+// the version's entries plus commit metadata and the names of any checkpoints
+// pinning it. Version 0 is the empty genesis record; an unknown/pruned version
+// is a 404 (code version_unknown / version_pruned).
+func (c *Client) ManifestAt(version uint64) (wire.VersionRecord, error) {
+	var out wire.VersionRecord
+	return out, c.do("GET", "/v1/manifest?version="+strconv.FormatUint(version, 10), nil, &out)
+}
+
+// Checkpoints lists the space's named checkpoints (ext-33 §4.6).
+func (c *Client) Checkpoints() ([]wire.Checkpoint, error) {
+	var out []wire.Checkpoint
+	return out, c.do("GET", "/v1/checkpoint", nil, &out)
+}
+
+// Checkpoint reads one named checkpoint (404 if absent).
+func (c *Client) Checkpoint(name string) (wire.Checkpoint, error) {
+	var out wire.Checkpoint
+	return out, c.do("GET", "/v1/checkpoint?name="+url.QueryEscape(name), nil, &out)
+}
+
+// CreateCheckpoint pins a retained version under a name (writer role). version
+// nil pins the CURRENT manifest version (resolved server-side). The reserved
+// "auto/" name prefix is refused 400.
+func (c *Client) CreateCheckpoint(name string, version *uint64, note string) (wire.Checkpoint, error) {
+	var out wire.Checkpoint
+	body := map[string]any{"name": name}
+	if version != nil {
+		body["version"] = *version
+	}
+	if note != "" {
+		body["note"] = note
+	}
+	return out, c.do("POST", "/v1/checkpoint", body, &out)
+}
+
+// DeleteCheckpoint unpins a checkpoint (ADMIN role only — ext-33 §4.6.5: an
+// agent must not unpin what protects another agent's work).
+func (c *Client) DeleteCheckpoint(name string) error {
+	return c.do("DELETE", "/v1/checkpoint?name="+url.QueryEscape(name), nil, nil)
 }

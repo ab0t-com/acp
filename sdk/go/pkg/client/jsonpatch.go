@@ -12,8 +12,11 @@
 //	remove at an object key          -> del  {path}
 //	remove at an array index         -> ldel {path}
 //	add into an array at an index    -> lins {path, idx, value} ("-" = append)
-//	test                             -> DROPPED (the CRDT has no baseRev
-//	                                    guard — convergence replaces it)
+//	test                             -> ASSERTION, not a mutation: evaluated
+//	                                    against the current doc (needs
+//	                                    JSONPatchToOpsWithDoc). A held test
+//	                                    emits no op; a FAILED test rejects the
+//	                                    WHOLE patch (RFC 6902 atomicity).
 //	move/copy                        -> remove + add (needs the current
 //	                                    doc: JSONPatchToOpsWithDoc)
 //
@@ -28,8 +31,13 @@
 //     the move instead of being lost. (The daemon's "crdtjson-move"
 //     capability ships alongside "crdtjson".) copy still DUPLICATES —
 //     a fresh insert of the copied value — which is correct for copy.
-//   - "test" ops are dropped, not evaluated: the CRDT path has no
-//     optimistic-locking rev to guard, by design.
+//   - "test" ops are ASSERTIONS, honored per RFC 6902: the value at the
+//     path MUST equal the asserted value (a logical JSON compare, key order
+//     and whitespace insignificant), else the ENTIRE patch is rejected and
+//     NOTHING is emitted (atomic). A test never mutates and emits no CRDT
+//     op. It needs the current document, so the doc-less JSONPatchToOps
+//     returns ErrNeedsDoc for a test (it refuses to silently discard the
+//     assertion) — use JSONPatchToOpsWithDoc.
 //   - Without the current document (JSONPatchToOps), array-vs-object
 //     addressing is decided SYNTACTICALLY: a final path segment that is a
 //     canonical base-10 integer (or "-") is treated as an array index,
@@ -45,6 +53,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -59,9 +68,10 @@ type PatchOp struct {
 	From  string          `json:"from,omitempty"`  // move|copy
 }
 
-// ErrNeedsDoc marks move/copy in the stateless mapper: their source value
-// can only be resolved against the current document.
-var ErrNeedsDoc = errors.New("move/copy need the current document: use JSONPatchToOpsWithDoc")
+// ErrNeedsDoc marks test/move/copy in the stateless mapper: a move/copy
+// source value, and a test assertion, can only be resolved against the
+// current document.
+var ErrNeedsDoc = errors.New("test/move/copy need the current document: use JSONPatchToOpsWithDoc")
 
 // appendIdx is the lins index used for the RFC 6901 "-" (append) segment
 // when the array length is unknown; the daemon clamps any past-end index
@@ -69,8 +79,9 @@ var ErrNeedsDoc = errors.New("move/copy need the current document: use JSONPatch
 const appendIdx = math.MaxInt32
 
 // JSONPatchToOps maps an RFC 6902 patch to structured-CRDT ops without
-// document state. test ops are dropped; move/copy return ErrNeedsDoc
-// (see the package comment for the full mapping and caveats).
+// document state. test/move/copy return ErrNeedsDoc — they can only be
+// resolved against the current document (see the package comment for the
+// full mapping and caveats).
 func JSONPatchToOps(patch []PatchOp) ([]crdtjson.Op, error) {
 	return jsonPatchToOps(patch, nil)
 }
@@ -106,7 +117,36 @@ func jsonPatchToOps(patch []PatchOp, shadow *any) ([]crdtjson.Op, error) {
 func mapOne(p PatchOp, shadow *any) ([]crdtjson.Op, error) {
 	switch p.Op {
 	case "test":
-		return nil, nil // dropped: no baseRev guard on the CRDT path
+		// RFC 6902 test is an ASSERTION, not a mutation: the value at Path
+		// MUST equal Value, else the WHOLE patch fails atomically. Honoring it
+		// needs the current doc; the doc-less mapper refuses (ErrNeedsDoc)
+		// rather than silently discard the assertion — dropping it would let a
+		// patch that RFC 6902 requires to FAIL apply unconditionally, a
+		// data-integrity bug. A held test emits no op and never mutates the
+		// shadow (so later ops and move/copy sources are unaffected).
+		if shadow == nil {
+			return nil, ErrNeedsDoc
+		}
+		if len(p.Value) == 0 {
+			return nil, errors.New("test requires a value")
+		}
+		segs, err := parsePointer(p.Path)
+		if err != nil {
+			return nil, err
+		}
+		got, err := shadowGet(*shadow, segs)
+		if err != nil {
+			// A test against a nonexistent location fails (RFC 6902 §4.6).
+			return nil, fmt.Errorf("test %q failed: %w", p.Path, err)
+		}
+		want, err := decodeVal(p.Value)
+		if err != nil {
+			return nil, err
+		}
+		if !jsonValueEqual(got, want) {
+			return nil, fmt.Errorf("test %q failed: value does not equal the asserted value", p.Path)
+		}
+		return nil, nil // assertion held: no CRDT op, no mutation
 	case "add", "replace", "remove":
 		segs, err := parsePointer(p.Path)
 		if err != nil {
@@ -453,6 +493,17 @@ func shadowMutate(node any, segs []string, edit func(container any, tail string)
 	default:
 		return nil, fmt.Errorf("segment %q under a scalar", segs[0])
 	}
+}
+
+// jsonValueEqual reports RFC 6902 §4.6 logical equality of two JSON values
+// decoded (by encoding/json) into `any`: strings/numbers/bools/null exact,
+// arrays equal in order, objects equal regardless of key order. Both
+// operands come from the same encoding/json decoding — numbers as float64,
+// objects as map[string]any — so a structural deep-equal matches the RFC's
+// logical comparison; representation-only differences (whitespace, key
+// order, 1 vs 1.0) are already normalized away by decoding.
+func jsonValueEqual(a, b any) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 func decodeVal(raw json.RawMessage) (any, error) {

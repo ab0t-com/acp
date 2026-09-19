@@ -1,0 +1,1510 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-37                                     ab0t.com
+Updates: (none -- client consumer)                          September 2026
+Category: Extension Proposal (client conformance)                  ISSN: n/a
+
+
+        ACP Extension Proposal 37: Mountable ACP
+     -- A Native Userspace Filesystem Mount (with Platform Loopback
+        Fallbacks) That Consumes the Frozen acp/1 Wire, Adds No Wire,
+        and Makes a Shared, Live, Multi-Agent Space "Just Files"
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies MOUNTABLE ACP: a CLIENT
+   that presents an ACP space (or a prefix of one) as an ORDINARY
+   DIRECTORY of the host operating system, so that an agent, a person,
+   or any program collaborates with a fleet by reading and writing
+   files -- "ls", "cat", "grep", an editor, a build -- with no
+   knowledge that a network, a protocol, or another agent is involved.
+
+   The mount is a CONSUMER.  It adds NO wire: every byte it moves rides
+   the existing acp/1 HTTPS surfaces -- the content-addressed blobs and
+   compare-and-swap manifest of ACP/1 Section 11 for a CAS-mode region,
+   the EXT-28 CRDT directory tree and CRDT file endpoints for a
+   realtime-mode region, the EXT-31 mode lookup that tells it which,
+   the ACP/1 Section 8 event log for liveness, and the EXT-32 "acp://"
+   address as its mount target.  It advertises no capability of its
+   own and needs none to run; it FEATURE-DETECTS the capabilities the
+   daemon already advertises.
+
+   What the memo makes NORMATIVE is the CLIENT CONTRACT an independent
+   mount implementation must honour so that two mounts from two vendors,
+   against one daemon, give an agent the SAME truth: (1) a CACHE-HONESTY
+   INVARIANT -- a cache between the user and the authority MAY be stale
+   but MUST NEVER LIE, and a negative answer ("does not exist") is never
+   cached; (2) ONE WRITE PATH -- every destructive change is expressed as
+   changes in ONE ordinary commit (CAS) or ONE structural batch
+   (realtime), so the bulk guard, the conflict anchor and the lease
+   refusal cover every syscall uniformly; (3) CONFLICT THROUGH POSIX --
+   errno is one integer and cannot carry the loser's bytes, so a
+   conflict lands as a SIDECAR by default with a status surface carrying
+   the rich record, or as ESTALE under an opt-in policy, and NEVER as
+   EIO; (4) SAFETY -- the bulk-change guard (EXT-34) is measured at the
+   crossing unlink so an "rm -rf" stops at the first refused call having
+   buffered nothing bulk, and everything under the mount stays
+   recoverable (EXT-33 history, EXT-28 trash); (5) SECURITY -- no raw
+   token in any path, argument, mount option or loopback listener.
+
+   Platform reach is stated honestly per platform: full on Linux; on
+   macOS through a user-installed FUSE package with TTL-only cache
+   honesty, or through a loopback NFS server the built-in client mounts;
+   on Windows through a loopback WebDAV server; and NO mountpoint on a
+   locked-down host without a FUSE device, where the SDK and CLI remain
+   the surface.  Nothing changes the wire version "acp/1".
+
+Status of This Memo
+
+   ACCEPTED as a numbered CLIENT-CONFORMANCE extension: the protocol
+   owner ratified numbering it EXT-37 on 2026-09-18 (Section 17).  It is
+   published as a Request For Comment on the client contract and is NOT
+   part of the normative ACP/1 specification -- it consumes acp/1 and
+   changes nothing in it.  The extension number EXT-37 is PROVISIONAL;
+   the protocol owner assigns final numbers on acceptance.  It is a CLIENT-CONSUMER extension in the sense of EXT-32
+   (the "acp://" scheme) and EXT-23 (the client packages): it proposes
+   NO amendment to ACP/1, defines NO new endpoint, NO new replicated
+   command, NO new capability string, and NO change to any existing
+   surface.  It CONSUMES, unchanged: ACP/1 Section 8 (the event log),
+   Section 11 (blobs and the CAS manifest), Section 12 (collaborative
+   documents); EXT-28 (the CRDT directory tree, the realtime structure);
+   EXT-31 (filesystem mode, the CAS/realtime toggle and the mode
+   lookup); EXT-32 (the "acp://" address it mounts); and, where
+   advertised, EXT-33 (version-pinned reads and history), EXT-34 (the
+   bulk-change guard, whose Section 5.5 already binds "a mount"), EXT-27
+   (read scoping), and EXT-22 (scoped watch).  It is the home for the
+   client obligations those memos place on "a mount" without a memo of
+   its own.
+
+   The design it transcribes was ratified by the protocol owner on
+   2026-09-18 (the four decisions of Section 4); the first increment
+   (a read-only CAS mount) exists as a reference implementation at the
+   time of writing; every later increment is UNBUILT.  The memo's
+   normative content is the CLIENT CONTRACT; where it names a reference
+   implementation choice it says so and marks it INFORMATIVE.  The owner
+   ratified numbering it as a client-conformance extension on
+   2026-09-18 (Section 17).  The base protocol version string remains
+   "acp/1".  Distribution is unlimited.
+
+   Published 2026-09-18 (draft).
+
+Copyright Notice
+
+   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
+   license as the reference implementation and the base specification.
+
+
+Table of Contents
+
+   1.  Motivation -- "just use files"
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  The Four Ratified Decisions (normative choices)
+       4.1.  Substrate: a pure userspace filesystem with the three
+             cache levers
+       4.2.  Packaging: a separate binary in its own module
+       4.3.  Conflict UX: sidecar by default, ESTALE on request,
+             never EIO
+       4.4.  Platform reach: Linux, macOS, loopbacks, no third FUSE stack
+   5.  Addressing and the Mount Model
+       5.1.  The mount target
+       5.2.  Pre-flight before the kernel
+       5.3.  Backend selection by mode; mode change under a live mount
+       5.4.  The barrier and the single write path
+       5.5.  The handle model (close-to-open)
+       5.6.  Lifecycle
+   6.  VFS Operation to ACP Mapping
+       6.1.  The mapping table (CAS and realtime)
+       6.2.  The errno table
+       6.3.  Operations that do not map cleanly (honest degradation)
+   7.  The Cache-Honesty Invariant (the negative-cache hazard,
+       generalised)
+       7.1.  The invariant
+       7.2.  The rules
+       7.3.  The per-platform honesty bound, and where it is shown
+       7.4.  Page-cache posture (recorded deviation)
+   8.  Conflict Through POSIX
+       8.1.  errno is one integer; the conflict record is not
+       8.2.  The two policies
+       8.3.  The status surface
+       8.4.  Realtime through POSIX
+   9.  Safety Under the Mount
+       9.1.  The bulk guard, measured at the crossing unlink
+       9.2.  Recover from anything under the mount
+       9.3.  No second write path; no durable authority state
+       9.4.  Never block; the disconnected posture
+   10. Platform Reach
+   11. Honest Limits
+   12. Security Considerations
+   13. Interaction with Other Extensions
+   14. Capability Negotiation, Rollout and Distribution
+   15. Section 17 Determinism Compliance
+   16. Conformance Ladder (the merge bar per increment)
+   17. Open Questions
+   Appendix A.  The Control Directory Schema
+   Appendix B.  Worked Examples
+   Authors' Addresses
+
+
+1.  Motivation -- "just use files"
+
+   1.1.  Every other surface asks the agent to learn something.
+
+      ACP's surfaces are good, and each asks the agent to hold some
+      concept that is not the task: the MCP tools ask which verb; the
+      CLI asks push versus pull versus a CRDT sync, and what a lease is;
+      an SDK asks for a language binding and a program.  The dogfood
+      runs measured this: even a good typed surface costs an agent some
+      of its scarce context on the protocol rather than on the work.
+      The mount asks the agent to learn NOTHING.  It already knows how
+      to read and write files -- the most universal skill any agent,
+      person or program has.  "cat spec.md"; "echo ... > src/x.py".
+      Done.  Ranked by how much each surface removes, the mount removes
+      ALL of it: the only concept left is "files in a folder", which the
+      agent already has.  There is nothing below "it's just files".
+
+   1.2.  Every existing tool becomes collaborative, unchanged.
+
+      Because the mountpoint is a real directory, an agent's ENTIRE
+      toolchain becomes multi-agent-collaborative for free: "grep -r",
+      "find", "sed", a build system, a linter, a test runner, an editor,
+      a language's standard file I/O, "git" on the mounted tree, a
+      notebook reading a shared data file.  None of these knows ACP
+      exists.  You do not port your tools to ACP; ACP appears
+      underneath your tools.  For a HETEROGENEOUS fleet -- a Python
+      agent, a shell script, a compiled data tool, a cron job, an MCP
+      harness -- the mount is the universal interop surface: anything
+      that can touch a path collaborates.
+
+   1.3.  Live collaboration through the filesystem.
+
+      On a realtime-mode region (EXT-31 selecting EXT-28), a teammate's
+      change shows up in the mounted directory as it happens: a created
+      file appears in the next "ls"; concurrent edits to one live
+      document CONVERGE, so the reader sees the merged bytes and never a
+      merge step; a folder reorganised by three agents at once is simply
+      the merged structure.  The agent gets a live shared drive with no
+      watch loop, no polling, no subscription code.
+
+   1.4.  The floor stays safe, so the agent can act boldly.
+
+      The substrate's guarantees hold under the mount: a wrong overwrite
+      or delete is undoable (EXT-33 history; EXT-28 trash); a runaway
+      "rm -rf" is caught by the bulk-change guard (EXT-34) before it
+      leaves the mount; a same-file race is merged (CRDT) or surfaced
+      honestly (a sidecar), never a silent clobber.  The biggest hidden
+      tax on an autonomous agent -- fear of an irreversible mistake --
+      is removed, and that is precisely why the mount is safe to give
+      to a swarm.
+
+   1.5.  Why this needs a memo.
+
+      Three memos already place obligations on "a mount" with nowhere
+      to hold them: EXT-34 Section 5.5 (a mount refuses bulk
+      synchronously), EXT-31 Section 4.5 (a mount dispatches by mode and
+      re-reads it on wrong_fs_mode), EXT-28 Section 5.6 (the client
+      SHOULD expose trash recovery).  A kernel adds four caches the
+      shipped client facade never had, and on some platforms removes the
+      lever to invalidate them (Section 7).  And two mounts from two
+      implementers against one daemon must show an agent the SAME truth:
+      the same sidecar convention, the same status schema, the same
+      loser-name display, the same "never EIO for a conflict".  That is
+      a CLIENT CONFORMANCE contract, and this memo is it.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the definitions of ACP/1 (space, manifest, path,
+   commit, base_version, blob, content hash, event, seq, lease,
+   read_prefix), EXT-28 (node, placement, TRASH, live node, the
+   name-collision disambiguation "<name>~<nodeId>" with the doubled
+   literal "~", RESTORE), EXT-31 (CAS mode, realtime mode, region,
+   fs_mode, wrong_fs_mode, fs.mode.changed), EXT-32 (ACP URI,
+   connection address, the "v=" pin, the ironclad no-token rule),
+   EXT-33 (version-pinned read, checkpoint, restore), EXT-34 (net loss,
+   the delete and overwrite tallies, threshold, bulk disposition,
+   bulk_confirm, 428 bulk_confirm_required, 403 bulk_denied) and EXT-27
+   (read scope, no-oracle) without restating them.  POSIX terms (inode,
+   dentry, attr, page cache, errno, close-to-open) are used as in the
+   host operating system's documentation.
+
+   MOUNT:  A running client process that presents one ACP region --
+      a space, or a prefix of one -- at a MOUNTPOINT of the host
+      filesystem, translating kernel VFS operations into acp/1 requests.
+
+   VIEW:  The kernel-free semantic core of a mount: the held manifest or
+      tree snapshot, the OVERLAY, the blob cache, the handle pins, and
+      the BARRIER.  Every front-end (a native FUSE adapter, a loopback
+      NFS or WebDAV server) is a thin errno/protocol shim over ONE view;
+      filesystem decisions live in the view, never in a front-end.
+
+   OVERLAY:  The view's set of not-yet-landed local changes: the
+      PENDING buffer UNION every QUEUED or IN-FLIGHT barrier batch,
+      newest wins.  A path whose first write is in flight is PRESENT in
+      the overlay.  All of lookup, readdir, stat and open consult it.
+
+   BARRIER:  The view's Flush: the single operation that converts the
+      overlay into ONE acp/1 write -- one commit (CAS) or one structural
+      batch (realtime) -- and reports the outcome.  fsync, flush-on-
+      close and release-of-last-dirty-handle all invoke it.
+
+   HANDLE PIN:  The content identity (a blob hash, or a document name)
+      a file handle bound at open; reads through the handle serve that
+      content for the handle's life (close-to-open consistency).
+
+   CROSSING CALL:  The unlink, rmdir or rename that would make the
+      pending batch cross an EXT-34 threshold if buffered.
+
+   SIDECAR:  A sibling file "<name>.conflict-<agent>-<timestamp>"
+      holding the losing byte set of a content conflict, created by the
+      barrier and visible in the tree.
+
+   STATUS SURFACE:  The mount's structured JSON log plus the OPTIONAL
+      control directory "<mountpoint>/.acp/" (Section 8.3, Appendix A).
+
+   FRONT-END:  The protocol the operating system's kernel or client
+      speaks to the mount: native FUSE (Linux, macOS), a loopback NFSv3
+      server, or a loopback WebDAV server.
+
+   NEGATIVE ANSWER:  A "does not exist" -- ENOENT from lookup, an absent
+      name in readdir, a failed access -- as opposed to a POSITIVE answer
+      carrying attributes or bytes.
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  A consumer, never a wire.  The mount is a CLIENT of the public
+      SDK over the frozen "acp/1" wire.  It MUST NOT require a daemon
+      change to function, MUST NOT introduce an endpoint, and MUST NOT
+      hold durable authority state: everything durable is on the daemon,
+      and a mount that dies loses only its unflushed buffer (which the
+      status surface and the sidecar discipline keep visible).
+
+   3.2.  A cache may be stale; it may never lie.  Section 7.  This is
+      the negative-cache hazard (HZ-ACPDB-13) generalised from the
+      client facade to every cache a kernel adds.  Negative answers are
+      never cached.  Positive staleness is bounded and shown.
+
+   3.3.  One write path.  Every destructive change from every syscall
+      is expressed as changes in ONE ordinary commit or ONE structural
+      batch (Section 5.4).  There is no second write path, so the bulk
+      guard, the conflict anchor and the lease refusal cover unlink,
+      rmdir, rename, truncate and write uniformly.
+
+   3.4.  Never a silent clobber.  A content conflict is surfaced --
+      sidecar or errno -- never resolved by last-writer-wins (Section
+      8).  Both byte sets survive on the daemon under the default
+      policy.
+
+   3.5.  Refuse, never ignore.  An operation the mount cannot map
+      (hard link, symlink, exchange-rename, device node) returns
+      ENOTSUP; it is never silently accepted and dropped, because a
+      tool that believes a rename-exchange succeeded will then destroy
+      data on the strength of it.
+
+   3.6.  Honest per platform.  The mount's guarantees differ by front-
+      end and kernel, and the memo states each rather than claiming the
+      best case everywhere (Sections 7.3, 10, 11).
+
+   3.7.  Non-goals.  This memo does NOT: define a new resource, address
+      or capability (EXT-32 addresses; the daemon advertises); define
+      the realtime structure or its recovery (EXT-28); define the mode
+      or its transition (EXT-31); define the bulk policy (EXT-34) or
+      history (EXT-33) -- it consumes them; make the mount an offline
+      store (Section 9.4); provide POSIX byte-range locking across
+      mounts (Section 6.3; leases are the cross-agent exclusion); or
+      surface the non-file primitives (mailbox, leases, presence,
+      channels) -- those remain on the MCP, CLI and SDK surfaces.  The
+      mount is the FILE surface taken to its OS-native conclusion.
+
+
+4.  The Four Ratified Decisions (normative choices)
+
+   The protocol owner ratified these four on 2026-09-18.  Each is
+   stated as the PROPERTY a conformant mount MUST have, followed by the
+   reference implementation's choice (INFORMATIVE -- an implementation
+   detail the ticket records, not a spec requirement).
+
+   4.1.  Substrate: a pure userspace filesystem with the three cache
+         levers.
+
+      A native mount MUST be built on a userspace-filesystem substrate
+      that (a) gives the mount control of the kernel's NEGATIVE-lookup
+      lifetime (so Section 7's "never cache a negative" is enforceable,
+      not hoped for), (b) lets the mount set the entry and attribute
+      lifetime PER LOOKUP (so a pending or dirty path can carry a zero
+      lifetime while a clean one carries a short one), and (c) where the
+      kernel supports it, lets the mount INVALIDATE an entry or announce
+      a deletion on an event (so a teammate's change reaches the kernel
+      before any lifetime expires).  The substrate MUST NOT require a C
+      toolchain or a dynamically linked helper: the reference
+      distribution is a single static binary per platform and the mount
+      MUST keep that property.  The substrate MUST be maintained and
+      protocol-current, because the kernel boundary is a forever
+      surface.
+
+      Reference choice (informative): the reference mount uses the
+      actively maintained pure-language FUSE library that exposes all
+      three levers at its high-level API, pinned to an exact tag with
+      a checksum in the module file; the previously considered library
+      was rejected as dormant (no commits since early 2023, macOS
+      support dropped in 2019); a second maintained pure-language
+      library is the recorded fallback.  A kext-less macOS FUSE
+      alternative that ignores cache lifetimes and offers no
+      invalidation is NOT supported for a live tree (Section 10).
+
+   4.2.  Packaging: a separate binary in its own module.
+
+      The mount MUST be packaged so that the DAEMON'S dependency set is
+      unchanged by it: the kernel-facing substrate lives in the mount's
+      own module, the mount consumes the PUBLIC SDK (never the daemon's
+      internals), and it ships as a separate executable the reference
+      CLI discovers and execs ("acp mount" / "acp umount", sibling-then-
+      PATH discovery, a clear install message if absent).  This is the
+      core/client independence rule made mechanical: the mount is FORCED
+      to be a client.  Cost accepted: one more artifact in the release
+      matrix, and a second module to keep aligned with the SDK.
+
+      Reference choice (informative): module "acp/mount" building
+      "acp-mount", built with the same static, trimmed, cross-compiled
+      flags as every other binary, for Linux and macOS targets.
+
+   4.3.  Conflict UX: sidecar by default, ESTALE on request, never EIO.
+
+      A mount MUST implement BOTH conflict policies of Section 8.2 and
+      MUST default to the SIDECAR policy.  Under either policy the rich
+      conflict record MUST reach the status surface (Section 8.3).  A
+      mount MUST NOT map a content conflict to EIO.  Rationale: errno
+      cannot carry bytes, cannot name the other writer, and is DISCARDED
+      by the kernel on release (the common no-fsync path of "cp", "git
+      checkout", a build tool) -- so an errno-only policy would silently
+      lose the loser's bytes when the mount dies.  The sidecar keeps both
+      byte sets on the daemon and makes the conflict visible in the tree
+      to "ls", editors and agents; it is the "conflicted copy"
+      convention users already know from consumer sync clients.
+      Tradeoff accepted: under the default a program sees success while
+      the path holds the OTHER writer's bytes and a sibling appears --
+      surprising once, mitigated by the status surface and (on Linux)
+      an inotify event.
+
+   4.4.  Platform reach: Linux, macOS, loopbacks, no third FUSE stack.
+
+      Reach MUST be delivered in this order and stated this honestly:
+      (1) native FUSE on Linux (full cache honesty: lifetimes AND
+      invalidation); (2) native FUSE on macOS through the user-installed
+      FUSE package (lifetimes only -- that kernel extension offers no
+      invalidation), which the mount MUST NOT bundle or auto-install
+      (its licence forbids bundling with commercial software) and MUST
+      detect and explain; (3) a LOOPBACK NFSv3 server the macOS built-in
+      client mounts, for a macOS host without a kernel extension; (4) a
+      LOOPBACK WebDAV server over loopback HTTPS with a per-session
+      credential, for Windows (built into every edition); (5) NO third-
+      party Windows FUSE stack unless the owner explicitly accepts its
+      licence (copyleft with a paid commercial exception); (6) a locked-
+      down Linux host without the FUSE device gets NO MOUNTPOINT -- the
+      SDK and CLI are the surface there, and the mount MUST say so
+      rather than degrade silently.  Both loopbacks MUST sit on the same
+      view as the native adapter (Section 2, VIEW).
+
+
+5.  Addressing and the Mount Model
+
+   5.1.  The mount target.
+
+      A mount is addressed by an EXT-32 ACP URI naming a space root or a
+      collection within it:
+
+         acp mount acp://<authority>/<space>/[<prefix>/] <mountpoint>
+                   [--conflict=sidecar|error] [--allow-bulk]
+                   [--control-dir] [--daemon] [--attr-ttl <d>]
+                   [--allow-other]
+
+      o  The URI MUST be a collection (a trailing slash: the space root
+         or a directory) -- a FILE cannot be a mountpoint's root and
+         MUST be refused with the collection form named.
+      o  A "v=<version>" pin (EXT-32 Section 3.4; EXT-33) yields a READ-
+         ONLY mount of that manifest version: every write returns EROFS.
+         A pinned URI MUST be refused for a realtime region (a realtime
+         region has no linear version; EXT-28 Section 3.7).
+      o  The credential comes from the local profile keyed by the URI's
+         authority (EXT-32 Section 3.6, connection-address amendment),
+         or from the environment the reference CLI resolves; it MUST
+         NEVER come from the URI, and the mount MUST refuse a URI whose
+         authority carries userinfo or whose query carries a credential-
+         shaped key.  A capability-signed (shareable) URI is a READ grant
+         and, when EXT-35 is ratified and advertised, MAY mount read-only
+         under the grant's scope; until then it is refused as a mount
+         target.
+      o  A "<prefix>/" NARROWS the mount: only entries under the prefix
+         are presented, paths are rebased to the mountpoint, and every
+         write is expressed with the prefix restored.  Narrowing is a
+         convenience, NOT confinement: confinement is the token's EXT-27
+         read scope and the space.
+      o  A space name given without a scheme is accepted by the
+         reference CLI as shorthand for the profile's authority; it is
+         resolved to the URI form before anything else happens.
+
+   5.2.  Pre-flight before the kernel.
+
+      A mount MUST complete, BEFORE the mountpoint is attached to the
+      kernel: (a) a health read confirming the daemon speaks "acp/1" and
+      collecting its capability set; (b) a credential check (an
+      authenticated read) so a bad token fails at the command line, not
+      as EIO on the first "ls"; (c) the mode lookup of EXT-31 for the
+      region (GET /v1/space/config) to select the backend; (d) the
+      mountpoint checks: it exists, is a directory, is EMPTY, and is not
+      already a mount.  A mount whose pre-flight fails MUST exit non-
+      zero with the reason and MUST leave no mountpoint behind.  A mount
+      that lacks the backend a region needs (a read-only increment asked
+      to mount a realtime region) MUST refuse at pre-flight, naming the
+      surface to use instead, never attach and then fail per-call.
+
+   5.3.  Backend selection by mode; mode change under a live mount.
+
+      The view has two backends over one interface, selected by the
+      region's fs_mode:
+
+      o  CAS backend: structure = the manifest (ACP/1 Section 11);
+         directories are SYNTHESISED from paths; reads by blob hash;
+         writes = blobs + ONE commit under base_version; conflicts by
+         the per-path anchor (Section 8).
+      o  REALTIME backend: structure = the EXT-28 tree (GET /v1/fs/tree,
+         narrowed to the prefix); directories are REAL nodes (empty
+         directories persist); file content is a blob reference or a
+         live document; writes = blobs + ONE structural batch (POST
+         /v1/fs/ops) or document operations; structure never conflicts,
+         content is anchored on node id (Section 8.4).
+
+      A mount MUST follow the event log (Section 8 of ACP/1; EXT-22 when
+      advertised) for fs.mode.changed.  On a mode change under a live
+      mount, or on a 409 wrong_fs_mode from the barrier (EXT-31 Section
+      4.5), the mount MUST: re-read the mode; invalidate its held
+      structure ONCE; re-point the backend; and CARRY every pending
+      change with its ORIGINAL anchor to the new surface -- never drop a
+      pending change, never re-anchor it to what the new surface now
+      shows (that would launder a conflict into a silent overwrite).  A
+      barrier that failed with wrong_fs_mode wrote nothing, so the retry
+      on the right surface is safe; if the retry fails, its own errno is
+      returned.
+
+   5.4.  The barrier and the single write path.
+
+      All mutation is BUFFERED in the overlay as whole-file images keyed
+      by path (plus structural intents: mkdir, unlink, rmdir, rename)
+      and converted to acp/1 writes ONLY by the barrier:
+
+      o  CAS: upload each NEW byte set (POST /v1/blobs, idempotent,
+         content-addressed; a rename re-references the existing hash and
+         uploads nothing) then ONE POST /v1/commit {base_version,
+         changes} carrying every buffered change.  409 -> per-path anchor
+         reconcile: the disjoint subset is rebased and re-tried; a
+         conflicting path is surfaced (Section 8).  423 (lease held) ->
+         the batch is KEPT and EACCES returned.
+      o  REALTIME: upload each new byte set, then ONE POST /v1/fs/ops
+         batch (mkdir/create/move/delete in buffer order; a content
+         replace of a blob-backed file is "delete p + create p <blob>"
+         anchored on the node id seen at buffer time; a pre-flight tree
+         re-read; a post-batch trash re-read and REPAIR batch for a
+         time-of-check race, EXT-28 style).  Structure never returns
+         409.  403 bulk_denied and 428 are surfaced per Section 9.1.
+
+      The barrier is invoked by fsync/fsyncdir, by flush on every close
+      of a handle that dirtied a path, and by release of the last handle
+      still dirty (the PRIMARY barrier for programs that never fsync).
+      A size cap on the pending buffer MAY auto-invoke it.  Two handles
+      on one path share the buffered image (POSIX-consistent within one
+      mount).  This ONE path is what lets EXT-34 Section 5.5, the
+      conflict anchor and the lease refusal cover every syscall.
+
+   5.5.  The handle model (close-to-open).
+
+      A file handle carries (path, the HANDLE PIN bound at open, a dirty
+      flag, the open flags).  Reads through a handle serve the pinned
+      content for the handle's life even as the tree changes underneath
+      -- an editor with a file open keeps reading the bytes it opened; a
+      FRESH open sees the current content.  A handle on a live document
+      reads the document's current text and, on write, buffers text
+      whose barrier is "pull the document's operations, diff, push".
+
+   5.6.  Lifecycle.
+
+      A mount runs in the FOREGROUND by default and unmounts on SIGINT,
+      SIGTERM and context cancellation; "--daemon" detaches (with a log
+      file).  A mount MUST clean up a STALE mountpoint it finds at start
+      (a previous instance hard-killed leaves a mountpoint answering
+      ENOTCONN), MUST unmount on a recovered panic, and MUST document the
+      kernel's abort control for a wedged connection.  An "umount"
+      verb MUST work from another shell after a hard kill (the
+      privileged and the lazy fallbacks in order).  "allow_other" (other
+      users may traverse the mount) MUST be OFF by default and behind an
+      explicit flag.
+
+
+6.  VFS Operation to ACP Mapping
+
+   6.1.  The mapping table (CAS and realtime).
+
+      The table states, per kernel operation, what the view does, what
+      acp/1 request each backend issues, and the KERNEL-CACHE POSTURE
+      (Section 7) the mount MUST return.  "deferred" = buffered in the
+      overlay until the barrier.  "TTL" = the entry/attribute lifetime
+      handed to the kernel; "notify" = an event-driven invalidation
+      where the platform supports it.
+
+      lookup          View.Stat via the overlay.  CAS: held manifest
+                      (GET /v1/manifest only on invalidation).  RT: held
+                      tree (GET /v1/fs/tree on invalidation).  Cache:
+                      present and clean -> TTL about 1 s; pending, in-
+                      flight or dirty -> TTL 0; MISSING -> ENOENT with
+                      TTL 0 (never a cached negative).
+      getattr         As lookup.  CAS: size, mtime, hash from the entry.
+                      RT: size from the blob, or the current document
+                      length for a live document; NO mtime exists, so
+                      one is SYNTHESISED (Section 8.4).  Size MUST
+                      include buffered bytes.
+      readdir /       View.Readdir merged with the overlay; CAS
+      readdirplus     synthesises directories; RT narrows the tree to
+                      the prefix and directory; a name-collision loser
+                      "<name>~<nodeId>" is shown VERBATIM and a real "~"
+                      is un-doubled for display (EXT-28 Section 4.2.4).
+                      One fresh directory stream per opendir = a
+                      consistent listing; no cached directory stream.
+      open (read)     Resolve (path -> hash | doc), bind the HANDLE PIN.
+                      No wire.  No kernel page cache kept across opens
+                      (close-to-open).
+      read            Serve from the pin.  CAS/RT blob: GET /v1/blobs/
+                      <hash> -- immutable, cached by hash, streamed above
+                      a ceiling never held whole.  RT live document: the
+                      document text, re-read per open, never cached.
+      create /        View.WriteFile(path, empty) into the overlay;
+      open(O_CREAT)   O_EXCL -> EEXIST if the OVERLAY says present (never
+                      a wire probe).  Deferred.  TTL 0 while pending.
+      write           Update the whole-file image at offset; the FIRST
+                      partial write pulls the pinned blob into the buffer
+                      (read-modify-write); O_APPEND appends at the
+                      buffered size.  Above the whole-file cap -> EFBIG.
+                      Deferred.  attr TTL 0.
+      truncate /      Resize the buffered image.  Deferred.  attr TTL 0.
+      setattr(size)
+      setattr(mode/   ACCEPT-AND-DROP (cosmetic) so "cp -p", "rsync -a",
+      uid/gid/times)  "tar -x" and editors do not fail (Section 6.3).
+      fsync /         THE BARRIER (Section 5.4).  On success, Linux:
+      fsyncdir        notify the touched names; attributes refreshed.
+      flush (close)   If the handle dirtied a path -> the barrier; else
+                      no-op.
+      release         If still dirty (no fsync/flush landed) -> the
+                      barrier; drop the pin.  The kernel IGNORES this
+                      call's return value (Section 8.1).
+      unlink          BULK GUARD FIRST (Section 9.1): the crossing call
+                      -> EPERM synchronously, nothing bulk buffered.
+                      Else View.Unlink into the overlay (a path whose put
+                      is in flight becomes a real delete, never ENOENT).
+                      CAS: deferred -> commit changes[{path, delete}].
+                      RT: deferred -> a delete op (node -> TRASH,
+                      recoverable).  Linux: notify-delete after landing.
+      rmdir           ENOTEMPTY if the overlay shows effective children;
+                      else CAS: drop the virtual directory; RT: a delete
+                      op on the folder node.
+      mkdir           CAS: a VIRTUAL directory (materialises when a file
+                      lands under it; vanishes on remount if empty).  RT:
+                      deferred -> a mkdir op (real, persists).  TTL 0
+                      while virtual/pending.
+      rename          BULK GUARD (a directory rename measures net-loss 0
+                      -- EXT-34 Section 4.2.2; moving a tree is not
+                      bulk).  RENAME_NOREPLACE -> EEXIST against the
+                      overlay.  RENAME_EXCHANGE -> ENOTSUP (reject, never
+                      ignore).  CAS: deferred -> one commit: delete old +
+                      put the SAME hash at new (no re-upload).  RT:
+                      deferred -> a move/rename op (identity-preserving).
+                      The mount's inode object moves with the name.
+                      Linux: notify both names after landing.
+      link            ENOTSUP (content is shared by hash; identity is
+                      not).
+      symlink /       ENOTSUP (no wire type).
+      readlink
+      mknod / fifo /  ENOTSUP.
+      socket
+      xattr (all)     ENOSYS with the substrate's "disable xattrs" so the
+                      kernel stops asking (v1).  A later read-only
+                      "user.acp.*" namespace is an Open Question.
+      access          OK: there is no per-user permission model; access
+                      IS the mount's credential plus its EXT-27 read
+                      scope.
+      statfs          Synthetic: block size 4096; blocks/free from the
+                      space quota headroom in /v1/stats when present
+                      (cached at least 30 s), else large constants.  "df"
+                      MUST not error.
+      getlk / setlk   Not implemented; the kernel's LOCAL emulation
+                      applies (Section 6.3).  Cross-agent exclusion is a
+                      LEASE (ACP/1 Section 10), on the CLI/SDK surface.
+      poll / ioctl /  ENOSYS / ENOTSUP.
+      bmap / fallocate
+      / copy_file_range
+      inotify (kernel Driven by the event follower: file.* (CAS) or fs.*
+      side)           (RT) events -> notify-entry / notify-delete (Linux
+                      only); macOS: TTL expiry only.
+      mode change     Section 5.3 (invalidate once, re-point, carry the
+      under the mount batch with anchors).
+
+      Invariant: there is no operation in this table that reaches the
+      daemon by any write other than ONE commit or ONE structural batch
+      (Section 5.4).
+
+   6.2.  The errno table.
+
+      A mount MUST use these meanings and MUST NOT conflate them; an
+      agent or tool reading an errno is entitled to the cause:
+
+         ESTALE    the version you edited is stale -- a CONTENT
+                   CONFLICT, under the "error" policy only (Section
+                   8.2).  POSIX-defined; editors treat it as "reload",
+                   not as a disk fault.
+         EACCES    refused by a LEASE (423) or by the token's
+                   authorisation; the batch is kept pending; the holder
+                   is named in the status surface.
+         EPERM     POLICY refusal: the crossing unlink/rename of the bulk
+                   guard (Section 9.1); a 428/403 answered at the
+                   barrier (buffer kept); a refused Finder-metadata name
+                   on macOS (Section 12.6).
+         EROFS     a version-pinned ("v=") mount, or a read-only
+                   increment.
+         EIO       the WIRE or the daemon is unreachable, or a per-
+                   request deadline expired.  NEVER a conflict, NEVER a
+                   policy refusal, NEVER a lease -- EIO hides the cause
+                   behind "disk error".
+         ENOTSUP / an operation this memo does not map (link, symlink,
+         ENOSYS    mknod, exchange-rename, xattr, fallocate, ...);
+                   rejected, never silently dropped.
+         EFBIG     a write that would exceed the whole-file cap (Section
+                   6.3); reads still stream.
+         ENODEV    a shared writable mapping under the direct-I/O
+                   posture (Section 7.4), on kernels whose substrate
+                   does not negotiate direct-I/O mmap.
+         EEXIST / ENOENT / ENOTDIR / EISDIR / ENOTEMPTY
+                   computed from the OVERLAY plus the held structure --
+                   NEVER by probing the wire per call, and never from a
+                   cached negative.
+         ENOTCONN  a mountpoint whose mount process has died (kernel-
+                   generated); the remedy is "umount" then re-mount.
+
+   6.3.  Operations that do not map cleanly (honest degradation).
+
+      A content-addressed, whole-file store is not a byte-addressable
+      block device, and the memo says so per concern rather than
+      pretending:
+
+      o  PARTIAL / RANDOM WRITES.  The write model is a whole-file image:
+         the first partial write pulls the pinned blob into the buffer,
+         edits happen in memory, the barrier uploads the whole new byte
+         set.  A one-byte edit re-uploads the file.  Files above a
+         configurable cap (RECOMMENDED default 256 MiB) are READ-ONLY
+         through the mount: a write returns EFBIG; reads stream.
+      o  MMAP.  Read-only and private mappings work (executables, "git").
+         A shared writable mapping is best-effort at best: its dirty
+         pages arrive as writes at msync/munmap and land in the buffer,
+         with no ordering guarantee against an explicit fsync on another
+         handle; under the direct-I/O posture of Section 7.4 it is
+         refused (ENODEV) on kernels that cannot map direct-I/O files.
+         Not coherent across mounts, ever.
+      o  LOCKS.  Byte-range and whole-file locks are kernel-LOCAL
+         emulation: they exclude processes on THIS mount only.  Cross-
+         agent exclusion is an ACP lease (an Open Question records a
+         possible lock-to-lease bridge).
+      o  O_APPEND.  The kernel computes the offset from the mount's size
+         attribute (TTL 0 on dirty paths) and the append lands in the
+         buffer.  Two mounts appending concurrently produce a CAS
+         conflict (sidecar) or, in realtime, a content conflict -- NEVER
+         an interleaved merge.
+      o  ATOMIC RENAME.  Atomic within THIS mount's overlay and atomic at
+         the authority (one commit / one batch); other mounts see it
+         after event latency plus TTL.  RENAME_NOREPLACE is honoured
+         against the overlay; a time-of-check race with another writer
+         becomes a conflict at the barrier.  RENAME_EXCHANGE is refused.
+      o  PERMISSIONS / OWNERSHIP.  Synthetic 0644 files and 0755
+         directories owned by the mounting user; mode/owner/time changes
+         are accepted and dropped so common tools do not fail.  Mode bits
+         are cosmetic; ACCESS CONTROL IS ACP'S, not POSIX's.
+      o  INODE NUMBERS.  Mount-local, stable within a mount session,
+         preserved across the mount's own rename and across a realtime
+         content replace (the node id changes underneath and is exposed
+         as metadata, not as the inode); the generation bumps on re-
+         create after delete.  Not stable across mounts.
+      o  MTIME IN REALTIME.  The tree carries none; the mount synthesises
+         one that CHANGES when the node id or blob changes and is
+         monotonic per path, so "make" rebuilds; "ls -l" times are
+         approximate.
+      o  EMPTY DIRECTORIES IN CAS.  A mount-local courtesy: virtual until
+         a file lands, gone on remount if still empty.  Realtime keeps
+         them.
+      o  EXTENDED ATTRIBUTES / FINDER METADATA.  Not stored (Section
+         12.6).
+      o  CASE / NORMALISATION.  Paths are byte-exact (the ACP path
+         charset); no case folding; a macOS user may meet NFD/NFC
+         surprises.
+      o  DISCONNECTED.  Cached reads serve; an uncached read returns EIO
+         FAST; a barrier fails and its bytes stay pending; there is NO
+         offline write queue (Section 9.4).
+      o  BULK DELETE.  "rm -rf" beyond the space's threshold stops at the
+         first refused unlink unless the mount was opened with
+         "--allow-bulk" (Section 9.1).
+
+
+7.  The Cache-Honesty Invariant (the negative-cache hazard, generalised)
+
+   7.1.  The invariant.
+
+      The shipped client facade had ONE cache (its overlay) and one lie
+      window (an in-flight batch invisible to same-mount reads: "you
+      told me it doesn't exist, now it does").  A kernel adds FOUR
+      caches -- the dentry cache including NEGATIVE dentries, the
+      attribute cache, the page cache, and the directory stream -- and
+      on some platforms removes the lever to invalidate them.  The
+      lesson is not "negative lookups"; it is:
+
+         EVERY cache between the user and the authority MUST either be
+         invalidated by the same events that change the truth, or hold
+         its entries so briefly that a lie cannot stick.  A cache MAY be
+         STALE; it MUST NEVER LIE.  A NEGATIVE answer is NEVER cached.
+
+      "Lie" is defined precisely: a negative answer for a name that
+      exists at the authority or in the overlay; a positive answer with
+      a size or content that mixes two versions; a directory listing
+      that omits a present entry for longer than the stated bound.
+      "Stale" is a positive answer that was true and is now superseded,
+      within the stated bound.
+
+   7.2.  The rules.
+
+      A conformant mount MUST implement, and its suite MUST pin, each
+      rule; the platform columns state where the KERNEL can be made to
+      obey and where only the view can:
+
+      D1  The overlay = pending UNION every queued or in-flight batch,
+          newest wins; a path whose first write is in flight is PRESENT
+          to lookup, readdir, stat, open, unlink and rename.  (Holds on
+          every platform -- the ONE line a loopback client cannot
+          break.)
+      D2  A missing name is answered ENOENT with an entry lifetime of
+          ZERO, and the substrate's global negative lifetime is ZERO.  No
+          cached negative, ever, in the kernel or in the view: the view
+          re-fetches before saying ENOENT from a snapshot it knows to be
+          stale.  (Linux, macOS FUSE: enforced.  A loopback NFS client
+          applies its own lookup cache -> the mount line MUST document
+          the positive-only lookup-cache option.)
+      D3  A pending, in-flight or dirty path carries entry and attribute
+          lifetime ZERO, and its size is the buffered size.  (A loopback
+          NFS client may show a stale size for its attribute timeout --
+          documented.)
+      D4  A clean path carries a SHORT positive lifetime (RECOMMENDED
+          about 1 s, operator-tunable) AND, where the platform supports
+          it, an event-driven invalidation on every file.* / fs.* event
+          that touches it.  (Linux: lifetime AND notify.  macOS FUSE:
+          lifetime ONLY.  Loopbacks: the OS client's cache.)
+      D5  No kernel page cache kept across opens, no writeback cache, no
+          cached directory stream: pages and listings die with the open.
+          (Enforced on native front-ends; a loopback client caches by
+          its own rules.)
+      D6  The barrier is the ONLY visibility fence for OTHER mounts; for
+          THIS mount the overlay makes a write visible immediately.
+      D7  A kernel request MUST NEVER block on an unbounded wire wait: a
+          disconnected mount answers EIO fast (Section 9.4).  (Loopback
+          NFS: the client's soft/timeout options, documented.)
+      D8  The per-platform staleness bound is SHOWN in the status
+          surface: "cache": {"negative": 0, "entry": "<d>", "notify":
+          true|false} (Appendix A).
+
+   7.3.  The per-platform honesty bound, and where it is shown.
+
+      Stated for the owner and the user alike: on LINUX the mount is as
+      honest as the facade -- a teammate's change is visible on the
+      event, and no cached answer outlives it.  On macOS through the
+      FUSE package a teammate's change is visible within the positive
+      lifetime plus event latency, with no push invalidation.  On a
+      loopback front-end the bound is the OS client's cache, not the
+      mount's.  The negative-cache CLASS (a stale "does not exist") is
+      closed on EVERY platform by D1 and D2, because the kernel is never
+      told a name is absent for longer than the current call.  The
+      mount MUST print its platform's bound at mount time and MUST show
+      it in the status surface (D8).
+
+   7.4.  Page-cache posture (recorded deviation).
+
+      The design table (Section 6.1) says "no kernel page cache across
+      opens" and the spike said "no direct I/O, it would break mmap".
+      The first increment found, with a real-kernel test, that the
+      page-cache alternative LIES: a file rewritten upstream is read
+      TRUNCATED to the kernel's cached old size for up to the attribute
+      lifetime -- a mixed-version read, the exact thing 7.1 forbids.
+      The reference mount therefore returns DIRECT I/O on every file
+      handle: each handle is one coherent content version, reads are
+      bounded by the handle's own end-of-file, and no page can go stale.
+      Cost: no kernel page cache (bytes come from the in-process cache),
+      and a shared writable mapping is refused (ENODEV) where the
+      substrate cannot negotiate direct-I/O mmap; private mappings work.
+      This is a DEVIATION from the design table, recorded for the owner
+      to ratify or reverse; the live-follow increment (Section 16, slice
+      4) re-evaluates it, because precise invalidation events make
+      "attribute lifetime zero plus content invalidation" a viable page-
+      cache design.  Whichever posture is chosen, 7.1 is the test: a
+      fresh open MUST see the full new bytes, never a truncated mix.
+
+
+8.  Conflict Through POSIX
+
+   8.1.  errno is one integer; the conflict record is not.
+
+      A barrier's outcome is a REPORT: {version, landed[], conflicts[]:
+      {path, op, ours{hash, bytes}, theirs{hash, size, mtime}, sidecar,
+      theirsNode}, rebases, attempts, outstamped[]}.  A kernel can
+      return exactly ONE errno from fsync, flush or release -- and the
+      kernel DISCARDS release's return value.  Consequently: a conflict
+      discovered on release (the common case -- "cp", "git checkout", a
+      build tool, none of which fsync) cannot be reported by errno at
+      all; an errno on fsync reaches the PROCESS, not the human ("fsync
+      failed" in an editor's status line, which keeps its buffer but
+      learns nothing of WHAT conflicted); and the losing bytes must
+      exist somewhere findable, which errno cannot provide.  Hence the
+      two-part answer: a policy for the errno, and a MANDATORY status
+      surface for the record.
+
+   8.2.  The two policies.
+
+      SIDECAR (the DEFAULT; the shipped facade's default):  the disjoint
+         subset lands; each conflicting write lands as a SIDECAR
+         "<name>.conflict-<agent>-<timestamp>" -- a FRESH name, never
+         overwriting an existing one, including one that exists but is
+         invisible to the token's read scope (the naming hazard under
+         EXT-27, HZ-ACPDB-14); the path keeps THEIR bytes.  fsync/flush
+         return 0 (the write DID durably land, as a sidecar).  The editor
+         then sees the file change under it -- Linux: notify on the path
+         and the new sibling, so inotify users and editors prompt
+         "reload?"; macOS: on the next stat after the lifetime.  Both
+         byte sets are on the daemon.
+      ERROR (opt-in "--conflict=error"; the facade's "throw" policy):
+         the disjoint subset lands; the conflicting change stays PENDING
+         in the mount; fsync/flush return ESTALE.  The editor keeps its
+         dirty buffer; a second save meets the same conflict until the
+         user re-reads (re-open).  Ours exist ONLY in the mount buffer --
+         lost if the mount dies -- which is why this is not the default.
+         On release the errno is lost, so the record MUST still reach
+         the status surface.
+
+      Under BOTH policies: a lease refusal (423) -> EACCES with the batch
+      kept and the holder in the status surface; a pinned mount -> EROFS
+      on any write; a bulk refusal -> EPERM (Section 9.1); a disconnected
+      barrier -> EIO with bytes pending; a mode flipped underneath ->
+      0 after re-point and retry (Section 5.3).  NEVER EIO for a
+      conflict.
+
+   8.3.  The status surface.
+
+      Required under both policies, layered:
+
+      (1) A STRUCTURED LOG (stderr or "--log"): one JSON line per barrier
+          report and per conflict record -- always on; what an agent
+          harness tails.
+      (2) A CONTROL DIRECTORY "<mountpoint>/.acp/" (flag "--control-dir";
+          RECOMMENDED on for an interactive mount, off for "--daemon"):
+          READ-ONLY synthetic files -- "status" (Appendix A), "conflicts.
+          jsonl" (append-only for the session, every conflict record
+          including the sidecar name and the other writer's node), and
+          "trash" (realtime: the retained trash listing in scope, so a
+          user can see what an "rm" moved aside and restore it with the
+          CLI's restore verb).  The directory is EXCLUDED from readdir of
+          the root unless the flag is set, so "rsync", "git" and "find"
+          never see it by accident, and it is never written to the
+          daemon.
+      (3) On Linux, an inotify event for every landed sidecar
+          (create/delete semantics through notify), so editors and
+          "inotifywait" learn of it without polling.
+      (4) OPTIONAL, later: a read-only "user.acp.conflict" extended
+          attribute on the original path while a sidecar exists
+          (deferred; v1 disables xattrs).
+
+   8.4.  Realtime through POSIX.
+
+      o  STRUCTURE never conflicts.  Two mounts creating, moving or
+         deleting in one subtree both land; a moved file keeps its node
+         id; a same-name concurrent create keeps BOTH nodes and the loser
+         appears as "<name>~<nodeId>" -- a real, listable, openable path
+         (EXT-28 Section 4.2.4).  The mount MUST show it verbatim and
+         MUST NOT "clean" it (that would hide the daemon's name for that
+         node); a "~" in a user-typed name is doubled on the wire and un-
+         doubled for display; a loser's suffix is accepted verbatim on
+         input.
+      o  CONTENT is still anchored.  Replacing a blob-backed file is
+         "delete p + create p <blob>" in ONE batch, anchored on the node
+         id the mount saw at buffer time; a different or absent node at
+         the barrier is a conflict surfaced exactly as Section 8.2, plus
+         the repair batch (their node restored from trash, ours to the
+         sidecar).  A LIVE DOCUMENT file MERGES -- no anchor, no
+         conflict, convergence.
+      o  A DELETE IS A MOVE TO TRASH.  "rm f" trashes the node
+         (recoverable for the retention window; EXT-28 Section 4.4 --
+         "delete is not immediate erasure", HZ-ACPDB-28); the mount
+         answers ENOENT afterwards; ".acp/trash" and the CLI list it.
+      o  readdir is a snapshot per opendir merged with the overlay.  A
+         teammate's change between two "ls" calls shows on the second
+         once the fs.* event has marked the tree stale: event latency
+         with a follower, the positive lifetime plus the next re-read
+         without one -- the bound is stated in the docs and in D8.
+      o  An editor with a file open keeps the pinned bytes; on Linux it
+         receives a delete/create pair (same mount-local inode) and
+         prompts to reload; on macOS it notices at the next stat.
+      o  "make" sees the synthesised, monotonic mtime (Section 6.3).
+      o  The version is null; ".acp/status" shows {"version": null,
+         "mode": "realtime"}; a "v="-pinned URI refuses to mount a
+         realtime region.
+      o  fs.mode.changed -> Section 5.3.
+
+
+9.  Safety Under the Mount
+
+   9.1.  The bulk guard, measured at the crossing unlink.
+
+      EXT-34 Section 5.5 already binds a mount; this memo restates it as
+      the mount's contract.  A mount cannot ask its user, so it MUST
+      evaluate EXT-34 Section 4.2 LOCALLY -- the net-loss tallies over
+      (overlay UNION the operation) against the token's measurement
+      scope -- BEFORE acknowledging the unlink, rmdir or rename that
+      would make the pending batch bulk, and MUST fail THAT call with
+      EPERM so an "rm -rf" stops at the first refused unlink having
+      buffered NOTHING bulk.  A directory rename is delete plus re-add of
+      the same hashes and measures 0: moving a tree is not bulk.  Only a
+      mount created with the explicit "--allow-bulk" option forwards a
+      bulk_confirm computed from ITS OWN measurement (never a blind echo
+      of the authority's numbers).  If the authority nonetheless answers
+      428 or 403 bulk_denied at the barrier (the cache was stale; the
+      token is denied bulk), the mount MUST keep the buffered changes
+      (never drop an acknowledged write), surface the refusal through
+      the status surface, return EPERM, and MUST NOT auto-echo.  Where
+      the daemon exposes the token's disposition (EXT-34 whoami), a mount
+      SHOULD read it at pre-flight and warn before a large operation.
+      The mount-side guard works on the FROZEN wire -- it does not depend
+      on the daemon advertising "bulkguard"; when the daemon does, the
+      two measurements agree by construction (same rule, same scope).
+      A mount opened with "--allow-bulk" is trusted by design; its
+      recovery is EXT-33 history.
+
+   9.2.  Recover from anything under the mount.
+
+      Every destructive change from the mount is recoverable for the
+      space's retention window exactly as from any other client, because
+      the mount uses no other write path: a CAS commit is a version with
+      an EXT-33 record (a restore is a forward commit); a realtime delete
+      is a move to retained TRASH (EXT-28 Section 5.6, a RESTORE brings
+      it back with identity and content); an accepted bulk commit pins
+      an EXT-34 pre-bulk checkpoint.  A mount MUST expose what it moved
+      aside (".acp/trash" in realtime; the sidecar in the tree for a
+      conflict) and MUST NOT implement any delete that bypasses these.
+
+   9.3.  No second write path; no durable authority state.
+
+      The mount holds NO durable authority state: its buffer is
+      volatile, its caches are derived, its status files are synthetic.
+      Everything durable is on the daemon.  A mount MUST NOT persist a
+      write queue across its own restart (that would be an offline store
+      with its own conflict semantics -- a non-goal), and MUST report an
+      unflushed buffer at exit in its log so nothing is lost silently.
+
+   9.4.  Never block; the disconnected posture.
+
+      A hung filesystem hangs every program that touches it.  A mount
+      MUST bound every kernel request by a per-request deadline and MUST
+      NOT wait on the wire without one: disconnected, an uncached read
+      returns EIO FAST (never fabricated bytes, never a block); a barrier
+      fails with EIO and its bytes stay pending; the status surface says
+      "disconnected"; reconnect resumes the event follower from the last
+      seq plus one with no gap.  There is NO offline write queue in v1
+      (whether realtime structural ops may queue until reconnect is an
+      Open Question).
+
+
+10. Platform Reach
+
+   The reach table (normative for what a mount MUST claim; each row's
+   "honesty" is the Section 7.3 bound):
+
+   Linux desktop / server (kernel FUSE, the standard FUSE userspace
+      package): native, PRIMARY; nothing to install beyond the package;
+      honesty FULL (lifetime and notify).
+   Linux container / CI sandbox: native ONLY with the FUSE device and
+      the mount privilege (or root in a user namespace) and any policy
+      allowance -- the orchestrator's cooperation; honesty full when it
+      works.  There is NO fallback that yields a POSIX mountpoint without
+      the same privilege (userspace WebDAV/NFS clients on Linux are
+      themselves FUSE- or privilege-backed).  Honest answer: the SDK and
+      CLI; no mountpoint.
+   macOS 12+ with the user-installed FUSE package (kernel extension, or
+      its file-system-extension backend on newer releases): native;
+      the package MUST NOT be bundled (licence); the kernel-extension
+      path needs the user's reduced-security approval on recent
+      hardware; honesty LIFETIME ONLY (no notify).  Fallback: the
+      loopback NFS server.
+   macOS with a kext-less third-party FUSE shim: NOT supported for a
+      live tree (it ignores cache lifetimes and offers no notify); a
+      user MAY find it works; the mount MUST NOT claim it.
+   macOS locked-down (no kernel extension, no install rights):
+      LOOPBACK NFSv3 -- the mount runs a loopback NFS server bound to
+      127.0.0.1 on a random port and the built-in kernel client mounts
+      it (user-mountable; locks disabled; positive-only lookup cache;
+      soft with a timeout); honesty = the OS client's attribute cache.
+      Windows-style WebDAV via Finder is a further fallback (needs lock
+      support and metadata handling).
+   Windows 10/11: no kernel FUSE.  LOOPBACK WebDAV over loopback HTTPS
+      with a random per-session credential (built into every edition);
+      caveats: a default 50 MB file cap (registry-tunable), a per-
+      directory attribute budget, basic auth only over TLS.  The built-
+      in NFS client exists only on the professional editions and is not
+      the primary path.  No third-party FUSE stack (Section 4.4).
+   FreeBSD: best-effort native (the substrate tests it); honesty
+      unverified; NFS loopback as fallback.
+   Browser: not this memo -- the browser virtual filesystem epic.
+
+   Both loopbacks are SERVERS the OS's own client mounts, sitting on the
+   same view; they are dependency-free of third-party kernel code and
+   MUST obey Section 12.2.  Their fidelity is lower (no change
+   notification on either; WebDAV listing storms; the Windows caps) and
+   MUST be stated as such.
+
+
+11. Honest Limits
+
+   Stated because they are the trust:
+
+   o  Conflicts through errno are lossy (Section 8.1); the full record
+      is in the sidecar and the status surface.
+   o  Content is immutable per node in realtime and whole-file in CAS:
+      an in-place partial rewrite is a replace underneath; a one-byte
+      edit re-uploads the file; very large files are read-only through
+      the mount (EFBIG).
+   o  Platform reach differs (Section 10): Linux full; macOS lifetime-
+      only or loopback; Windows loopback WebDAV; a locked-down host gets
+      no mountpoint.
+   o  It is a running mount: a process holds it; if the process dies the
+      mountpoint answers ENOTCONN until unmounted; the data is safe on
+      the daemon; re-mount.
+   o  Locks are per mount; cross-agent exclusion is a lease.
+   o  No offline writes.
+   o  Directory listings and attributes on a loopback front-end obey the
+      OS client's cache, not the mount's.
+   o  Nothing here reaches the non-file primitives (mailbox, leases,
+      presence, channels); those stay on the MCP, CLI and SDK surfaces.
+
+
+12. Security Considerations
+
+   12.1.  No token in a path, argument, option or listener.  The ACP
+      bearer or space token MUST NEVER appear in the mount URI (EXT-32's
+      ironclad rule), in a mounted file, in a mount option visible to
+      "mount" or "/proc", in the process argument vector beyond the
+      "acp://" address, or on any loopback listener.  The token rides
+      ONLY the Authorization header of the mount's own acp/1 requests.
+      A mount MUST refuse a URI carrying userinfo or a credential-shaped
+      query key.  The suite MUST assert, at the request level, that no
+      Authorization header ever appears on a loopback listener and no
+      token appears in any file under the mountpoint.
+
+   12.2.  Mount-local secrets for the loopbacks.  A loopback server MUST
+      bind ONLY to 127.0.0.1, and MUST authenticate the OS client with a
+      credential the mount MINTED for this session (a random basic-auth
+      secret for WebDAV over loopback TLS; loopback-only binding plus a
+      random high port for NFSv3, which has no credential) -- NEVER the
+      ACP token.  A leak of the session secret exposes only that
+      session's view for that session's life; a leak of the ACP token
+      would be the capability-URL leak class (EXT-3), a P0.  The
+      loopback libraries are not hardened against hostile clients, which
+      is acceptable ONLY under this binding and credential rule.
+
+   12.3.  Access is the credential's, not POSIX's.  Mode bits are
+      cosmetic (Section 6.3).  What a mount can read is the token's
+      EXT-27 read scope: an out-of-scope subtree is MISSING-SHAPED
+      (never an error), in-scope counts are filtered counts, and the
+      status surface MUST NOT reveal out-of-scope names, sizes or counts
+      (the no-oracle discipline applies to ".acp/trash" and to any
+      count it prints).  What a mount can write is the token's write
+      scope and bulk disposition.
+
+   12.4.  Other users on the host.  "allow_other" is OFF by default: a
+      mount is visible to the mounting user only, because the mount's
+      credential would otherwise act on behalf of any local user.
+      Enabling it is an explicit, documented flag.
+
+   12.5.  The status surface discloses.  ".acp/" carries the daemon
+      address, the mode, pending paths and conflict records (including
+      another writer's agent id).  It is hidden from root readdir by
+      default, is read-only, never leaves the host, and is never written
+      to the daemon; a mount with a read-scoped token MUST apply 12.3 to
+      it.
+
+   12.6.  Host-metadata litter.  A macOS file browser drops AppleDouble
+      ("._*") and folder-settings files into any directory it touches; a
+      shared space would accumulate them from every Mac.  A mount on
+      macOS SHOULD refuse names beginning "._" with EPERM by default
+      (flag to allow), and the memo records ignoring folder-settings
+      writes as an Open Question.
+
+   12.7.  Sidecar naming under read scope.  A sidecar name MUST be fresh
+      against the AUTHORITY's view, not only the token's: an existing
+      but out-of-scope sibling must not be overwritten (HZ-ACPDB-14).
+
+   12.8.  The space is the boundary.  A mount presents ONE region of ONE
+      space; it confers no cross-space reach and cannot be re-pointed by
+      a path, query or option to another space (EXT-32 Section 3.10).
+      Prefix narrowing is hygiene, not confinement.
+
+
+13. Interaction with Other Extensions
+
+   13.1.  EXT-28 (CRDT directory tree).  The realtime backend consumes
+      GET /v1/fs/tree, POST /v1/fs/ops, GET /v1/fs/trash and RESTORE as
+      specified; it shows loser names verbatim, keeps content anchored on
+      node id, and exposes trash recovery through ".acp/trash" and the
+      CLI (discharging EXT-28 Section 5.6's "client SHOULD expose it").
+      The mount adds no structural semantics: convergence, sticky trash,
+      no-resurrection and the GC pin are the daemon's.
+
+   13.2.  EXT-31 (filesystem mode).  Backend selection by GET /v1/space/
+      config; wrong_fs_mode and fs.mode.changed handling per Section 5.3
+      (the mount is the "virtual-FS facade" EXT-31 Section 4.5 assumes).
+      A pinned URI refuses a realtime region.
+
+   13.3.  EXT-32 ("acp://").  The mount target is a connection address
+      plus an optional collection path; the ironclad rule is inherited.
+      The reference CLI's "mount" verb resolves the profile from the
+      authority exactly as "--uri" does.
+
+   13.4.  EXT-33 (history).  "v=" pins a read-only mount; a CAS commit
+      from the mount is an ordinary versioned commit; recovery of a
+      mount-caused loss is EXT-33 restore (a forward commit).
+
+   13.5.  EXT-34 (bulk-change guard).  Section 9.1 IS EXT-34 Section
+      5.5 from the mount's side; the reference-client contract lines of
+      EXT-34 that name "a mount" are satisfied here.
+
+   13.6.  EXT-27 (read scoping).  Section 12.3: missing-shaped out-of-
+      scope, filtered counts, no oracle through the status surface;
+      sidecar naming per 12.7.
+
+   13.7.  EXT-22 (scoped watch).  When "watch" is advertised the event
+      follower narrows to the mount's prefix; otherwise it filters
+      file.* / fs.* events client-side from the full log.
+
+   13.8.  EXT-35 (path and subtree capability URLs).  Not consumed in
+      v1.  When ratified and advertised, a subtree capability MAY mount
+      READ-ONLY under its signed prefix (the "link-held mount" EXT-35
+      names); until then a capability-signed URI is refused as a mount
+      target.
+
+   13.9.  ACP/1 Section 10 (leases).  A 423 on the barrier is EACCES with
+      the batch kept and the holder shown; the mount takes no lease of
+      its own (an Open Question records a lock-to-lease bridge).
+
+
+14. Capability Negotiation, Rollout and Distribution
+
+   14.1.  The mount advertises NOTHING and requires no capability to run
+      against a bare acp/1 daemon in CAS mode.  It FEATURE-DETECTS at
+      pre-flight: "fsmode" + "crdtfs" (realtime regions mountable);
+      "history" ("v=" pins; restore guidance); "bulkguard" (disposition
+      read; server-side agreement with the local guard); "watch" (prefix-
+      narrowed following); "scopedtokens.read" (scope-aware status);
+      "acpuri" (bare-host discovery).  Absent any of them the mount
+      degrades to the documented behaviour, never to a silent one.
+
+   14.2.  Backward compatibility.  A mount is a client; a daemon is
+      unchanged by its existence.  An older mount against a newer daemon
+      ignores capabilities it does not know; a newer mount against an
+      older daemon refuses at pre-flight what it cannot serve (a
+      realtime region on a daemon without "crdtfs" cannot exist; a
+      pinned mount on a daemon without "history" is refused with the
+      reason).
+
+   14.3.  Distribution.  The mount binary ships beside the CLI in the
+      release matrix for Linux and macOS (never Windows for the native
+      front-end), with a checksum per artifact; the installer resolves it
+      by name; "acp update" is aware of the sibling.  The macOS FUSE
+      package is never bundled.  The reference CLI's "mount" verb
+      discovers the binary sibling-first then on PATH and prints an
+      install message when absent.
+
+   14.4.  The client SDK must carry the realtime surface.  A mount built
+      on the public SDK can only speak realtime if the SDK exposes the
+      EXT-28/31 client functions; the SDK regeneration gate precedes the
+      realtime increment.
+
+
+15. Section 17 Determinism Compliance
+
+   The mount touches NOTHING in the replicated state machine.  Every
+   request it issues is an existing acp/1, EXT-28 or EXT-31 request whose
+   apply-path determinism is already that memo's; its local caches,
+   overlay, lifetimes, synthesised times and status files are node-local
+   CLIENT state that never enters a replicated computation; the loopback
+   servers are client-side too.  There is no wall-clock, I/O or
+   nondeterminism ADDED to any apply path by this memo, because this memo
+   adds nothing to any apply path.
+
+
+16. Conformance Ladder (the merge bar per increment)
+
+   The mount is built as SHIPPABLE INCREMENTS, each with its own merge
+   bar, so a later lane continues without re-deriving the design.  A
+   conformant implementation MAY stop at any rung and MUST state which
+   rung it reaches (a read-only mount is conformant to rung 1 and MUST
+   say "read-only").  Test families are named; the clause-to-test map is
+   maintained outside the memo (the ticket's conformance stub).  Every
+   family's exploit-first case MUST first be shown FAILING on a naive
+   adapter with the bad behaviour reproduced; real-mount tests MUST run
+   against a scratch daemon on a loopback address at a temporary
+   mountpoint, unmount on cleanup, and SKIP (never fake) without the FUSE
+   device; nothing may touch a production daemon.
+
+   Rung  Increment                          Merge bar (families)
+   ----  ---------------------------------  ---------------------------
+    1    CAS READ-ONLY mount: ls/cat/grep/  lifecycle (mount, list,
+         stat/find, prefix narrowing, "v="  read, pinned = EROFS, clean
+         pin, the Section 7 posture, the    unmount); cache-honesty
+         CLI mount/umount shim.             (negatives never cached in
+         [reference implementation EXISTS,  kernel or view; fresh open
+         2026-09-18]                        sees full new bytes); cache
+                                            bound; no-token; URI parity
+    2    WRITE PATH (CAS): whole-file        editor save sequence lands
+         buffer, ONE-commit barrier,        as one commit; rename re-
+         mkdir/rm/mv, EFBIG, ENOTSUP set,   references the hash; the
+         accept-and-drop attrs, TTL 0 on    in-flight-write-is-present
+         pending, notify after landing.     probe (the negative-cache
+                                            hazard ported); the two-
+                                            mount same-path race with
+                                            the loser's bytes never
+                                            lost; facade conformance
+                                            vectors replayed
+    3    BULK GUARD + STATUS: crossing       "rm -rf" beyond threshold
+         unlink -> EPERM, "--allow-bulk",   refused at the crossing
+         428/403 keep the buffer,           unlink with nothing bulk
+         ".acp/status".                     buffered; under threshold
+                                            lands; allow-bulk forwards
+                                            the mount's own count; a
+                                            stale-cache 428 keeps the
+                                            buffer and is not echoed;
+                                            denied token gets EPERM
+                                            not EIO; net-loss parity
+                                            with an EXT-34 reference
+    4    LIVE-FOLLOW: event follower ->     write on mount A visible on
+         narrowed invalidation + Linux      mount B on the event;
+         notify; reconnect; generation      inotify fires; lifetime-
+         marks; page-cache posture          independence (long lifetime
+         re-evaluated (Section 7.4).        set, change lands fast);
+                                            disconnected posture (EIO
+                                            fast, status says so,
+                                            cached reads serve)
+    5    CONFLICT UX: sidecar default,       both byte sets survive;
+         "conflicts.jsonl", inotify on the  sidecar visible to ls; the
+         sidecar, "--conflict=error" ->     no-fsync release path still
+         ESTALE.                            lands the sidecar; ESTALE
+                                            keeps the editor buffer;
+                                            disjoint paths no false
+                                            conflict; leased -> EACCES;
+                                            the live-loser anchor case
+    6    REALTIME backend: tree, loser      structure converges across
+         names, node-id anchors,            two mounts; loser name shown
+         delete+create replace, trash       verbatim; rm -> trash and
+         repair batch, live documents,      restorable; document merge;
+         synthesised mtime, real empty      mode flip re-points carrying
+         dirs, mode re-point.               anchors; POSIX honesty
+                                            family; parity with the
+                                            facade's realtime vectors
+    7    LIFECYCLE hardening: "--daemon",   stale mount cleaned at
+         stale-mount cleanup, panic ->      start; hard-kill then umount
+         unmount, "mount status", per-      works; no request blocks
+         request deadlines.                 past its deadline
+    8    RELEASE plumbing: build matrix,    artifact + checksum present
+         installer, docs, CLI awareness.    for each target; installer
+                                            resolves it; "acp update"
+                                            aware
+    9    macOS via the FUSE package:        manual run log per release
+         lifetime-only honesty shown,       (no CI path); "._*" refused;
+         "._*" refusal.                     status shows notify:false
+   10    NFSv3 LOOPBACK (kext-less macOS).  loopback-only bind; no
+                                            Authorization on the
+                                            listener; the D1/D2 lines
+                                            hold through the OS client;
+                                            documented mount options
+   11    WebDAV LOOPBACK (Windows).         as rung 10 plus per-session
+                                            credential over loopback
+                                            TLS; conditional writes
+                                            carry the anchor; lock
+                                            support for the OS client
+
+   Parallelisable once rung 2 lands: 3 with 4, then 5 with 6; 7 and 8
+   any time after 1.  "Done" for a rung means the kernel-free AND real-
+   mount tests are green, an independent review has been folded, and a
+   defect introduced by a rung is treated at the severity of what it
+   broke.
+
+
+17. Open Questions
+
+   o  SHOULD A CLIENT-CONFORMANCE MEMO CARRY A NUMBER?  The owner's
+      2026-09-18 statement was "no dedicated wire-ext; an epic plus a
+      consumer".  This memo is drafted as EXT-37 on the EXT-23/EXT-32
+      precedent (client memos with a number and a ledger row), because
+      the OBLIGATIONS on a mount that EXT-28, EXT-31 and EXT-34 already
+      state need a normative home and a conformance row, and because two
+      implementers must agree on the sidecar convention, the status
+      schema and the errno meanings.  The alternative -- an unnumbered
+      epic with a client-contract appendix in EXT-31 -- is argued in the
+      ticket discussion.  The recommendation is to number it as a
+      CLIENT-CONFORMANCE extension (no wire, no capability) and to say
+      so in the category line.  Owner decides.
+
+   o  THE PAGE-CACHE POSTURE (Section 7.4).  Ratify the direct-I/O
+      deviation of the first increment (never a truncated read; no
+      shared writable mmap) until the live-follow increment re-evaluates
+      a page-cache design with events in hand -- or reverse it now.
+      Recommendation: keep it.
+
+   o  THE CONTROL DIRECTORY DEFAULT.  On for interactive mounts, off for
+      "--daemon" (recommended), or always off behind the flag.
+
+   o  OFFLINE STRUCTURAL OPS IN REALTIME.  Queue mkdir/rename/delete
+      until reconnect (they never conflict) or refuse as CAS does
+      (recommended for v1: refuse; one posture).
+
+   o  A LOCK-TO-LEASE BRIDGE.  Map an exclusive whole-file lock to an ACP
+      lease acquisition (with the lease's TTL) so a POSIX-locking tool
+      gains cross-agent exclusion.  Deferred; recorded.
+
+   o  A READ-ONLY "user.acp.*" EXTENDED-ATTRIBUTE NAMESPACE (hash, node
+      id, version, conflict flag) once xattrs are enabled for reads.
+
+   o  MACOS FOLDER-SETTINGS FILES.  Refuse (like "._*"), accept, or
+      ignore-on-write.
+
+   o  THE WHOLE-FILE CAP DEFAULT (256 MiB recommended) and whether it is
+      per mount or per space.
+
+   o  WHETHER THE LOOPBACK NFS FRONT-END SHOULD ALSO BE OFFERED ON LINUX
+      (it still needs the mount privilege, so it is a macOS story, not a
+      container story).
+
+   o  THE WINDOWS FUSE STACK: closed unless the owner buys its commercial
+      licence and accepts a second FUSE stack.
+
+
+Appendix A.  The Control Directory Schema
+
+   "<mountpoint>/.acp/status" (read-only, JSON, regenerated per read):
+
+      {
+        "state":        "connected" | "disconnected" | "flushing",
+        "authority":    "<host:port>",
+        "space":        "<name>",
+        "prefix":       "<prefix>/" | "",
+        "mode":         "cas" | "realtime",
+        "version":      <manifest version> | null,      ; null in realtime
+        "pinned":       <version> | null,               ; "v=" mounts
+        "read_only":    true | false,
+        "conflict_policy": "sidecar" | "error",
+        "allow_bulk":   true | false,
+        "bulk_disposition": "allowed" | "denied" | "unknown",
+        "last_seq":     <event seq>,
+        "pending":      [ "<path>", ... ],              ; buffered, unflushed
+        "in_flight":    true | false,
+        "last_barrier": { "at": "<time>", "ok": true|false,
+                          "version": <v>|null, "landed": <n>,
+                          "conflicts": <n>, "error": "<errno name>"|null },
+        "cache":        { "negative": 0, "entry": "<duration>",
+                          "notify": true | false,
+                          "platform": "linux-fuse" | "darwin-fuse" |
+                                      "nfs-loopback" | "webdav-loopback" },
+        "last_error":   "<text>" | null
+      }
+
+   "<mountpoint>/.acp/conflicts.jsonl": one JSON object per line, one
+   line per conflict record of the session: {at, path, op, ours{hash,
+   size}, theirs{hash, size, mtime}, sidecar, theirs_node|null, policy}.
+   Append-only for the session; not persisted across restarts.
+
+   "<mountpoint>/.acp/trash" (realtime only): the retained trash listing
+   the token's scope permits -- one JSON object per line {node_id,
+   origin_path, trashed_at, size}; restore is the CLI's verb.
+
+   All three are synthetic, read-only, hidden from root readdir unless
+   "--control-dir", never written to the daemon, and filtered by the
+   token's read scope (Section 12.3).
+
+
+Appendix B.  Worked Examples
+
+   B.1.  An editor's save (CAS).  The editor writes ".spec.md.tmp",
+      renames it over "spec.md", then fsyncs.  The overlay holds one new
+      byte set and one rename; the barrier uploads ONE blob and issues
+      ONE commit {delete .spec.md.tmp (never existed upstream -- elided),
+      put spec.md <hash>}; the version advances by one; "stat" shows the
+      new size immediately (overlay), other mounts see it on the event.
+
+   B.2.  "rm -rf big/" beyond the threshold.  The first unlinks are
+      buffered (each is below the threshold); the unlink that would make
+      the pending batch cross the delete threshold returns EPERM; "rm"
+      stops with "Operation not permitted"; nothing bulk was buffered
+      and no wipe reached the daemon.  With "--allow-bulk" the whole
+      delete lands in one commit carrying the mount's own bulk_confirm
+      counts, and (where "history" is advertised) an EXT-34 pre-bulk
+      checkpoint pins the prior version.
+
+   B.3.  A same-file race (sidecar default).  Mounts A and B both edit
+      "notes.md" from version 41.  A's barrier lands (42).  B's barrier
+      meets 409; the anchor for "notes.md" (hash at buffer time) no
+      longer matches; B's bytes land as "notes.md.conflict-B-<ts>" in a
+      commit that rebases B's other, disjoint paths; fsync returns 0;
+      ".acp/conflicts.jsonl" gains a record naming A's hash; on Linux an
+      inotify create fires for the sidecar and B's editor prompts to
+      reload "notes.md".  Both byte sets are on the daemon.
+
+   B.4.  The same race under "--conflict=error".  B's fsync returns
+      ESTALE; B's editor keeps its buffer and shows "reload?"; B's bytes
+      stay pending in the mount until B re-opens the file; the record is
+      in the status surface.  If the mount dies first, B's bytes are
+      gone -- which is why this is opt-in.
+
+   B.5.  A teammate's change in realtime.  Agent B (another machine)
+      creates "specs/todo.md" via its own mount; the fs.* event reaches
+      A's follower; A's view marks the tree stale and (Linux) notifies
+      the directory entry; A's next "ls specs/" shows it.  A and B then
+      append to the same live-document file; the bytes converge; neither
+      sees a conflict marker or a sidecar.
+
+   B.6.  A name-collision loser.  A and B both create "notes.md" in one
+      folder concurrently in realtime; the greater stamp holds the name;
+      the other node is listed as "notes.md~<nodeId>" -- openable,
+      renameable with "mv" -- and the mount shows it exactly so.
+
+   B.7.  A mode flip under a live mount.  An admin flips the space to
+      realtime; the mount receives fs.mode.changed (or a 409
+      wrong_fs_mode from its next barrier); it re-reads the mode,
+      invalidates once, switches to the realtime backend, and re-issues
+      its pending changes as a structural batch anchored on what it saw
+      at buffer time; nothing pending is dropped or re-anchored.
+
+
+Authors' Addresses
+
+   A. Bot (Editor)
+   ab0t
+   https://ab0t.com
+
+   This extension proposal accompanies the ACP/1 specification
+   (rfc/acp-1.txt) and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .  It is a client-consumer memo in
+   the manner of EXT-23 and EXT-32: it transcribes the Mountable-ACP
+   design ratified 2026-09-18 into a client-conformance contract, adds
+   no wire, and composes with ACP/1 Sections 8, 11 and 12 and with
+   EXT-27, EXT-28, EXT-31, EXT-32, EXT-33 and EXT-34 by consuming the
+   surfaces they expose.

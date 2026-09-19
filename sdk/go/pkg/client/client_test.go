@@ -213,6 +213,71 @@ func TestFollowStreamsEvents(t *testing.T) {
 	}
 }
 
+// TestFollowFilteredWithFiresOnOpenBeforeFirstEvent guards the M2 stream-open
+// hook: FollowOptions.OnOpen must fire on stream ESTABLISHMENT (status < 300),
+// BEFORE the first event, and even on a stream that never sends one — so a caller
+// can flip "connected" on open instead of under-reporting a healthy-but-quiet
+// stream as dead. RED-on-revert: gate OnOpen on the first event and the quiet
+// sub-case never fires it. (The mount consumes this via FollowFilteredWith; this
+// is the SDK-side guard so the M2 behaviour lives with the source, not the mirror.)
+func TestFollowFilteredWithFiresOnOpenBeforeFirstEvent(t *testing.T) {
+	// (1) Quiet stream: the open succeeds, zero events arrive, then EOF. OnOpen
+	// must STILL fire exactly once — the whole point of the fix.
+	quiet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/healthz" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"capabilities":["channels"]}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(200) // stream established; no events, then the body closes (EOF)
+	}))
+	t.Cleanup(quiet.Close)
+	c := newTestClient(t, quiet.URL)
+	opened := 0
+	f := &EventFilter{Actions: []string{"file.*"}}
+	err := c.FollowFilteredWith(0, f, &FollowOptions{OnOpen: func() { opened++ }},
+		func(wire.Event) error { t.Fatal("no events expected on a quiet stream"); return nil })
+	if err != nil && err != io.EOF {
+		t.Fatalf("follow (quiet): %v", err)
+	}
+	if opened != 1 {
+		t.Fatalf("OnOpen must fire exactly once on establishment even with 0 events; fired %d (M2 regression)", opened)
+	}
+
+	// (2) Streaming server: OnOpen must fire BEFORE the first fn call.
+	ts, _ := newFakeServer(t)
+	c2 := newTestClient(t, ts.URL)
+	var order []string
+	err = c2.FollowFilteredWith(0, nil, &FollowOptions{OnOpen: func() { order = append(order, "open") }},
+		func(wire.Event) error { order = append(order, "event"); return nil })
+	if err != nil && err != io.EOF {
+		t.Fatalf("follow (streaming): %v", err)
+	}
+	if len(order) < 2 || order[0] != "open" {
+		t.Fatalf("OnOpen must fire before the first event; order=%v", order)
+	}
+
+	// (3) A failed open (>=300) must NOT fire OnOpen and must return the *APIError.
+	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(403)
+		w.Write([]byte(`{"error":"scope"}`))
+	}))
+	t.Cleanup(fail.Close)
+	c3 := newTestClient(t, fail.URL)
+	fired := false
+	err = c3.FollowFilteredWith(0, nil, &FollowOptions{OnOpen: func() { fired = true }},
+		func(wire.Event) error { return nil })
+	var apiErr *APIError
+	if !errorsAs(err, &apiErr) || apiErr.Status != 403 {
+		t.Fatalf("failed open must return *APIError(403); got %v", err)
+	}
+	if fired {
+		t.Fatal("OnOpen must NOT fire when the stream open fails")
+	}
+}
+
 func TestCRDTAndStats(t *testing.T) {
 	ts, _ := newFakeServer(t)
 	c := newTestClient(t, ts.URL)
@@ -650,7 +715,7 @@ func TestReadBoundedStopsAtCap(t *testing.T) {
 
 	src := &endlessReader{}
 	done := make(chan []byte, 1)
-	go func() { done <- readBounded(src) }()
+	go func() { b, _ := readBounded(src); done <- b }()
 
 	select {
 	case got := <-done:
@@ -698,10 +763,10 @@ func TestControlResponseIsBounded(t *testing.T) {
 // returned byte-for-byte, so the bound is invisible to every real deployment.
 func TestReadBoundedPassesNormalPayloads(t *testing.T) {
 	payload := bytes.Repeat([]byte("x"), 2<<20) // 2 MiB — a big but lawful response
-	if got := readBounded(bytes.NewReader(payload)); !bytes.Equal(got, payload) {
+	if got, err := readBounded(bytes.NewReader(payload)); err != nil || !bytes.Equal(got, payload) {
 		t.Fatalf("a lawful %d-byte response was altered (got %d bytes)", len(payload), len(got))
 	}
-	if got := readBounded(bytes.NewReader(nil)); len(got) != 0 {
+	if got, err := readBounded(bytes.NewReader(nil)); err != nil || len(got) != 0 {
 		t.Fatalf("empty body should read as empty, got %d bytes", len(got))
 	}
 }

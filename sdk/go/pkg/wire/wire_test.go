@@ -29,6 +29,14 @@ var (
 	_ intwire.AwarenessSnapshot = wire.AwarenessSnapshot{}
 	_ intwire.AwarenessDelta    = wire.AwarenessDelta{}
 	_ intwire.AwarenessFrame    = wire.AwarenessFrame{}
+	// ext-33 history/checkpoint surface (must stay aliases, not copies).
+	_ intwire.VersionRecord   = wire.VersionRecord{}
+	_ intwire.VersionInfo     = wire.VersionInfo{}
+	_ intwire.PathVersion     = wire.PathVersion{}
+	_ intwire.History         = wire.History{}
+	_ intwire.PathHistory     = wire.PathHistory{}
+	_ intwire.Checkpoint      = wire.Checkpoint{}
+	_ intwire.RetentionPolicy = wire.RetentionPolicy{}
 )
 
 // TestAliasIdentity confirms at runtime that each public type is the identical

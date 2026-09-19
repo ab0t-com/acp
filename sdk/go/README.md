@@ -20,6 +20,17 @@ frozen wire protocol (`acp/1`). This module is client code: it talks to a runnin
 > module — this module is purely the `acp/1` client. See the ACP project for how
 > to run `coordd`.
 
+## Versioning (read before pinning)
+
+This SDK is versioned on its **own** line — `sdk/go/vX.Y.Z` — and is released
+**independently of the `coordd` daemon**. The SDK version is **not** the daemon/server
+version, and the two are never pinned to each other:
+`go get github.com/ab0t-com/acp/sdk/go/pkg/client@vX.Y.Z` selects an **SDK** release, not
+a server release. Compatibility is defined by the **frozen `acp/1` wire** that every SDK
+release speaks — an SDK works with any `coordd` serving `acp/1`, whatever the daemon's own
+version number. So never assume the SDK tag matches a daemon/binary version (for example,
+do **not** expect `sdk/go` to be at the daemon's `v0.2.x`).
+
 ## Install
 
 ```bash
@@ -270,6 +281,16 @@ func main() {
     }
 }
 ```
+
+## Runnable examples
+
+Focused, commented, compilable programs — one per need — live in
+[`examples/`](examples): `connect`, `share-files`, `event-log`, `mailbox`,
+`lease`, `crdt-coedit`, `json-crdt`. They import the SDK by its full module path,
+exactly as your own module would. `examples/run.sh` builds `coordd` from the
+parent module, starts a scratch daemon on `127.0.0.1`, and runs every example
+against it with real assertions (then tears it down). See
+[`examples/README.md`](examples/README.md) for the need → example map.
 
 ---
 
