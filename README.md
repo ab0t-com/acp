@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-7C6CF0"></a>
-  <img alt="release v0.1.7" src="https://img.shields.io/badge/release-v0.1.7-2DD4BF">
+  <img alt="release v0.2.2" src="https://img.shields.io/badge/release-v0.2.2-2DD4BF">
   <img alt="protocol acp/1" src="https://img.shields.io/badge/protocol-acp%2F1-FF9466">
 </p>
 
@@ -62,7 +62,7 @@ Grab the auto-generated token and point any client at it:
 docker exec coordd cat /data/token
 ```
 
-Pin a version with `ab0tcom/acp:v0.2.1`. Exposing it beyond localhost? Add `-hosts <your-host>` so
+Pin a version with `ab0tcom/acp:v0.2.2`. Exposing it beyond localhost? Add `-hosts <your-host>` so
 the certificate trusts that name. **Full walkthrough — TLS, configuration, docker-compose,
 clustering — in [docs/DOCKER.md](docs/DOCKER.md).**
 
