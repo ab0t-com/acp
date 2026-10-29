@@ -28,7 +28,7 @@ Errors use `{"error": "...", "current": <optional state>}`. Notable statuses:
 | Method | Path | Body / Query | Returns |
 |--------|------|-------------|---------|
 | GET | `/v1/healthz` | — (no auth) | `{status, protocol}` |
-| GET | `/v1/stats` | — | counters: `events, leases, docs, messages, blobs, manifest_version, agents_seen, idempotency_keys, uptime_sec, enforce_leases` |
+| GET | `/v1/stats` | — | counters: `events, leases, docs, json_docs, resident_docs, resident_json_docs, messages, blobs, manifest_version, agents_seen, idempotency_keys, uptime_sec, enforce_leases` (`resident_*` = documents loaded in memory right now — see OPERATIONS §6) |
 
 ## Coordination event log
 | Method | Path | Body / Query | Returns |

@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.2.3 — 2026-10-28
+Patch release. Lower, flatter memory for spaces with many large documents, plus three reliability fixes. Wire protocol
+`acp/1` is unchanged (additive; no capability, spec or on-disk-format change); no action required to upgrade.
+
+- **Lower, flatter memory for spaces with many large CRDT documents.** The daemon now holds
+  in memory the documents that are *in use*, not every large document that exists: the
+  periodic compaction check no longer loads a document just to learn it needs nothing, and a
+  document unused for `-doc-idle-unload` (default `10m`; `0` restores the old behaviour) is
+  released and rebuilt from its op-log on next access. Reported by a server-DB-mode user whose
+  idle daemon grew from ~30 MB to ~1 GB within minutes of a restart. `/v1/stats` gains
+  `resident_docs` / `resident_json_docs`. See OPERATIONS §6 for the trade-offs (first access
+  after idle pays one rebuild; the first start after upgrading folds large documents once).
+- **Fix (default file mode): a structured document re-created after a refused write no longer breaks
+  the space.** When a write that would have created a document was refused (for example by the
+  document limit) and a document of the same name was created later, its first write could fail and
+  leave every later structured-document write in that space failing until a restart. The same
+  hazard after a transient disk error while opening a document (structured or text) is fixed too.
+  Server DB mode was not affected.
+- **Fix (default file mode): document op counts stay exact across a restart after a document is
+  emptied.** A document whose content was entirely deleted and compacted, then written again, could
+  report one op fewer after a restart than before it; in a cluster that could make a restarted node
+  disagree with its peers on a compaction or limit decision. Logs already on disk in that state are
+  repaired automatically on the next start. Server DB mode was not affected.
+- **Quieter idle clusters.** The leader no longer writes and replicates a lease-expiry entry for every
+  space every 5 seconds when nothing has expired; it does so only when a lease actually expires.
+
 ## v0.2.2 — 2026-09-19
 Patch release. Adds the **native cross-OS mount** — use a space as an ordinary folder — plus **realtime shared
 spaces**, and a batch of data-integrity fixes. Wire protocol `acp/1` is unchanged (additive; the mount is a pure

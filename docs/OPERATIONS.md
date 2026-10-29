@@ -27,6 +27,7 @@ First run creates under `-data`: `token` (shared bearer secret), `cert.pem`/`key
 | `-event-retention N` | `0` | keep only the last N events (0 = unlimited); periodic compaction |
 | `-mkagent NAME` | — | create a per-agent token, print it, exit (switches to per-agent mode) |
 | `-role admin\|writer\|reader` | `writer` | role for `-mkagent` |
+| `-doc-idle-unload` | `10m` | release a document's in-memory state after it has been idle this long; the next access rebuilds it from its log. Memory only — nodes in a cluster need not agree on it. `0` keeps every touched document in memory until exit |
 
 ## 2. Auth modes
 
@@ -140,3 +141,18 @@ Good for a few agents and code/spec-sized workspaces. The event log and CRDT op-
 are kept in RAM (durable on disk); very large/long-lived deployments need compaction
 (roadmap). fsync-per-write bounds throughput to the disk's sync rate — ample for
 agent coordination, not for high-frequency telemetry.
+
+**Document memory (`-doc-idle-unload`).** A document is loaded into memory only when something needs it
+(a read, a write, the periodic compaction check) and released again after `-doc-idle-unload` without use,
+so memory tracks the documents *in use*, not every document that exists. `GET /v1/stats` reports
+`docs` / `json_docs` (all documents) next to `resident_docs` / `resident_json_docs` (loaded right now).
+Trade-offs:
+- The first access after an idle period rebuilds that document once (milliseconds; up to about a second for
+  a very large history). On a cluster a write to an idle document does this on every node — for very large
+  documents written less often than the window, raise it (e.g. `30m`) or set `0` and size RAM instead.
+- Listing documents keeps the listed page loaded; cluster snapshots briefly load every document and release
+  them again within seconds.
+- The first start after upgrading may load each large document once, about a minute after boot, then release
+  them within seconds; later starts skip that work.
+- Server DB mode benefits most; in the default file mode each log's raw records stay in memory anyway, so the
+  saving is the (larger) decoded document state on top of them.
