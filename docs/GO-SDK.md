@@ -117,12 +117,17 @@ c.SetAwareness(map[string]any{"cursor": []int{12, 40}}, 30, "session-1")
 Text: keep a local replica, fold in pulled ops, push generated ops.
 
 ```go
-doc := crdt.New("replica-A")
+doc := crdt.New("alice/editor-1") // your agent id, or `<agent>/<suffix>` (one per session); the server refuses other names
 ops, _, epoch, _ := c.PullCRDTOps("notes.txt", 0)
 for _, op := range ops { doc.Apply(op) }
 c.PushCRDTOps("notes.txt", doc.GenerateOps("hello world"), epoch)
 text, _, _ := c.CRDTText("notes.txt")
 ```
+
+To learn what a push could not apply, use `PushCRDTOpsResult` (same arguments; `PushCRDTOps` is unchanged). Its
+`Dropped` counts ops the server did not apply and never will from this push (a delete of a teammate's text it does
+not hold yet); `Pending` counts ops stored but waiting for text that has not arrived — they apply by themselves when
+it lands. Both are 0 on servers older than v0.2.5.
 
 Structured (JSON): read the converged value, mutate via a local `crdtjson.Doc`.
 

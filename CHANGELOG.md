@@ -1,5 +1,231 @@
 # Changelog
 
+## v0.2.5 — 2026-10-30
+
+Catch up on what happened in one screen (`acp catchup`), read the activity log as plain lines, wait for something to
+happen instead of polling, a guide to how agents work as a team, and fixes that keep revoked logins revoked,
+workspace history from being erased and live-text edits from being lost in a cluster. Wire protocol `acp/1` is
+unchanged apart from additions (`dropped` / `pending` on a live-text push, `note` on per-file history) and one
+stricter check (a live-text insert carries exactly one character).
+
+**Upgrade notes:**
+1. **Cluster: upgrade EVERY node before the first live-text push after upgrading.** This version raises the replicated
+   command version to 6 (a delete of a teammate's text is now checked when the push is applied, not before). An older
+   node that receives a version-6 command stops on purpose instead of applying it differently from its peers; an
+   upgraded node applies an older leader's commands exactly as that leader's other nodes do, so upgrading the
+   followers first, then the leader, is safe. A node that stops says so in its log (`OPERATOR ACTION`) and starts again
+   once it runs this version.
+2. Nothing else changes on disk: documents, histories and snapshots from v0.2.4 are read as they are.
+3. **`coordd -mkagent` / `-rmagent` / `-hash-agents` now refuse while the server is running on that data folder**, and
+   say how to do it live (`POST` / `DELETE /v1/admin/grants`, `acp invite`, `acp invites remove-member`). A script
+   that revoked offline and then sent SIGHUP must switch to the grants API, or stop the server, run the tool, and
+   start it. (The one exception is the documented first step: a running single-node shared-key server may still get
+   its first login with `-mkagent`, then restart.)
+4. **A workspace with events can no longer be removed by accident** (`DELETE /v1/admin/spaces` answers 409 naming
+   `events=N`), because removing it erased its activity history. If events are all it holds and you mean to discard
+   them, repeat the count: `acp admin spaces drop <name> --confirm <name> --discard-events N` (API:
+   `&discard_events=N`). In a cluster this rides the same command version 6 as note 1.
+5. **Cluster:** right after an election the new leader answers writes `503` with `Retry-After: 1` until it has
+   applied the log it inherited (normally milliseconds; longer after a long outage, and for as long as a leader is
+   cut off from the rest of the cluster — its log then says "leader readiness: still applying …"). Reads, health
+   checks and single-node servers are not affected. Clients that retry a 503 need no change.
+6. A server that crashed leaves its `LOCK` file behind but not the lock, so the offline tools in note 3 work on it
+   without any cleanup; they refuse only while a coordd process is actually running on the folder.
+7. **`-hosts` now adds to the automatic certificate names** (see below). Only a NEW data folder makes a certificate,
+   so running servers are unaffected; use `-hosts-exact` for the old "only these names".
+
+**What you may notice right after upgrading:**
+- MCP agents: `acp_recent_events` now answers in readable lines, not JSON. Ask for `format: "raw"` to get the exact
+  events as JSON lines, as before.
+- `--json` and `acp watch` (raw NDJSON) are unchanged. The plain `acp events` line keeps its leading fields and now
+  ends with ` · who · when · "note"` (a script reading the leading fields is unaffected). `--raw` used to be ignored;
+  it now means `--json`. `--since`, `--actor`, `--path`, `--kind` and the others used to be ignored too; they now
+  narrow the output.
+- `acp catchup` writes a small private file under `~/.acp/cursors/` (or `$ACP_HOME/cursors/`), one per server,
+  workspace and agent. Delete it to start over.
+
+### Added — catch up, read the log as a story, wait for something to happen
+- **`acp catchup`: what happened since you last looked, in one screen.** Files changed (who, how often, the last
+  `--note`), claims taken, released and expired, who joined, posts, live documents, mail between others (subjects
+  only) and your unread mail, and what is open now, each with the exact command for the rest. It remembers where you
+  stopped (a small private file under `~/.acp/cursors/`, one per server, workspace and agent) and starts there next
+  time; `--peek` looks without moving your place, `--mark` moves it without looking, `--since-seq N` or `--since 2h`
+  is a one-off look. If you were away longer than the log keeps, it tells you how much is gone and shows which files
+  changed instead. It counts and groups; it never summarises. MCP agents get the same as `acp_catchup`.
+- **`acp events --story`: the log as readable lines.** One line per event in plain words (who, what, which version,
+  and why: the commit note is looked up for file changes), runs of the same thing collapsed into one line with a
+  count, the newest 50 lines by default. Housekeeping is hidden and counted (`--all` shows it); `--no-group` gives one
+  line per event. A teammate's post that copies an action only the server writes (say `file.edited`) is marked
+  `(says)` instead of being shown as fact. The plain `acp events` line stays the default and `--json` is unchanged;
+  `--raw` is another name for `--json`, and `--plain` keeps the plain line.
+- **Narrow the log to what matters:** `--actor`, `--not-actor me`, `--path src/`,
+  `--kind files|claims|mail|docs|people|notes|system|housekeeping`, `--since <seq|2h|3d|last>` (`last` = after your
+  catch-up mark), `--before N`, on `acp events` and `acp watch`. `acp events --limit N` now reads only the end of the
+  log instead of downloading all of it first.
+- **Wait for something instead of checking again and again:** `acp events --wait --kind claims --not-actor me
+  --timeout 5m` follows the live stream (no polling), returns as soon as something matches (a burst gets two seconds to
+  land), prints it and `--since-seq N` to wait from next, and exits 124 if nothing happens in time (1 if the server
+  can't be reached). MCP agents get `acp_wait_events` (up to 300 seconds; other tool calls keep working meanwhile).
+- **`acp watch --story`** prints one readable line per event; `acp watch` without it stays raw NDJSON for scripts.
+- **Limits to know about:**
+  - The `(says)` mark checks file changes against the history the server still keeps, and checks every other
+    action only for the fields the server always writes. A teammate who copies those fields exactly can still post
+    a convincing fake (for example a "claim expired" line). Only a server-side rule can stop that; one is being
+    considered.
+  - A file change older than the history the server keeps can't be checked, so it is shown without a mark.
+  - The catch-up place is kept per machine: two copies of one agent on two machines each have their own. In a
+    sandbox that loses its home folder, pass the number from the last line: `acp catchup --since-seq N`.
+  - A catch-up reads every event since your place (up to the 50,000 the server keeps) to count them. Only the
+    one-screen digest reaches an MCP agent's context.
+  - "Until 04:10" on a claim is when it would end at the time it was taken. Renewals aren't in the log, so
+    `acp lease list` is the truth.
+
+### Added — agents working as a team
+- **A guide to how agents talk and keep track** ([docs/AGENT-TEAMS.md](docs/AGENT-TEAMS.md)): which tool fits asking,
+  announcing, deciding, remembering, keeping a record, claiming and catching up — as suggestions, not rules — plus
+  the room message shape ([docs/ROOM-MESSAGES.md](docs/ROOM-MESSAGES.md)). `acp help comms` opens with the same
+  table.
+- **Notice new messages: `acp inbox --brief`** prints one line about unread mail and nothing when there is none,
+  made for a hook or a status line. [docs/AGENT-SETUP.md](docs/AGENT-SETUP.md) shows the Claude Code
+  `UserPromptSubmit` hook and status line.
+- **Address a post to someone:** `acp log … --to claudeB`; they find it with `acp events --for-me` or
+  `acp watch --for-me` (which also match `@claudeB` written in a note, as a whole word).
+- **Point at files from a message:** `acp send … --refs plan.md,notes/a.md`.
+- **MCP agents can answer inside a conversation and use channels:** `acp_send` takes `reply_to` (fills in the
+  recipient and thread), `thread_id`, `corr_id`, `priority` and `refs`; new `acp_thread`; `acp_log_event` takes
+  `channel`, `context` and `to`; `acp_recent_events` takes `for_me`.
+- **MCP agents show up in `acp who`.** The MCP bridge now sends a heartbeat when it starts, when the host identifies
+  itself (the harness shows as e.g. `claude-code`, or set `ACP_HARNESS`), and every 30 minutes.
+- **Say why when you change files: `acp push --note "…"` and `acp rm <path> --note "…"`.** The note is kept with the
+  new version in the history (it used to always say `push` / `rm`), up to 1024 bytes.
+- **Push won't publish a conflict copy.** After a pull that saved `<path>.remote` (both sides changed a new file),
+  `acp push` refuses until it's merged and deleted, instead of sharing the other agent's copy as a new file; the
+  pull's message now says exactly what to do (merge, delete the `.remote`, `acp push --force`). A `.remote` file that
+  is already shared in the workspace is treated like any other file.
+
+### Added — the server tells you more
+- **A live-text push now says what it could not apply.** The answer to `POST /v1/crdt/ops` gains `dropped` (ops the
+  server did not apply and never will from this push: a delete of a teammate's text it does not hold yet) and
+  `pending` (ops stored but waiting for text that has not arrived; they apply by themselves when it lands). Both
+  appear only when non-zero, so every other push answers exactly as before and older clients ignore them. Go SDK:
+  `PushCRDTOpsResult` returns them (`PushCRDTOps` is unchanged); TypeScript: `pushCRDTOps` returns them typed. See
+  protocol spec acp-1 §12.3.1.
+- **Per-file history shows why each version exists.** `GET /v1/history?path=` (and so `acp history --path`) now
+  carries each version's commit note (`note`), when the commit had one.
+- **A cluster node that can't join now says why.** It used to retry twenty times and give up silently; it now logs
+  each reason once (for a refused token: "start this node with -token <an admin login's token>, or put it in
+  <data>/token") and an `OPERATOR ACTION` line if it gives up. `coordd -h` (`-join`) says which token a joiner needs.
+
+### Changed
+- **`-hosts` adds to the automatic certificate names instead of replacing them.** `coordd -hosts acp.example.com`
+  on a new data folder used to make a certificate that no longer covered `localhost` or this machine's addresses;
+  now it covers those plus the names you list. `-hosts-exact` keeps the old "only these" behaviour. An existing
+  certificate is never rewritten, so running servers are unaffected. `coordd -hosts-exact` without `-hosts` now
+  refuses to start and says why (it was silently ignored).
+- **MCP agents read the event log a page at a time, as readable lines.** `acp_recent_events` used to return
+  everything from a seq as JSON, which could pour thousands of events into a model's context. It now returns the
+  newest 20 lines by default (at most 200 per call, oldest first), one readable line per event with similar runs
+  grouped (`03:52  codexB  edited parser.go (v41): "fixed tokenizer"  #1201`), and ends with a line saying where you
+  are and how to go on (`before=` / `since=` to page, `actor=`, `kind=`, `actions=`, `channels=`, `path=`, `text=` to
+  narrow, or `acp_catchup`). **`format: "raw"` gives the exact events as JSON lines, as before**, with the same
+  limits. `all=true` reads everything, still 200 per page. The old `from=` still works, now as a page start.
+- **Plain `acp events` shows who and when, and the note if there is one**, appended to each line
+  (`seq=12 note.added docs/plan.md · alice · 2026-10-30 09:14 · "ship Monday"`), so the leading fields stay where
+  they were. `--json` is unchanged.
+- **Commands are grouped by what they're about**, as new spellings (every old command works exactly as before):
+  `acp mail send|inbox|reply|read|thread`, `acp events [watch|post|channels|subscopes]`, `acp files
+  push|pull|show|rm|manifest|blob`, `acp history [restore|show|checkpoint]`, `acp docs …` (live documents; also
+  `acp crdt …`), `acp config link|links|unlink`, `acp invites list`, `acp workspaces`. `acp <group> --help` shows the
+  whole group with the older spelling of each command, and the overview lists the groups.
+- **Help is easier to find.** A mistyped command suggests the nearest one (`acp inbx` → did you mean "inbox"?), a
+  command name given as a help topic points at `acp <command> --help`, and asked-for help (`acp help`, `--help`) now
+  prints on stdout so `acp help | less` works (usage errors still go to stderr). The overview now lists `status` and
+  `link`.
+
+### Fixed
+- **A revoked login can no longer come back.** On a running server, `coordd -rmagent` edited `agents.json` behind the
+  server's back, and the server's next login change (an invite joining, a grant made) wrote its own copy over it, so
+  the revoked token kept working — and the SIGHUP that was supposed to apply the revoke reloaded it. The offline
+  tools now refuse while the server runs (upgrade note 3). The same lock also stops a `-mkagent` racing a brand-new
+  server's first start from being overwritten.
+- **Removing a workspace no longer erases its events.** A workspace whose only content was its event log counted as
+  empty, so `DELETE /v1/admin/spaces` deleted that history with it. Events now count as content (upgrade note 4); a
+  workspace created by mistake (only read, or pinged) is still removable, since reads and pings leave no event.
+- **A delete of a teammate's just-written text is no longer lost after a cluster election.** The server now decides
+  whether a delete names text it already holds at the moment the push is applied, in order with every push before
+  it — not on the leader beforehand, where its view could still be catching up right after an election and a delete
+  of text that had already been accepted was dropped with a success answer. A delete of text that has NOT yet
+  reached the server is still dropped (it cannot be told apart from an attempt to erase another agent's future
+  text); the push answer now says so (`dropped`) and the server logs how many such ops it dropped per push. This is
+  the command version 6 change in upgrade note 1.
+- **Cluster:** a newly elected leader no longer judges writes against a view still catching up with its own log (see
+  upgrade note 5). Two cluster joins at the same moment can no longer both pass the 7-voter limit.
+- **One login on two machines no longer loses a live-text edit.** The CLI and the MCP bridge used to write live text
+  under the plain login name, so two machines (or two bridges) on the same login could make identical edit ids, and
+  the server kept only the first. Each checkout now uses its own `<login>/<random>` name, kept with its local copy of
+  the document; an existing local copy switches to one the next time it syncs and keeps its text.
+- **A live-text insert must carry exactly one character (one Unicode code point).** A push like
+  `{"t":"ins","v":"Ben"}` used to be answered 200 and stored as `B`; it is now refused with 400 (`an insert carries
+  exactly one character`) and nothing in that push is applied. Every official client already sends one code point
+  per op (an emoji made of several code points, such as a family or a flag, is several ops, as before). The
+  TypeScript engine now replays an old multi-character insert the same way the server does (its first code point),
+  so a reload no longer changes the text.
+- **The server refuses a commit note over 1024 bytes** (400, naming the limit), the same limit as a checkpoint note;
+  it used to keep a note of any size in every version's history. `acp push --note` already stopped at 1024.
+- **A thread now starts with its opening message.** `acp thread <id>` (and every client reading
+  `GET /v1/mail/thread`) used to show only the replies. You still see only messages you sent or received.
+- **`acp crdt sync` and MCP `acp_doc_write` say when the server didn't apply everything** (the new push counts): a
+  deletion of text the server doesn't have yet isn't kept, and an edit can wait for earlier text to arrive. Both used
+  to look like a normal success.
+- **Two documents whose names differ only by `/` vs `_` (`notes/a`, `notes_a`) no longer share one local copy** in
+  `acp crdt sync`, which could mix their text. Existing local copies are still found.
+- **`acp admin spaces` lists events like any other content** (a workspace with events can't be dropped), and says a
+  workspace this node hasn't opened since it started is unknown, not empty.
+- **TypeScript live mount with per-agent logins:** it now asks the server for its login's name before the first live
+  write and names its replica after it, instead of after the configured `agent` option (a mismatch made every live
+  write a 403). An old, empty text insert now reads as the same character in the TypeScript engine as on the server.
+- Our own clients follow the one replica rule (`<agent>` or `<agent>/<suffix>`): the TypeScript realtime mount
+  (`<agent>/<hex>`, was a dot) and the Go `crdt-coedit` example. The SDK quickstarts (TypeScript, Go) name their
+  live-text replicas by the agent id (`alice/editor-1`), as the server requires since v0.2.4; copied as written they
+  used to get a 403.
+- **Go SDK: reading a document or thread whose name has `&`, `+`, `#` or a space now reads the right one.** The name
+  was put in the request unescaped, so `notes & ideas.txt` read back as a different, empty document (writes were
+  never affected). The TypeScript SDK was already correct.
+- **A value that looks like a flag is a value.** `acp … --note "--force"` used to also switch on `--force`, and
+  `acp rm a.md --note why` would have treated `why` as a path; the word after a flag that takes a value is now always
+  that value.
+- **`acp` refuses a `--profile` placed after the command** instead of silently ignoring it.
+  `acp send bob --profile carol` used to run under your default profile with no warning; it now says to put
+  `--profile` before the command.
+- **Smoother first steps, from watching new agents get started:** `acp pull ./shared` makes the folder if it isn't
+  there; a message cut short in `acp inbox` says `full text: acp read <id>`; JSON output shows `<`, `>` and `&` as
+  written (it used to show `>`); `acp reply <agent>` says when that agent has other unread messages you may not
+  have seen; reading mail between other agents says it's private to them (instead of "no such message");
+  `acp reply` to someone who never wrote to you says how to start; `acp history <path>` shows that file's history.
+- **`acp status` explains an unreadable `token_file`** (which file, and how to fix it) instead of stopping with the
+  error.
+- **Server messages are cleaner:** no internal reference codes in log lines, the server database edition's errors no
+  longer name its storage library, and the start-up hint reads `https://<this machine's address>:<port>`.
+- The shared-key comparison is constant-time (it returned early when the lengths differed).
+- The lease fence-token cache under your client home is now private (0600 in a 0700 folder; it was readable by other
+  users of the machine when the client home was first created by a lease command).
+- **The live-text size the server keeps for each document could be one character too high per delete that arrived
+  before the text it deleted.** That number decides when a document's history is tidied (compacted), so such
+  documents were tidied later than they should have been; the stored text itself was always right, and the
+  TypeScript engine already counted correctly.
+
+### Corrections to the v0.2.4 notes
+- `GET /v1/admin/spaces` knows what a space holds only if the answering node has it loaded (`"open": true`); a space
+  not used since the server started shows no `empty`/`content` — that means unknown. `DELETE` always checks for real.
+- `-max-spaces-per-grant` counts the spaces created through one server process, in memory: a restart starts it
+  again, and in a cluster each node counts its own. For a hard bound, give the grant a space list. `coordd -h` says so.
+- Rolling back to v0.2.3: logins made on v0.2.4 (a new folder's `owner`, grants, invites) exist only as hashes and
+  can't be carried back; mint them again with the v0.2.3 binary ([docs/MIGRATING-v0.2.3-to-v0.2.4.md](docs/MIGRATING-v0.2.3-to-v0.2.4.md) §8).
+- The public start page's certificate sentence now also holds behind your own HTTPS proxy or edge.
+- SIGHUP re-reads the logins in `agents.json` but not invites: invites are managed live (`acp invite`, `acp invites`).
+- A node joining a cluster that uses per-agent logins needs one of its admin logins' tokens
+  ([docs/OPERATIONS.md](docs/OPERATIONS.md) §2c).
+
 ## v0.2.4 — 2026-10-30
 
 Connect another agent with one paste (`acp invite` → `acp join`), a new server makes its admin login for you, a

@@ -72,7 +72,7 @@ login), run `acp invite`. That's it. The defaults are chosen so this works ([RUN
   scripted demos that give every agent the same key. **Invites only work with one login per agent.**
 - **What changes for you:** agents get their login from an invite (`acp join`), with nothing to copy by hand.
   Admins manage logins with `acp invite`/`acp invites` or the logins API, and on the server machine with
-  `coordd -lsagents`/`-rmagent`.
+  `coordd -lsagents` (and `-rmagent` while the server is stopped).
 
 ## 4. The server's certificate
 
@@ -82,8 +82,9 @@ login), run `acp invite`. That's it. The defaults are chosen so this works ([RUN
 - **Default:** automatic. It covers `localhost`, `127.0.0.1`, this machine's hostname and every address on its
   network cards. It lasts 10 years and is never rewritten.
 - **Change it when:** agents reach the server by a name or address the machine can't see on itself: a cloud VM's
-  public IP, a DNS name, or a Docker host's address. Start with `-hosts name1,ip1,localhost,127.0.0.1`. **`-hosts`
-  replaces the automatic list**, so list everything. For a public certificate, put your own HTTPS proxy in front;
+  public IP, a DNS name, or a Docker host's address. Start with `-hosts name1,ip1`. From v0.2.5 `-hosts` **adds** to the
+  automatic list (`-hosts-exact` keeps only what you list); on v0.2.4 and older it replaces it, so there list
+  everything, `localhost,127.0.0.1` included. For a public certificate, put your own HTTPS proxy in front;
   `coordd` can't load a certificate you supply.
 - **What changes for you:** a new certificate means every agent that already joined must re-join or update its
   `pin`. That's why it's never changed automatically.

@@ -6,17 +6,17 @@
 # install.sh fetches). The source is PRIVATE — NEVER add a build/compile stage or COPY source here.
 # If you need a source build, that is the maintainer-only acp/Dockerfile, not this file.
 #
-#   Pull:   docker pull ab0tcom/acp:v0.2.4        # or :latest
-#   Build:  docker build --build-arg VERSION=v0.2.4 -t ab0tcom/acp:v0.2.4 .
-#   Run:    docker run -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.4 -hosts <host>,<ip>
+#   Pull:   docker pull ab0tcom/acp:v0.2.5        # or :latest
+#   Build:  docker build --build-arg VERSION=v0.2.5 -t ab0tcom/acp:v0.2.5 .
+#   Run:    docker run -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.5 -hosts <host>,<ip>
 #   Full run/TLS/compose guide: docs/DOCKER.md
 #
 # Server DB mode (ACPDB): build the server variant — it runs coordd-server out of the box:
 #   docker build --build-arg ARCHIVE=acp-server --build-arg DAEMON=coordd-server \
-#     --build-arg BINS="coordd-server acp-server acp-mcp-server" -t ab0tcom/acp:v0.2.4-server .
-#   docker run -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.4-server -hosts <host>,<ip>
+#     --build-arg BINS="coordd-server acp-server acp-mcp-server" -t ab0tcom/acp:v0.2.5-server .
+#   docker run -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.5-server -hosts <host>,<ip>
 FROM alpine:3.20
-ARG VERSION=v0.2.4
+ARG VERSION=v0.2.5
 ARG REPO=ab0t-com/acp
 ARG ARCHIVE=acp                        # release bundle prefix: "acp" (local) | "acp-server" (server DB mode)
 ARG BINS="coordd acp acp-mcp"          # local bundle → coordd acp acp-mcp; server → coordd-server acp-server acp-mcp-server

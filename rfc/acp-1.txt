@@ -503,6 +503,37 @@ Table of Contents
    element compares origin positions first, then id, which is convergent
    for concurrent inserts (the rule underlying RGA/YATA-class CRDTs).
 
+====== BEGIN RATIFIED AMENDMENT · id=acp1-12.1-replica-namespace · proposed 2026-10-30 (rev 2) · RATIFIED by the protocol owner 2026-10-30 ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-10-30 (proposed
+     2026-10-30, revision 2 the same day) per the amendment-governance
+     SOP; now NORMATIVE.  Marker retained for provenance. ]
+
+   A replica name belongs to exactly one agent: the agent whose id it
+   equals, or whose id followed by "/" is a prefix of it (for example
+   agent "bob" owns "bob" and "bob/laptop", but not "bobby" or
+   "bob.laptop").  This is the only namespace rule; it is the same for
+   every identity mode (Section 5.2) and an authority MUST NOT accept
+   other separators.
+
+   For a text document the authority MUST refuse (403) a push that
+   contains an insert whose id names a replica the caller does not
+   own, without applying any op of that push.  A delete MAY name
+   another agent's replica when the element already exists (deleting a
+   teammate's text is normal collaboration); a delete of an id under
+   another agent's replica that the document does not hold MUST be
+   dropped, not stored, because storing it would pre-claim that agent's
+   future id.  "Holds" is judged against the document as it is at the
+   point this push is applied, after every push ordered before it
+   (so an authority's momentary lag behind its own committed history
+   cannot drop a delete whose target was already accepted).  Whether
+   the client is told of the drop is the subject of Section 12.3.1.
+
+   In shared-token mode the caller's agent id is the X-ACP-Agent header
+   (Section 5.2), so this rule prevents accidental collisions between
+   clients but cannot stop a token holder that claims another agent's
+   id; isolation between agents requires per-agent tokens.
+====== END RATIFIED AMENDMENT · id=acp1-12.1-replica-namespace ======
+
    12.2.  Operation Object
 
    An Op is { "t": "ins" | "del", "id": {"c":<uint>,"r":<string>},
@@ -517,6 +548,40 @@ Table of Contents
    the document's current epoch, the authority MUST respond 409 (the
    document was compacted; the client MUST resync, Section 12.5).  Pushes
    SHOULD also append a "crdt.op" event so watchers notice activity.
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-12.3-push-accounting · proposed 2026-10-30 · RATIFIED by the protocol owner 2026-10-30 ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-10-30 (proposed
+     2026-10-30) per the amendment-governance SOP; now NORMATIVE.
+     Marker retained for provenance. ]
+
+   12.3.1.  Operations the authority did not apply
+
+   A push may contain operations the authority appends but cannot yet
+   integrate (an insert whose origin, or a delete whose target, it does
+   not hold), and operations it MUST NOT append (Section 12.1: a delete
+   naming another agent's replica for an id the document does not hold).
+   The response to POST /v1/crdt/ops MAY carry two additional members:
+
+      "pending":  the number of operations in this push that were
+                  appended but are not yet integrated because a
+                  predecessor is missing; they integrate when it
+                  arrives and are counted in "total";
+      "dropped":  the number of operations in this push that were not
+                  appended; they are not counted in "total" and will
+                  never be applied from this push.
+
+   An authority that implements this section MUST include "dropped"
+   whenever it is non-zero and SHOULD include "pending" whenever it is
+   non-zero; it MAY omit either when zero.  A client MUST treat an
+   absent member as zero.  A client that sees "dropped" > 0 for a delete
+   SHOULD re-pull the document (Section 12.4) and, if the target is now
+   present, push the delete again; a client that sees "pending" > 0
+   SHOULD expect the text to change without a new push and MUST NOT
+   assume the push's operations are visible.
+
+   The authority MUST NOT count a dropped operation as applied in any
+   event it emits for the push (Section 12.3).
+====== END RATIFIED AMENDMENT · id=acp1-12.3-push-accounting ======
 
    12.4.  Pull Operations and Materialization
 

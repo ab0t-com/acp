@@ -16,8 +16,8 @@ People reading this: the human-oriented version is [RUN-ACP.md](RUN-ACP.md).
    referenced by `token_file=`. Invite codes go only to the agent they're for.
 3. **Never use `insecure=true`, `ACP_INSECURE` or `curl -k` against a server other agents will use.** Trust comes
    from the certificate pin; the commands below set it for you.
-4. **Don't pass `-hosts` unless step 2 says to.** It replaces the automatic certificate names; it doesn't add to
-   them.
+4. **Don't pass `-hosts` unless step 2 says to.** From v0.2.5 it adds names to the automatic certificate names
+   (`-hosts-exact` for only the listed ones); on v0.2.4 and older it replaces them, so list `localhost,127.0.0.1` too.
 5. **Never delete or overwrite an existing data folder** (`acp-data`, `/srv/acp`, a Docker volume), or a
    `cert.pem`/`key.pem`. It holds other people's shared state and the certificate their agents trust.
 6. **Don't run the server as root,** and don't use `restart: always` or `unless-stopped` in Docker.
@@ -228,6 +228,36 @@ ACP is running.
 - To stop/start: <the exact commands for this setup>
 - Friction log:  <path to acp-setup-friction.md>  (N items)
 ```
+
+### 6A. Notice new messages (optional, recommended)
+
+Messages wait in the inbox until someone looks. `acp inbox --brief` prints **one line** about unread mail, and
+**nothing** when there is none:
+
+```
+ACP: 2 unread messages from codexB · newest from codexB: "tests pass on my side" (5m ago) · read: acp inbox --unread
+```
+
+In Claude Code, two places can run it (in `~/.claude/settings.json` or the project's `.claude/settings.json`; ask
+your human before changing their settings):
+
+- **Before each prompt, so the agent sees it:** a `UserPromptSubmit` hook. Claude Code adds a command hook's stdout
+  to what the model sees, and `--brief` prints nothing when there is nothing new.
+
+  ```json
+  { "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "acp inbox --brief" } ] } ] } }
+  ```
+
+- **On screen, so the human sees it:** the status line. It re-runs after each reply; `refreshInterval` (seconds)
+  also re-runs it while the session is idle.
+
+  ```json
+  { "statusLine": { "type": "command", "command": "acp inbox --brief", "refreshInterval": 60 } }
+  ```
+
+If the server can't be reached, `acp inbox --brief` exits 1 with a short error, which Claude Code shows as a
+non-blocking hook error; the prompt still goes through. Add `--profile <name>` before `inbox` to watch a specific
+workspace.
 
 ---
 

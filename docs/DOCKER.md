@@ -24,7 +24,7 @@ docker run -d --name coordd \
   --restart on-failure:5 \
   -p 8443:8443 \
   -v acp-data:/data \
-  ab0tcom/acp:v0.2.4
+  ab0tcom/acp:v0.2.5
 ```
 
 **Database storage:** identical flags, just the `-server` tag (it runs `coordd-server` for you):
@@ -34,7 +34,7 @@ docker run -d --name acpdb \
   --restart on-failure:5 \
   -p 8443:8443 \
   -v acpdb-data:/data \
-  ab0tcom/acp:v0.2.4-server
+  ab0tcom/acp:v0.2.5-server
 ```
 
 Either is a full ACP server: shared filesystem, mailbox, event log, live documents, leases, presence. Three
@@ -101,11 +101,11 @@ with **`-hosts`**:
 
 ```bash
 docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data \
-  ab0tcom/acp:v0.2.4 -addr :8443 -data /data -hosts coordd.example.com,10.0.0.5,localhost,127.0.0.1
+  ab0tcom/acp:v0.2.5 -addr :8443 -data /data -hosts coordd.example.com,10.0.0.5,localhost,127.0.0.1
 ```
 
-- **`-hosts` replaces the automatic list; it doesn't add to it.** List **every** name and address agents will use,
-  plus `localhost,127.0.0.1`.
+- **From v0.2.5 `-hosts` adds to the automatic names** (`-hosts-exact` keeps only the listed ones). On v0.2.4 and
+  older it replaces them, so there list **every** name and address agents will use, plus `localhost,127.0.0.1`.
 - Anything after the image name replaces the default command, so always keep `-addr` and `-data`.
 - The certificate is made once, on the volume's first start, and **never rewritten** (agents have pinned it).
   Setting `-hosts` on an existing volume changes nothing. To re-make it: stop the container, move `cert.pem` and
@@ -123,7 +123,7 @@ Pass flags after the image name. The most common:
 |---|---|
 | `-addr :8443` | listen address/port |
 | `-data /data` | state directory (keep this pointed at the volume) |
-| `-hosts a,b,localhost,127.0.0.1` | every name/IP agents use, for the certificate (replaces the automatic list) |
+| `-hosts a,b` | extra names/IPs agents use, for the certificate (added to the automatic ones from v0.2.5; `-hosts-exact` = only these) |
 | `-owner-name <name>` | name of the admin login a new volume makes (default `owner`) |
 | `-shared-token` | start a **new** volume the old way: one shared key for everyone in `/data/token` (no invites) |
 | `-data-key-file <file>` | encrypt shared file contents at rest (see [OPERATIONS.md](OPERATIONS.md)) |
@@ -131,7 +131,7 @@ Pass flags after the image name. The most common:
 | `-awareness-ws` | enable the WebSocket transport for live presence |
 | `-max-docs N` | cap live documents per workspace |
 
-Run `docker run --rm ab0tcom/acp:v0.2.4 -h` for the full list, and [OPERATIONS.md](OPERATIONS.md) for what each
+Run `docker run --rm ab0tcom/acp:v0.2.5 -h` for the full list, and [OPERATIONS.md](OPERATIONS.md) for what each
 does. Group commit and the presence HTTP tier are on by default; the presence **WebSocket** transport is opt-in
 via `-awareness-ws`.
 
@@ -143,7 +143,7 @@ keeps them.
 ```yaml
 services:
   acp:
-    image: ab0tcom/acp:v0.2.4               # a fixed version; you choose when to upgrade
+    image: ab0tcom/acp:v0.2.5               # a fixed version; you choose when to upgrade
     command: ["-addr", ":8443", "-data", "/data",
               "-hosts", "coordd.example.com,localhost,127.0.0.1"]   # every name agents use
     ports:
@@ -201,12 +201,12 @@ docker compose pull && docker compose up -d      # after changing the image tag 
 or, with `docker run`:
 
 ```bash
-docker pull ab0tcom/acp:v0.2.4
+docker pull ab0tcom/acp:v0.2.5
 docker rm -f coordd
-docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.4
+docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.5
 ```
 
-Pin a version (`ab0tcom/acp:v0.2.4`) in production and bump deliberately. Read the release notes in
+Pin a version (`ab0tcom/acp:v0.2.5`) in production and bump deliberately. Read the release notes in
 [CHANGELOG.md](../CHANGELOG.md) first: v0.2.4 rewrites the logins file in a form older versions refuse, and keeps a
 backup beside it for rolling back.
 
@@ -224,7 +224,7 @@ checksum-verified binaries** (the same tarballs `install.sh` fetches). That mean
 `Dockerfile` and rebuild the *exact* official image using only public artifacts:
 
 ```bash
-docker build --build-arg VERSION=v0.2.4 -t acp:local .
+docker build --build-arg VERSION=v0.2.5 -t acp:local .
 ```
 
 It fetches `acp_<version>_linux_<arch>.tar.gz` from the release downloads and verifies its SHA-256
@@ -234,7 +234,7 @@ chain of trust as `install.sh`; no source, no compiler in the image.
 Database storage: build the server variant, which runs `coordd-server`:
 
 ```bash
-docker build --build-arg VERSION=v0.2.4 --build-arg ARCHIVE=acp-server --build-arg DAEMON=coordd-server \
+docker build --build-arg VERSION=v0.2.5 --build-arg ARCHIVE=acp-server --build-arg DAEMON=coordd-server \
   --build-arg BINS="coordd-server acp-server acp-mcp-server" -t acpdb:local .
 ```
 

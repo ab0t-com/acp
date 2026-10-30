@@ -16,8 +16,9 @@ coordd -addr :8443 -data /srv/acp   # the first start makes your admin login "ow
 ```
 
 Leave `-hosts` off unless agents will connect by a name or address this machine can't see on itself (a cloud VM's
-public IP, a DNS name, the Docker host's address). When you do set it, list **every** name agents use plus
-`localhost,127.0.0.1`: it replaces the automatic list rather than adding to it.
+public IP, a DNS name, the Docker host's address). When you do set it, list the extra names agents use: from v0.2.5 they are added to the automatic list
+(`-hosts-exact` for only the listed names). On v0.2.4 and older `-hosts` replaces the list, so there include
+`localhost,127.0.0.1` too.
 
 First run on a NEW data folder creates under `-data`: `owner.token` (0600, the token of the admin login `owner`
 it makes for you; `agents.json` keeps only its hash), `cert.pem`/`key.pem` (TLS identity), and the state dirs. It
@@ -37,7 +38,7 @@ is relative to the directory you start from.
 | `-shared-token` | `false` | on a NEW data folder, start in shared-token mode (create `<data>/token`) instead of making the `owner` login; no effect on an existing folder |
 | `-owner-name` | `owner` | name of the admin login a NEW data folder makes on its first start (token in `<data>/owner.token`) |
 | `-shared-token-role` | `admin` | role the shared token grants while no per-agent identity exists: `admin`, `writer` or `reader` |
-| `-hosts` | (auto) | SANs baked into a NEW self-signed cert. Unset: the cert covers loopback, this machine's hostname and its network addresses. Set it for a cloud VM's public IP, a DNS name, or a Docker host's address (not visible from inside). **Setting it replaces the automatic list** — include `localhost,127.0.0.1` and every name agents use. (`coordd -h` shows `127.0.0.1,localhost` as its default; unset really means the automatic list.) An existing cert is never rewritten (agents pinned it); start-up names addresses it lacks |
+| `-hosts` | (auto) | SANs baked into a NEW self-signed cert. Unset: the cert covers loopback, this machine's hostname and its network addresses. Set it for a cloud VM's public IP, a DNS name, or a Docker host's address (not visible from inside). From v0.2.5 the names are **added** to the automatic list (`-hosts-exact`: only these); on v0.2.4 and older setting it replaces the list, so include `localhost,127.0.0.1` there. (`coordd -h` shows `127.0.0.1,localhost` as its default; unset really means the automatic list.) An existing cert is never rewritten (agents pinned it); start-up names addresses it lacks |
 | `-data-key-file` | (off) | file holding a 32-byte key (or 64 hex chars) that encrypts blob contents at rest; or set `ACP_DATA_KEY`. See §4 "Encryption at rest" |
 | `-root-page` / `-root-page-file` | `true` / — | the public start-here document at `GET /` (§2b); `false` turns it off, a file replaces it |
 | `-enforce-leases` | `true` | reject commits to a path another agent holds a lease on |
@@ -45,12 +46,12 @@ is relative to the directory you start from.
 | `-rate` | `50` | per-agent request rate (req/s), burst = 4× |
 | `-event-retention N` | `50000` | keep only the last N events per space (0 = unlimited, warned at startup); periodic compaction |
 | `-mail-retention N` | `5000` | keep only the last N READ messages per recipient (unread mail is always kept; 0 = unlimited) |
-| `-max-spaces` / `-max-spaces-per-grant` | `1000` / `16` | spaces open on this node / new spaces one non-admin per-agent grant may create (§2b) |
+| `-max-spaces` / `-max-spaces-per-grant` | `1000` / `16` | spaces open on this node / new spaces one non-admin per-agent grant may create through this server process — counted in memory, per process and per node (§2b) |
 | `-idem-window N` | `10000` | idempotency keys remembered per space (exact-replay window; older keys re-apply). Replicated + persisted; in cluster mode set the SAME value on every node |
-| `-mkagent NAME` | — | create a per-agent token, print it **once**, exit (switches to per-agent mode); `agents.json` stores only its hash |
+| `-mkagent NAME` | — | create a per-agent token, print it **once**, exit (switches to per-agent mode); `agents.json` stores only its hash. For a **stopped** server: refused while one runs on `-data` (use the grants API or `acp invite`), except a single-node shared-key server's first login |
 | `-lsagents` | — | list identities (fingerprint, name, role, scope; never a token), exit |
-| `-rmagent FINGERPRINT\|NAME` | — | revoke one identity, exit; SIGHUP the daemon to apply live (refuses the last identity and an ambiguous name) |
-| `-hash-agents` | — | rewrite an older `agents.json` to store only token hashes (v6), keeping a 0600 backup, exit |
+| `-rmagent FINGERPRINT\|NAME` | — | revoke one identity, exit (refuses the last identity and an ambiguous name). For a **stopped** server: refused while one runs on `-data` — revoke live with `DELETE /v1/admin/grants` |
+| `-hash-agents` | — | rewrite an older `agents.json` to store only token hashes (v6), keeping a 0600 backup, exit (stopped server only) |
 | `-allow-cluster` | off | with `-mkagent -role admin` + a scope: lets that scoped admin change cluster membership; an unscoped admin already can |
 | `-role admin\|writer\|reader` | `writer` | role for `-mkagent` |
 | `-spaces s1[,s2…]` | (any space) | space allowlist for `-mkagent`: the token may select only these spaces |
@@ -99,10 +100,15 @@ startup, carried as `k=` in URLs).
   switches the daemon to per-agent mode: identity is derived from the token (header
   can't spoof it), and the shared token stops working. The token is printed once;
   `agents.json` keeps only its SHA-256 hash, so the file (or a backup of it) never
-  hands out access. **See who has access** with `coordd -data … -lsagents`;
-  **revoke** with `coordd -data … -rmagent <fingerprint|name>` then `kill -HUP` the
-  daemon (no restart). **Rotate** = `-mkagent` the same name, hand over the new token,
-  then `-rmagent <old fingerprint>`.
+  hands out access. **See who has access** with `coordd -data … -lsagents`.
+  **While the server runs, change logins live** (next section): `-mkagent`, `-rmagent` and
+  `-hash-agents` refuse while a coordd holds the data folder (`<data>/LOCK`), because the
+  running server rewrites `agents.json` from memory on its next login change and would
+  silently undo the edit (a revoked token would come back). They are for a **stopped**
+  server: stop it, run them, start it. One exception keeps the documented first step:
+  a running single-node shared-key server may get its FIRST login with `-mkagent`, then
+  restart. **Rotate** = mint the same name again, hand over the new token, then revoke
+  the old fingerprint (live: `POST` then `DELETE /v1/admin/grants`).
 - **Hashed storage upgrade note (v0.2.4):** files written by older versions store raw
   tokens; they keep working unchanged. The first `-mkagent` / `-rmagent` /
   `-hash-agents` rewrites the file as version 6 (hashes only) and keeps the old one as
@@ -112,7 +118,8 @@ startup, carried as `k=` in URLs).
   node runs v0.2.4.
 
 ### Live identity management (v0.2.4)
-With the daemon running, an UNSCOPED admin manages identities over HTTP — no shell, no restart, no SIGHUP:
+With the daemon running, an UNSCOPED admin manages identities over HTTP — no shell, no restart, no SIGHUP. This is
+the way to change logins on a running server (the offline `-mkagent`/`-rmagent` refuse while it runs):
 
     GET    /v1/admin/grants                         # who has access (fingerprint, name, role, created, scope)
     POST   /v1/admin/grants  {"name":"bot","role":"writer","scope":{"spaces":["team"]}}
@@ -208,14 +215,26 @@ Any request that names a space creates it, reads included, so two limits keep on
 - **`-max-spaces-per-grant`** (default 16; `0` = off): new spaces one non-admin per-agent grant may create. Over it the
   request fails with a message naming the limit. Not counted: admins, a grant scoped to a list of spaces (its list
   already bounds it), and shared-token mode (there is no per-agent identity to count; `-max-spaces` is the bound there).
+  **What it counts, exactly:** spaces created through THIS server process, kept in memory. A restart starts the count
+  again from 0, and in a cluster each node counts the spaces created through it (a read on a follower creates the
+  space there), so one grant can create up to this many per node and per process lifetime. It stops a runaway
+  client, not a determined one; for a hard bound give the grant a space list (`-spaces` / `scope.spaces`).
+  (Replicating the counter would cost a cluster write on every first read of a space; not done.)
 
 **See and remove spaces** (admin; a scoped admin only within its own spaces):
 ```
 GET    /v1/admin/spaces                          # each space: open?, empty?, what it holds
 DELETE /v1/admin/spaces?space=NAME&confirm=NAME  # remove an EMPTY space
 ```
+The listing knows what a space holds only if this node has it loaded (`"open": true`). A space not used since the
+server started shows `"open": false` with no `empty` and no `content`: that means **unknown**, not empty and not full
+(on one node spaces load when first used; a cluster node loads every space at start). `DELETE` always checks for
+real, so just try it: a space with content is refused and the answer says what it holds.
+
 Removal **refuses (409) any space that holds content**: files or their history, blobs, documents, a directory tree,
-mail, live leases, or a quota setting. Only events don't count (a read or a ping leaves those). It's replicated in a
+mail, live leases, a quota setting, or **events** (since v0.2.5: a space's event log is its activity history, and
+removing the space would erase it). A read or a presence ping leaves no event, so a space created by mistake (a
+typo'd name, a read) is still removable. It's replicated in a
 cluster, the `default` space can't be removed, and removing a space that isn't there is a no-op. The name is free again
 afterwards, and a slot goes back to the grant that created it. This endpoint never deletes real content: a space that
 holds anything stays. **If the name is used again it is a new space whose event numbers start at 1:** a watcher that resumes with an old
@@ -288,7 +307,8 @@ coordd -data /var/lib/acp -mkagent pod-42a -role writer \
   hashed-storage note in §2 for the rollback backup.
 - A well-behaved client can read its own bounds via `GET /v1/whoami` (`{agent, role,
   scope?}` — the token is never echoed) and self-limit instead of collecting 403s.
-- Revoke like any grant: `coordd -data … -rmagent <fingerprint|name>` + SIGHUP.
+- Revoke like any grant: `DELETE /v1/admin/grants?fingerprint=<fp>` on a running server, or
+  `coordd -data … -rmagent <fingerprint|name>` on a stopped one.
 
 ## 2b-read-scopes. Read scopes (`-read-prefix`)
 
@@ -389,8 +409,12 @@ production (upgrade all nodes to the same build) and treat these as current cave
   then be an unscoped admin token: the shared token no longer works.
 - **First start of a cluster:** only a node started with `-raft-bootstrap` on a NEW data folder (and no `-token` /
   `-shared-token`) makes the `owner` login; when it first leads, identity seeding replicates it to the cluster.
-  A node that joins never makes its own owner: start it with `-token "$(cat <bootstrap data>/owner.token)"` (an
-  unscoped admin token for the join) and it receives the cluster's table.
+  A node that joins never makes its own owner: its join request carries its own token (`-token`, else
+  `<data>/token`), so give it an unscoped admin login's token of the cluster — `-token "$(cat <bootstrap
+  data>/owner.token)"`, or copy that token into the joiner's `<data>/token` (0600) before its first start (it stays
+  off the process list) — and it receives the cluster's table. A joiner with its own random token is refused (401);
+  since v0.2.5 the joiner logs why and what to do (`cluster join: … refused this node's token (401) …`) instead of
+  giving up silently.
 - Cluster-membership admin (`join`/`leave`) is not yet a distinct capability from space admin — restrict
   membership operations to a trusted operator credential.
 
@@ -510,8 +534,12 @@ certificate. Env vars (`ACP_SERVER`, `ACP_TOKEN`, `ACP_PIN`/`ACP_CERT`, `ACP_AGE
 - **Roles:** in per-agent mode, mint least-privilege tokens: `coordd -mkagent bot
   -role reader` (admin|writer|reader), optionally path-confined with `-path-prefix`
   (see 2b-scopes). Revoke one with `acp invites remove-member <invite id>` (an invite's agent),
-  `DELETE /v1/admin/grants?fingerprint=…` (live, any node), or on the server machine
-  `coordd -data … -rmagent <fingerprint|name>` + `kill -HUP` (single node). Never hand-edit `agents.json`.
+  `DELETE /v1/admin/grants?fingerprint=…` (live, any node), or with the server STOPPED
+  `coordd -data … -rmagent <fingerprint|name>` (it refuses while the server runs). Never hand-edit `agents.json`.
+  **SIGHUP** re-reads the logins in `agents.json` (a rotation within the current mode; it never switches between
+  shared-key and per-agent). It does **not** re-read invites: they are managed live (`acp invite`, `acp invites`,
+  the `/v1/admin/invites` API), and the server's own table is what every redeem and revoke writes — re-reading a
+  hand-edited one could bring back a spent or revoked invite.
 - **Blob GC:** unreferenced blobs accumulate (e.g. after deletes/overwrites). Reclaim:
   `acp admin gc --grace 600` (keeps blobs newer than 10 min to avoid racing an
   in-flight push). Safe to run live; schedule it (cron) if churn is high.
@@ -579,6 +607,10 @@ certificate. Env vars (`ACP_SERVER`, `ACP_TOKEN`, `ACP_PIN`/`ACP_CERT`, `ACP_AGE
 | `acp invite` / `acp join`: "certificate does not cover …" | the address isn't in the cert's SANs: invite by an address it covers, or re-make the cert with `-hosts` (every joined agent must then re-pin) |
 | client: "the daemon's certificate isn't trusted" | set `pin=sha256:…` (start-up line) or `cert=` in the profile, or join with an invite |
 | daemon exits `78` "OPERATOR ACTION REQUIRED" | a permanent config error named in the message (bad flag, damaged store, wrong data key); restarting will not help |
+| `coordd -rmagent`/`-mkagent`: "a coordd is running on …" | the server is running on that folder; an offline edit would be undone by it. Use the grants API (`POST`/`DELETE /v1/admin/grants`) or `acp invite`/`acp invites`, or stop the server first (§2) |
+| cluster: `503` "just elected leader and is still applying the log it inherited" | right after an election a new leader serves writes only once it has applied everything committed before its term (normally milliseconds); retry after `Retry-After` |
+| cluster: a new node never joins; its log says `refused this node's token (401)` | the join carries the node's own token; give it an unscoped admin login's token of the cluster (`-token`, or `<data>/token` before its first start) — §2c |
+| `DELETE /v1/admin/spaces` → `409 … events=N` | the space has activity history; since v0.2.5 that counts as content and the space is kept. If events are all it holds and you mean to discard them: add `&discard_events=N` (`acp admin spaces drop <name> --confirm <name> --discard-events N`) |
 
 ## 6. Capacity notes
 

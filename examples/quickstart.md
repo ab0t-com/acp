@@ -12,7 +12,8 @@ coordd -addr :8443 -data /srv/acp -hosts s.example.com,localhost,127.0.0.1   # -
 The first start makes your admin login `owner`: its token goes to `/srv/acp/owner.token` (private, never printed),
 and start-up ends with the exact `acp config set owner …` line for this machine. The `clients: … pin=sha256:…`
 line shows the certificate fingerprint. Leave `-hosts` off when agents reach S by an address S has on itself (its
-hostname, a LAN or VPN IP); when you set it, list every name agents use, because it replaces the automatic list.
+hostname, a LAN or VPN IP); when you set it, list the extra names agents use (from v0.2.5 they're added to the automatic ones; on v0.2.4 and
+older `-hosts` replaces them, so list `localhost,127.0.0.1` too).
 
 ## Connect the admin (on S) and invite
 ```bash

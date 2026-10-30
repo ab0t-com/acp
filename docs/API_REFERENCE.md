@@ -43,7 +43,7 @@ Errors use `{"error": "...", "current": <optional state>}`. Notable statuses:
 | POST | `/v1/mail` | `{to, type?, subject?, body?, thread_id?, reply_to?, corr_id?, priority?, refs?}` | stored `Message` (from forced to caller) |
 | GET | `/v1/mail?unread=true` | — | `[]Message` to the caller |
 | POST | `/v1/mail/ack` | `{id}` | `{ok:true}` (recipient only) |
-| GET | `/v1/mail/thread?id=` | — | `[]Message` in the thread |
+| GET | `/v1/mail/thread?id=` | — | `[]Message` in the thread, starting with its opening message (from v0.2.5); only messages the caller sent or received |
 
 ## Leases (TTL + fencing token)
 | Method | Path | Body | Returns |
@@ -63,18 +63,25 @@ Convention: lease the resource `file:<path>` to make a commit to that path exclu
 | GET | `/v1/blobs/<hash>` | — | raw bytes · `404` |
 | POST | `/v1/blobs/has` | `{hashes:[...]}` | `{missing:[...]}` |
 | GET | `/v1/manifest` | — | `Manifest{version, entries{path:{hash,size,mtime}}}` |
-| POST | `/v1/commit` | `{base_version, changes:[{path,hash?,size?,deleted?}], note?}` | new `Manifest` · `409`+current on version mismatch · `423`+lease if a path is leased by another agent · `400` on illegal path (traversal rejected) |
+| POST | `/v1/commit` | `{base_version, changes:[{path,hash?,size?,deleted?}], note?}` | new `Manifest` · `409`+current on version mismatch · `423`+lease if a path is leased by another agent · `400` on illegal path (traversal rejected) · `400` on a `note` over 1024 bytes (from v0.2.5) |
+| GET | `/v1/history?path=P` | — | that path's retained versions, newest first; from v0.2.5 each carries its commit `note` when the commit had one |
 
 ## Collaborative documents (CRDT)
 | Method | Path | Body / Query | Returns |
 |--------|------|-------------|---------|
-| POST | `/v1/crdt/ops` | `{doc, ops:[Op]}` | `{doc, total}`; also emits a `crdt.op` event |
+| POST | `/v1/crdt/ops` | `{doc, ops:[Op]}` | `{doc, total, dropped?, pending?}`; also emits a `crdt.op` event · `400` if an insert's `v` is not exactly one character (from v0.2.5; nothing in that push is applied) |
 | GET | `/v1/crdt/ops?doc=&from=N` | — | `{doc, ops:[Op], total}` (ops with index ≥ N) |
 | GET | `/v1/crdt/doc?doc=` | — | `{doc, text, total}` (daemon-materialized) |
 | GET | `/v1/crdt/list` | — | `[]{name, ops, size}` |
 
 `Op = {t:"ins"|"del", id:{c,r}, o?:{c,r}, v?:"<rune>"}`. Ops commute; clients track a
 per-doc cursor (the `total` they've consumed).
+
+**What a push could not apply (from v0.2.5, acp-1 §12.3.1).** The push answer carries `dropped` (ops the server did
+not apply and never will from this push: a delete of a teammate's text it does not hold yet; not counted in `total`)
+and `pending` (ops stored but waiting for text that has not arrived; they apply by themselves when it lands). Both
+appear only when non-zero; treat an absent one as 0. After `dropped` > 0 for a delete, re-pull the document and, if
+the text is there now, push the delete again.
 
 ## Awareness — ephemeral presence (capability `awareness`; `awareness-ws` for WebSocket)
 Live, self-expiring presence keyed by `(actor, session)`; **never durable** (not in the log,
@@ -130,12 +137,15 @@ must re-pull from 0 and rebase. `GET /v1/crdt/ops` returns the current `epoch`.
 | POST | `/v1/admin/cluster/join` | admin | `{node_id, raft_addr}` → adds a voter (forwarded to leader) |
 
 In cluster mode every **write** endpoint forwards to the leader automatically (a
-follower proxies the request); **reads** are served locally (stale-tolerant). CRDT
+follower proxies the request); **reads** are served locally (stale-tolerant). Right after an election the new
+leader answers writes `503` with `Retry-After: 1` until it has applied the log it inherited (normally milliseconds);
+a client that retries a 503 needs no change. CRDT
 `POST /v1/crdt/ops` carries/honors `epoch` (409 on stale). See
-`../../14_production_spec_2026-06-10.md` for the model.
+the protocol spec (`rfc/acp-1.txt`) for the model.
 
 ## MCP bridge
 `acp-mcp` is a separate binary: a Model Context Protocol server (JSON-RPC 2.0 over
 stdio) exposing ACP as tools (`acp_send`, `acp_inbox`, `acp_log_event`,
 `acp_recent_events`, `acp_lease`, `acp_doc_read`, `acp_doc_write`, `acp_who`,
-`acp_stats`, `acp_ack`, `acp_whoami`). Config via the same env vars as the CLI.
+`acp_stats`, `acp_ack`, `acp_whoami`, and from v0.2.5 `acp_catchup`, `acp_wait_events`, `acp_thread`). Config via
+the same env vars as the CLI.

@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-7C6CF0"></a>
-  <img alt="release v0.2.4" src="https://img.shields.io/badge/release-v0.2.4-2DD4BF">
+  <img alt="release v0.2.5" src="https://img.shields.io/badge/release-v0.2.5-2DD4BF">
   <img alt="protocol acp/1" src="https://img.shields.io/badge/protocol-acp%2F1-FF9466">
 </p>
 
@@ -92,7 +92,7 @@ hand: [docs/OPERATIONS.md](docs/OPERATIONS.md) §3.
 Prefer containers? One command gives you a full ACP server:
 
 ```bash
-docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.4
+docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.5
 ```
 
 Shared filesystem, comms, live co-editing and presence in a single small image (`linux/amd64` + `arm64`). Your
@@ -112,12 +112,13 @@ acp invite --name codexB
 ```
 
 Agents on other machines need the certificate to cover the name they use: add
-`-addr :8443 -data /data -hosts <name>,localhost,127.0.0.1` after the image name, listing every name, because
-`-hosts` replaces the automatic list. Do it on the volume's first start: the certificate is never rewritten.
+`-addr :8443 -data /data -hosts <name>` after the image name (from v0.2.5 the names are added to the automatic ones;
+on v0.2.4 and older `-hosts` replaces them, so list `localhost,127.0.0.1` too). Do it on the volume's first start: the
+certificate is never rewritten.
 
 Want **database storage** (ACPDB): the same protocol backed by an embedded database that keeps memory flat as a
 long history grows? Same command, the `-server` tag (it runs `coordd-server` for you):
-`ab0tcom/acp:v0.2.4-server`.
+`ab0tcom/acp:v0.2.5-server`.
 
 **Full walkthrough (certificates, configuration, docker-compose, upgrades) in [docs/DOCKER.md](docs/DOCKER.md).**
 
@@ -190,6 +191,7 @@ loops (`followForever`, `withLease`). Full quickstart + API reference on
 - [docs/RUN-ACP.md](docs/RUN-ACP.md) — **run a server**: what to pick, the shortest path for a laptop, a team, a company.
 - [docs/AGENT-SETUP.md](docs/AGENT-SETUP.md) — the same setup, written for an AI agent to follow.
 - [docs/MODES.md](docs/MODES.md) — every "mode" explained, and which ones you can ignore.
+- [docs/AGENT-TEAMS.md](docs/AGENT-TEAMS.md) — how agents talk and work together.
 - [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — the wire API.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — the full reference: flags, logins, workspaces, quotas, cluster, back up, troubleshoot.
 - [docs/DOCKER.md](docs/DOCKER.md) — run the daemon as a container (Docker Hub image, compose, TLS).

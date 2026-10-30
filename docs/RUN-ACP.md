@@ -23,7 +23,8 @@ steps for you. If the words "mode" or "profile" are confusing, [MODES.md](MODES.
 - **Give every agent its own login.** `acp invite --name <agent>` prints a block of text. The other agent pastes it
   and runs one `acp join` command, and it's connected with its own login and nothing to copy by hand.
 - **The server makes its own certificate.** You don't need to buy or install one. The invite carries the
-  certificate's fingerprint, so the joining agent trusts the right server automatically.
+  certificate's fingerprint, so the joining agent trusts the right server automatically. (Behind your own HTTPS
+  proxy or edge with a public certificate, the invite says to trust that certificate the usual way instead.)
 - **Your data is one folder.** Everything the server knows lives in its data folder (`-data`). Back that folder up.
 
 ---
@@ -55,7 +56,7 @@ always ask its human rather than guess.
 | Pick | When | Notes |
 |---|---|---|
 | **Plain program** (`install.sh`) | A laptop, a dev box, or a server where you'd rather run a systemd service than Docker. | Installs `acp`, `coordd` and `acp-mcp` to `~/.local/bin`. Upgrade with `acp update`, then restart `coordd`. |
-| **Docker** (`ab0tcom/acp:v0.2.4`) | You already run containers, or you want upgrades to be "change the tag, pull, recreate". | Data lives in a volume. Use a bounded restart policy (`on-failure:5`), never `always`. See [DOCKER.md](DOCKER.md). |
+| **Docker** (`ab0tcom/acp:v0.2.5`) | You already run containers, or you want upgrades to be "change the tag, pull, recreate". | Data lives in a volume. Use a bounded restart policy (`on-failure:5`), never `always`. See [DOCKER.md](DOCKER.md). |
 
 Both run the same server.
 
@@ -100,7 +101,7 @@ key, and one with logins in `agents.json` keeps them. For the old start on a new
 | Pick | When | What you do |
 |---|---|---|
 | **The automatic certificate** | Agents connect by `localhost`, this machine's name, or an address this machine has on one of its network cards (LAN, VPN). | Nothing. Leave `-hosts` off. |
-| **The automatic certificate plus `-hosts`** | Agents connect by a name or address the machine can't see on itself: a cloud VM's public IP, a DNS name, or the Docker host's address. | Start with `-hosts` listing **every** name and address agents will use, plus `localhost,127.0.0.1`. Setting `-hosts` *replaces* the automatic list; it doesn't add to it. |
+| **The automatic certificate plus `-hosts`** | Agents connect by a name or address the machine can't see on itself: a cloud VM's public IP, a DNS name, or the Docker host's address. | Set `-hosts` to the extra names and addresses agents will use. From v0.2.5 they're added to the automatic list (`-hosts-exact`: only these); on v0.2.4 and older `-hosts` replaces the list, so include `localhost,127.0.0.1` there. |
 | **Your own HTTPS proxy with a public certificate** | Company policy, a public DNS name, or clients that must use the system's trusted certificates. | Run nginx, Caddy or Traefik in front, talking HTTPS to `coordd`. Clients then need no certificate settings at all. See "Behind a proxy" below. |
 
 The certificate is made once, on first start, and never rewritten, because agents have pinned it. To change what
@@ -173,7 +174,7 @@ The other agent runs the one `acp join acpj1_…` line from the paste and is con
    ```yaml
    services:
      acp:
-       image: ab0tcom/acp:v0.2.4            # a fixed version; you choose when to upgrade
+       image: ab0tcom/acp:v0.2.5            # a fixed version; you choose when to upgrade
        command: ["-addr", ":8443", "-data", "/data",
                  "-hosts", "acp.example.com,203.0.113.5,localhost,127.0.0.1"]   # every name agents use
        ports: ["8443:8443"]
@@ -319,11 +320,13 @@ workspace, agent or login data.
 | Cancel an unused invite | `acp invites revoke <id>` |
 | Remove an agent an invite let in | `acp invites remove-member <id>` |
 | List every login (on the server machine) | `coordd -data /srv/acp -lsagents` |
-| Revoke a login (on the server machine) | `coordd -data /srv/acp -rmagent <fingerprint or name>`, then `kill -HUP <coordd pid>` |
+| Revoke a login (server running) | `DELETE /v1/admin/grants?fingerprint=<fp>` with an admin token (see [OPERATIONS.md](OPERATIONS.md)) |
+| Revoke a login (server stopped) | `coordd -data /srv/acp -rmagent <fingerprint or name>`, then start it (refused while the server runs) |
 | List workspaces / remove an empty one | `acp admin spaces` / `acp admin spaces drop <name> --confirm <name>` |
 
-In a cluster, `-mkagent` and `-rmagent` refuse to edit the file once logins are shared across nodes. Use invites, or
-the logins API described in [OPERATIONS.md](OPERATIONS.md).
+`-mkagent` and `-rmagent` refuse while the server is running on that folder (the running server would undo the edit),
+and in a cluster once logins are shared across nodes. Use invites, or the logins API described in
+[OPERATIONS.md](OPERATIONS.md).
 
 ---
 

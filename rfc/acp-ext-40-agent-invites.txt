@@ -1,0 +1,1562 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-40                                     ab0t.com
+Updates: ACP/1                                                  October 2026
+Category: Extension Proposal                                       ISSN: n/a
+
+
+              ACP Extension Proposal 40: Agent Invites
+     -- Single-Use, Expiring Invites a New Agent Redeems for Its Own
+        Per-Agent Credential, and the "acpj1_" Invite-Code Format --
+
+
+Abstract
+
+   This document is an EXTENSION PROPOSAL for the Agent Coordination
+   Protocol, Version 1 (ACP/1).  It specifies AGENT INVITES: a PENDING
+   INVITE is a replicated, expiring, use-counted record that an
+   administrator creates for ONE space and ONE role; a new agent REDEEMS
+   it, without holding any credential beforehand, and receives its OWN
+   per-agent token -- the live grant of ACP/1 Section 15 -- shown once.
+   The invite's secret is dead the moment its uses are spent, so a code
+   that leaks into a chat transcript, a screenshot or a log cannot be
+   used later or by everyone.
+
+   It also specifies the "acpj1_" INVITE CODE: one opaque, versioned
+   string that carries everything the joining agent's client needs --
+   the server's address(es), the space, how to trust the server's TLS
+   certificate, the invite identifier and secret, the agent's assigned
+   name, who invited it, and an advisory expiry -- so that one paste is
+   the whole set-up.
+
+   Three things are new on the wire: an unauthenticated redeem endpoint
+   (the invite secret IS the credential), three admin endpoints to
+   create, list and revoke invites, and the events "invite.created",
+   "invite.revoked" and "member.joined".  Everything else rides the
+   ratified grant model: the token an invite mints is an ordinary scoped
+   per-agent grant (ACP/1 Section 15, EXT-7), stored as a one-way hash,
+   revoked by the existing grants API.  Support is advertised by the
+   capability string "invites".  The protocol version stays "acp/1".
+
+Status of This Memo
+
+   This is a DRAFT PROPOSAL, published 2026-10-29 for review by the
+   protocol owner; it is NOT accepted, NOT part of the normative ACP/1
+   specification, NOT ratified and UNSIGNED.  Nothing here is built.
+   The extension number EXT-40 is PROVISIONAL; the protocol owner
+   assigns final numbers on acceptance (EXT-39 is the mount event
+   surface proposal; EXT-40 is the next free number).
+
+   The product design it transcribes has been approved in its
+   recommendations by the owner.  UPDATE 2026-10-29: the owner APPROVED
+   the Section 13 recommendations ("approved thanks, best practice";
+   "approve the other things"); the decisions are recorded in Section
+   13.  Implementation may proceed behind the "invites" capability; the
+   memo moves to the public RFC set once the build matches it.
+
+   This memo UPDATES ACP/1 in four places, each stated where it occurs:
+   Section 5.1 (one more endpoint besides GET /v1/healthz is exempt from
+   the bearer-token requirement: the redeem endpoint, Section 5.4 here);
+   Section 15 (three admin endpoints, Section 5.1-5.3 here); Section 16
+   (reference lines, Appendix A here); and Appendix B (one new status,
+   410 Gone, Appendix B here).  It contradicts no ratified text: the
+   grant it mints is exactly the grant of the ratified "acp1-15-admin-
+   grants" amendment, with its scope expressed in the ratified EXT-7
+   scope grammar.  The base protocol version string remains "acp/1".
+   Distribution is unlimited.
+
+
+Table of Contents
+
+   1.  Intent -- one paste, and two agents are talking
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  The Pending Invite (replicated state)
+   5.  Wire API: create, list, revoke, redeem
+   6.  Events
+   7.  Capability Advertisement and Compatibility
+   8.  The "acpj1_" Invite Code
+   9.  Errors
+   10. Determinism and High Availability (ACP/1 Section 17)
+   11. Security Considerations
+   12. Conformance and Test Vectors
+   13. Decisions (owner, 2026-10-29)
+
+   o  SCOPED-ADMIN INVITES: YES, under the Section 4.5 containment test;
+      and a scoped admin may remove the members its invites let in
+      (Section 5.6).
+   o  ADMIN-ROLE INVITES: FORBIDDEN (400).  The grants API covers the
+      rare need.
+   o  REDEEM RETRY: the Section 5.5 rule (a retry within the window
+      rotates the member's token; only hashes are stored).  The
+      project's own clients always send a redeem_key.
+   o  DEFAULTS AND MAXIMA: as drafted (24 h default TTL, 7-day max, 60 s
+      min; uses max 10; pending caps 64/64/1024; retry window 15 min;
+      retention 7 days).
+   o  TRUST: "webpki" | "sha256:" pin, as drafted.  The owner's goal is
+      that trying ACP needs no TLS work: the authority makes its own
+      certificate and the code carries its pin, so the joiner configures
+      nothing.  Whether a plain-HTTP trial form is also wanted is a
+      separate ACP/1 Section 4.1 question, not part of this memo.
+   o  ACROSS NETWORKS: out of scope (the server list is the hook).
+   o  SIGNED CODES, "member.removed": deferred until needed.
+   o  NUMBER: EXT-40.
+
+
+14. Recommendation
+   Appendix A.  Data Types and Wire Reference Lines
+   Appendix B.  New Error Conditions
+   Appendix C.  Worked Example -- the whole flow
+   Author's Address
+
+
+1.  Intent -- one paste, and two agents are talking
+
+   Connecting a second agent to an ACP authority today takes two files
+   copied by hand (the certificate and a token), five settings per agent,
+   a shell on the authority's host to mint a per-agent token, and a
+   restart or signal to load it.  The agent doing the joining is often
+   another AI harness that has never heard of ACP, so the instructions
+   ARE the product: they must be complete, unambiguous and short.
+
+   Customers judge this against invite flows they use every day (chat
+   invite links, device pairing, auth keys for a new machine): ONE thing
+   to pass along; it works the first time on another machine; it
+   EXPIRES and is USED ONCE, so a leak is harmless; both sides get a
+   confirmation ("you are connected as codexB", "codexB joined"); and
+   removing the agent is one command.
+
+   Two mechanisms deliver that, and this memo specifies both:
+
+      o  A PENDING INVITE (Section 4): a random secret with a time-to-
+         live and a use count, bound to one space, one role and (for a
+         single-use invite) one agent name.  REDEEMING it (Section 5.4)
+         checks the secret, spends a use and mints the agent its OWN
+         scoped per-agent token -- the ratified live grant -- in ONE
+         atomic replicated step.  The token is returned once; only its
+         one-way hash is kept.  The invite secret is then dead.
+
+      o  The INVITE CODE (Section 8): "acpj1_" followed by one encoded
+         object carrying the server address(es), the space, the TLS
+         trust (a public-CA verification or a certificate pin), the
+         invite id and secret, the assigned name, the inviter and an
+         advisory expiry.  A client turns it into a working profile with
+         no other input.
+
+   A code that is itself the access token can neither expire nor be
+   single-use; a code that is a one-time ticket can be both.  That is
+   why this memo adds a small amount of replicated state and an
+   unauthenticated endpoint rather than wrapping a raw token in a string.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174].
+
+   This document uses the transport, authentication, identity-mode,
+   role, space, event-log, administration and determinism definitions of
+   ACP/1 without restating them; "ACP/1 Section N" points into
+   rfc/acp-1.txt, "EXT-7 Section N" into the scoped-tokens memo, and
+   "EXT-32 Section N" into the "acp://" scheme memo.
+
+   AUTHORITY:  The ACP/1 server (a single daemon or a cluster acting as
+      one).
+
+   GRANT:  The per-agent authorization record of ACP/1 Section 5.2 as
+      extended by EXT-7 Section 4.1 and the ratified ACP/1 Section 15
+      grants amendment: { name, role, scope }, keyed by a one-way hash
+      of its token, with a FINGERPRINT -- the opaque identifier that
+      GET /v1/admin/grants lists for the identity.
+
+   PENDING INVITE (or INVITE):  The replicated record of Section 4.  It
+      has an IDENTIFIER (public) and a SECRET (private; only its hash is
+      stored).
+
+   REDEEM:  The act of presenting an invite's identifier and secret to
+      mint a grant.  A successful redeem CONSUMES one USE.
+
+   INVITE CODE (or CODE):  The "acpj1_..." string of Section 8.  It is a
+      BEARER SECRET until the invite is exhausted, expired or revoked.
+
+   CREATOR:  The administrator identity that created the invite.  INVITER
+      is the human-facing name the code carries for the same party.
+
+   MEMBER:  The identity a redeem mints.
+
+   SPACE:  The ACP/1 Section 7 isolation domain.  User-facing text may
+      call it a "workspace"; the protocol word, and every field name in
+      this memo, is "space".
+
+   COMMAND TIME:  The RFC 3339 UTC timestamp the LEADER stamps into a
+      replicated command before proposing it (ACP/1 Section 17).  Every
+      time comparison this memo makes inside the replicated state
+      machine is made against COMMAND TIME, never against a node's own
+      clock.
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  The invite is a ticket, never the credential.
+
+      The secret the code carries can do exactly one thing: be exchanged,
+      a bounded number of times before a deadline, for a grant.  It
+      authorizes no other request.  A leaked code therefore has a short
+      life and a small blast radius, and revoking a joined member is the
+      existing grant revoke, unchanged.
+
+   3.2.  Nothing secret is ever replicated, logged or listed.
+
+      Neither the invite SECRET, nor the minted TOKEN, nor the client's
+      retry key (Section 5.5) ever appears in a replicated command, a
+      snapshot, the authority's durable state, the event log, a list
+      response or an error body.  The authority stores a one-way hash of
+      each (the same rule the ratified grants API already applies to
+      tokens), compares presented values against the hash in constant
+      time, and returns the secret and the token exactly once.
+
+   3.3.  An invite can never mint more than its creator holds.
+
+      Privilege containment (Section 4.5) is a MUST: the grant an invite
+      produces is bounded by the creator's own grant, is confined to one
+      space, is never an admin, and carries no positive "allow" surface.
+
+   3.4.  Atomic, deterministic, replicated.
+
+      A redeem spends a use and mints the grant in ONE replicated
+      command whose apply is a pure function of replicated state and the
+      command (ACP/1 Section 17).  There is no window in which a use is
+      spent without a grant, and two redeems of a single-use invite can
+      never both succeed (Section 10).
+
+   3.5.  Reuse the ratified shapes.
+
+      The minted grant IS the Section 15 grant; its scope IS the EXT-7
+      scope; revoke IS DELETE /v1/admin/grants; the trust pin IS the
+      EXT-32 "cert_fingerprint" string; events ride the Section 8 log;
+      support is advertised as an EXT-1 Section 7 capability string.
+
+   3.6.  Non-goals.
+
+      This memo does NOT define: how two machines on different networks
+      reach one authority (a hosting, tunnelling or relay question that
+      stays with the owner -- the code's server list is deliberately a
+      LIST so any answer fits without changing the format); invites that
+      mint admin grants (Section 4.4, an owner question); invites across
+      several spaces; a client-side paste template or any user-facing
+      wording (a client concern, though Section 9 gives every error a
+      machine-readable reason so a client can render such wording);
+      presence or messaging (unchanged ACP/1).
+
+
+4.  The Pending Invite (replicated state)
+
+   4.1.  The record.
+
+      A pending invite is replicated state of the authority, in the same
+      class as the identity table of the ratified ACP/1 Section 15
+      amendment: a change applies on every node, a joining node receives
+      the table, and it is carried by snapshots.  Its fields:
+
+         Invite = {
+           "id":          <string>,     ; public identifier, Section 4.2
+           "secret_hash": <bytes>,      ; SHA-256 of the raw secret;
+                                        ;   NEVER listed, Section 4.2
+           "space":       <string>,     ; the ONE target space
+           "name":        <string>?,    ; assigned member name (single-
+                                        ;   use invites), Section 4.4
+           "name_prefix": <string>?,    ; required prefix of a redeemer-
+                                        ;   chosen name (multi-use)
+           "role":        "writer"|"reader",
+           "scope":       Scope?,       ; EXT-7 narrowing, Section 4.4
+           "uses":        <uint32>,     ; total uses granted, >= 1
+           "uses_left":   <uint32>,     ; remaining
+           "created_at":  <rfc3339>,    ; command time of creation
+           "expires_at":  <rfc3339>,    ; created_at + ttl, leader-fixed
+           "created_by":  { "name": <string>, "fingerprint": <string> },
+           "note":        <string>?,    ; free text, <= 256 octets
+           "revoked_at":  <rfc3339>?,   ; set by revoke, Section 5.3
+           "revoke_reason": <string>?,  ; "admin" | "creator_revoked"
+           "redemptions": [ Redemption ]
+         }
+
+         Redemption = {
+           "name":        <string>,     ; the member minted
+           "fingerprint": <string>,     ; its CURRENT grant fingerprint
+           "at":          <rfc3339>,    ; command time of the redeem
+           "redeem_key_hash": <bytes>?, ; SHA-256 of the client's retry
+                                        ;   key, Section 5.5; NEVER
+                                        ;   listed; the raw key is never
+                                        ;   replicated or stored
+           "retries":     <uint32>      ; retried re-mints, Section 5.5
+         }
+
+      The derived STATUS of an invite, as reported by the list endpoint,
+      is:
+
+         "revoked"    if revoked_at is set; else
+         "exhausted"  if uses_left == 0; else
+         "expired"    if the reference time >= expires_at; else
+         "pending".
+
+      The reference time for a LISTING is the serving node's clock (a
+      read outside the apply path, which ACP/1 Section 17 permits); the
+      reference time for a REDEEM decision is the redeem command's
+      COMMAND TIME (Section 10).  A listing is therefore informational;
+      the redeem apply is authoritative.
+
+   4.2.  Identifier and secret.
+
+      o  "id" is 16 octets from a cryptographically secure random source,
+         encoded as 32 lowercase hexadecimal characters.  It is PUBLIC:
+         it MAY appear in events, list responses, error bodies and logs.
+         It is the handle for list and revoke.
+
+      o  The SECRET is at least 16 octets (128 bits) and RECOMMENDED 32
+         octets (256 bits) from a cryptographically secure random source.
+         It is shown exactly once, in the create response (Section 5.1),
+         encoded as base64url without padding [RFC4648 Section 5].  The
+         authority stores ONLY "secret_hash" = SHA-256 over the RAW
+         secret octets [SHA256].  The raw secret MUST NOT enter any
+         replicated command, snapshot, durable state, event, list
+         response, error body or log: the leader hashes it on creation
+         and proposes the hash; on redeem the leader hashes the presented
+         secret and compares the hashes in constant time (ACP/1 Section
+         5.1 for tokens applies equally here).
+
+      o  The identifier is looked up first and the secret compared
+         second, but the two failures ("no such id", "secret does not
+         match") MUST produce the SAME response (Section 9, reason
+         "invite_unknown"), so the response does not reveal which part
+         of a mistyped code was wrong.
+
+   4.3.  Lifetime: time-to-live and uses.
+
+      o  "ttl_sec" (create request) is the invite's lifetime in seconds.
+         Absent means the authority's DEFAULT, which MUST be 86400 (24
+         hours) unless the operator configures otherwise.  The authority
+         MUST enforce a MAXIMUM (RECOMMENDED 604800, seven days) and a
+         MINIMUM (RECOMMENDED 60).  A value of 0, a negative value, or a
+         value above the maximum MUST be refused with 400 (reason
+         "invite_ttl_invalid", the body naming the permitted range);
+         there is NO "never expires" and the authority MUST NOT clamp
+         silently.  "expires_at" = "created_at" + "ttl_sec", both fixed
+         by the leader and carried in the create command.
+
+      o  An invite is REDEEMABLE at command time T if and only if
+         T < expires_at (strictly).  At T == expires_at it is expired.
+
+      o  "uses" (create request) is the number of successful redeems the
+         invite permits.  Absent means 1.  The authority MUST enforce a
+         maximum (RECOMMENDED 10); 0 or above the maximum MUST be
+         refused with 400 ("invite_uses_invalid").  "uses_left" starts
+         equal to "uses" and is decremented by exactly one per successful
+         redeem; a refused redeem decrements nothing.
+
+      o  Expiry is LAZY: a pending invite past its expiry is refused at
+         redeem and reported "expired" by the list endpoint, with no
+         background action required.  An authority MAY additionally run a
+         leader-driven, replicated SWEEP that removes expired and
+         consumed records after a retention period (Section 4.7); it
+         MUST NOT remove or alter invite state through any path that is
+         not a replicated command (ACP/1 Section 17).
+
+   4.4.  Target: one space, a name, a role, a scope.
+
+      o  "space" is REQUIRED and names exactly ONE space (ACP/1 Section
+         7 grammar).  An invite cannot grant access to several spaces;
+         an operator who needs that creates several invites, or uses the
+         grants API directly.  The authority MUST NOT create the space
+         on invite creation; a space is created on first use, as ACP/1
+         Section 7 says, by the member's first request.
+
+      o  The NAME the member becomes is either FIXED by the invite
+         ("name", the single-use case: "invite codexB") or CHOSEN by the
+         redeemer at redeem time (the multi-use case: "invite three
+         teammates' agents").  The two are exclusive:
+
+            - "name" present  => "uses" MUST be 1 (a name is one
+              identity; two identities cannot share it).  A create
+              request with "name" and "uses" > 1 is refused with 400
+              ("invite_name_with_multiple_uses").
+
+            - "name" absent   => the redeem request MUST carry "name"
+              (400 "invite_name_required" otherwise).  The invite MAY
+              carry "name_prefix"; a chosen name that does not begin,
+              by exact octet prefix, with it is refused with 400
+              ("invite_name_prefix").
+
+         A name MUST match [A-Za-z0-9][A-Za-z0-9._-]{0,63}.  It is an
+         agent id in the sense of ACP/1 Section 5.2: the minted grant's
+         identity.  Name collision is decided at REDEEM apply against
+         the replicated identity table (Section 5.4) and, for a fixed
+         name, ALSO at CREATE so the inviter learns at once (Section
+         5.1).
+
+      o  "role" is "writer" (the default) or "reader" (ACP/1 Section
+         5.3).  "admin" MUST be refused with 400 ("invite_role_
+         forbidden").  Rationale: a code is a bearer secret that pastes
+         into transcripts; a full administrator minted from a paste is
+         the wrong habit, and the ratified grants API already mints admin
+         grants for an operator who means it.  Whether an explicit opt-in
+         should exist is an owner question (Section 13).
+
+      o  "scope" is an EXT-7 Scope restricted to the NARROWING fields
+         "path_prefix" and "read_prefix" (each validated per EXT-7
+         Section 10.7).  Any other scope field in a create request MUST
+         be refused with 400 ("invite_scope_invalid").  The GRANT a
+         redeem mints has:
+
+            Grant.name  = the member name
+            Grant.role  = the invite's role
+            Grant.scope = { "spaces": [ <the invite's space> ],
+                            "path_prefix": <from the invite>?,
+                            "read_prefix": <from the invite>? }
+
+         i.e. it is ALWAYS space-scoped to the one space (EXT-7 Section
+         4.1.1), and it carries NO positive "allow" surface (EXT-34):
+         bulk, cluster and any future surface are denied by default
+         exactly as for any freshly minted writer.
+
+   4.5.  Privilege containment (MUST).
+
+      An invite MUST NOT be able to mint a grant with more authority than
+      its creator holds.  Concretely, at CREATE the authority MUST verify
+      against the creator's own grant C:
+
+         (a) C.role is "admin";
+         (b) the invite's role is not "admin" (Section 4.4);
+         (c) if C.scope.spaces is present, the invite's space is listed
+             in it;
+         (d) if C.scope.path_prefix is present, every invite
+             path_prefix begins with at least one of C's; and if the
+             invite has none, the invite inherits ALL of C's path_prefix
+             values (the result can never be wider than C);
+         (e) the same rule as (d) for read_prefix.
+
+      An UNSCOPED admin satisfies (c)-(e) trivially.  A SCOPED admin MAY
+      create invites only under these rules; a violation is refused with
+      403 ("invite_not_contained", the body naming the violated rule).
+      The same containment MUST be re-evaluated at REDEEM apply against
+      the invite record (which froze the result at create); if the
+      creator's grant has since been revoked, the invite remains valid
+      (it was contained when created and the creator's departure does
+      not widen it), but an authority MAY, by operator policy, revoke a
+      creator's pending invites when the creator is revoked (a
+      replicated Section 5.3 revoke with "revoke_reason"
+      "creator_revoked", audited as "invite.revoked", Section 6).
+
+      Because invites mint strictly-bounded grants, this memo RECOMMENDS
+      that a space-scoped admin be allowed to invite into its own spaces
+      (the "team lead" case: delegation without the master key).  The
+      ratified grants API requires an UNSCOPED admin; whether the invite
+      API should be the first admin surface open to scoped admins is an
+      owner question (Section 13).  An authority that chooses the strict
+      reading MUST refuse scoped admins with 403 ("invite_not_contained")
+      and MUST say so in its documentation.
+
+   4.6.  Identity mode.
+
+      Invites exist to mint per-agent identities, so they require PER-
+      AGENT identity mode (ACP/1 Section 5.2).  An authority in SHARED-
+      TOKEN mode MUST refuse invite creation with 409 ("identity_mode_
+      shared"), mirroring the ratified grants API's refusal of the first
+      grant (minting one would switch the authentication mode live and
+      lock out every shared-token client).  The body MUST say that the
+      authority must be restarted in per-agent mode.  Such an authority
+      has no invites, so a redeem against it answers "invite_unknown".
+
+   4.7.  Bounds.
+
+      o  PENDING-INVITE CAPS.  An authority MUST bound the number of
+         PENDING invites per space and per creator (RECOMMENDED 64 each)
+         and MAY bound them daemon-wide (RECOMMENDED 1024).  A create
+         beyond a cap is refused with 429 and a Retry-After hinting the
+         soonest pending expiry (the cap is transient: invites expire;
+         this follows EXT-7's 429 for the transient max_leases).  The cap
+         is an ADMISSION decision the leader makes before proposing; it
+         MUST NOT be evaluated inside the apply path from node-local
+         configuration (Section 10).  Two creates admitted concurrently
+         MAY exceed a cap by their number; the cap is an abuse bound, not
+         an exact invariant.
+
+      o  RETENTION.  Exhausted, expired and revoked records are RETAINED
+         (for listing, for the "already used by X at T" message, and for
+         redeem retries, Section 5.5) for at least the retry window and
+         RECOMMENDED seven days, then removed by the leader-driven sweep
+         of Section 4.3.  An authority MUST bound retained non-pending
+         records per space (RECOMMENDED 1024, oldest first).
+
+      o  SIZES.  "note" <= 256 octets; a create or redeem body
+         > 4096 octets MAY be refused with 400.
+
+
+5.  Wire API: create, list, revoke, redeem
+
+   All endpoints follow ACP/1 Section 6 conventions (JSON bodies, the
+   standard headers, the standard error body) with ONE addition to the
+   error body, "reason" (Section 9).  Sections 5.1-5.3 are /v1/admin/*
+   endpoints: they REQUIRE the admin role (ACP/1 Section 5.3) and are
+   further constrained by Section 4.5; X-ACP-Space is IGNORED on them
+   (the space is in the body or the record).  They UPDATE ACP/1 Section
+   15 (new admin operations).  Section 5.4 UPDATES ACP/1 Section 5.1.
+
+   5.1.  Create -- POST /v1/admin/invites
+
+      Request:
+
+         { "space":       <string>,       ; REQUIRED
+           "name":        <string>?,      ; fixed member name (uses = 1)
+           "name_prefix": <string>?,      ; multi-use only
+           "role":        "writer"|"reader"?,  ; default "writer"
+           "scope":       { "path_prefix": [<string>]?,
+                            "read_prefix": [<string>]? }?,
+           "ttl_sec":     <int>?,         ; default 86400
+           "uses":        <int>?,         ; default 1
+           "note":        <string>? }
+
+      The authority validates Sections 4.3-4.7, then proposes ONE
+      replicated command carrying the leader-fixed "id", "secret_hash",
+      "created_at", "expires_at", the creator's name and fingerprint,
+      and the request fields.  Apply inserts the record if, and only if:
+
+         - no pending invite with the same "id" exists (a leader-chosen
+           id; a collision is a leader bug and MUST fail the command);
+         - for a fixed "name": no IDENTITY of that name exists (409
+           "name_taken", the body naming the existing identity's
+           fingerprint) and no OTHER PENDING invite fixes that name (409
+           "invite_pending_for_name", the body carrying the existing
+           invite's id so the operator can revoke it).
+
+      Response, 201 Created:
+
+         { "invite": InviteView,          ; Appendix A; no hash
+           "secret": <base64url> }        ; shown ONCE
+
+      The SECRET appears in this response and nowhere else.  The
+      authority MUST append "invite.created" (Section 6).  The client --
+      not the authority -- composes the invite code (Section 8) from this
+      response plus what the client already knows: the URL(s) it reached
+      the authority by, and how it trusts the authority's certificate.
+      The authority MAY include a "servers" hint (a list of URLs the
+      operator configured as reachable) in InviteView; a client MAY use
+      it and MUST NOT require it.
+
+   5.2.  List -- GET /v1/admin/invites[?space=<name>][&status=<s>]
+
+      Response, 200:  { "invites": [ InviteView ] }
+
+      InviteView (Appendix A) carries every record field EXCEPT
+      "secret_hash" and "redeem_key_hash", plus the derived "status" of
+      Section 4.1.  A scoped admin sees only invites whose space its
+      grant lists (Section 4.5 (c)); an unscoped admin sees all.
+      Retained non-pending records are included unless filtered by
+      "status".  A token NEVER appears here.
+
+   5.3.  Revoke -- DELETE /v1/admin/invites/<id>
+
+      Marks the invite revoked (one replicated command: "revoked_at" =
+      command time, "revoke_reason" = "admin"); the authority appends
+      "invite.revoked" (Section 6).  Response 200 { "revoked": <id> }.
+      Revoking an already exhausted, expired or revoked invite is
+      IDEMPOTENT (200; the record's "revoked_at" is set if it was not).
+      An unknown id is 404 ("invite_unknown").  A scoped admin MAY
+      revoke only invites whose space its grant lists (403 otherwise).
+
+      Revoking an invite affects ONLY future redeems.  A member already
+      minted from it keeps its grant; to remove the member, revoke its
+      GRANT with DELETE /v1/admin/grants (ratified ACP/1 Section 15) --
+      this memo adds no second revocation path for identities.
+
+   5.4.  Redeem -- POST /v1/invites/redeem
+
+      This endpoint UPDATES ACP/1 Section 5.1: like GET /v1/healthz, it
+      is EXEMPT from the bearer-token requirement, because the caller
+      has no token yet -- the invite secret is the credential.  The
+      authority MUST IGNORE any Authorization and X-ACP-Space header on
+      this request (a stale profile on the joining machine must not
+      influence the outcome; the space comes from the invite).  X-ACP-
+      Protocol is honoured as always.  It is a WRITE and follows the
+      ACP/1 Section 14.2 leader rule (a follower forwards or redirects).
+
+      Request:
+
+         { "id":         <hex32>,         ; REQUIRED
+           "secret":     <base64url>,     ; REQUIRED
+           "name":       <string>?,       ; REQUIRED iff the invite has
+                                          ;   no fixed name
+           "redeem_key": <string>?,       ; retry key, Section 5.5;
+                                          ;   16..64 octets of
+                                          ;   [A-Za-z0-9._-]; hashed
+                                          ;   on receipt, never stored
+           "client":     { "harness": <string>?,
+                           "version": <string>? }? }
+
+      LEADER ADMISSION (outside the replicated apply; Section 10):
+
+         1. RATE LIMIT (MUST): per source address and per invite id,
+            429 + Retry-After when exceeded (RECOMMENDED no more than
+            10 attempts per minute per source and 30 per minute per id).
+            Admission state is node-local by nature and never enters
+            replicated state.
+         2. LOOK UP "id" in committed state; HASH the presented secret;
+            constant-time COMPARE with "secret_hash".  Unknown id or
+            mismatch -> the SAME 404 ("invite_unknown"); the leader
+            MUST NOT propose anything.  An authority MAY escalate the
+            NODE-LOCAL rate limit for an id that keeps failing (a longer
+            back-off for that id, reported as 429 + Retry-After); it
+            MUST NOT revoke, lock or otherwise change replicated state
+            because of failed attempts -- the id is public (Section
+            4.2, Section 6), so a replicated lock-out would let anyone
+            who has seen an event kill every pending invite (Section
+            11.2).
+         3. If "redeem_key" is present: HASH it (SHA-256 over its
+            octets).  The raw key is held in the leader's memory for
+            the duration of this request ONLY and is never stored.
+         4. MINT: generate the new token (ACP/1 Section 19: >= 128 bits
+            of entropy) and compute its one-way hash and fingerprint.
+            The raw token is held in the leader's memory for the
+            duration of this request ONLY.
+         5. PROPOSE one command: { invite id, command time, member name,
+            token HASH, fingerprint, the grant (Section 4.4), redeem-key
+            HASH?, client? }.  Not the secret.  Not the token.  Not the
+            raw redeem key.
+
+      APPLY (a pure function of replicated state and the command; all
+      conditions checked, in this order, against COMMAND TIME T):
+
+         a. the invite exists                     else refuse (unknown)
+         b. "revoked_at" unset                    else 410 invite_revoked
+         c. the command carries a redeem-key hash,
+            a Redemption of this invite holds an
+            EQUAL "redeem_key_hash", and T - its
+            "at" <= the retry window              -> RETRY path, 5.5
+         d. "uses_left" > 0                       else 410 invite_exhausted
+         e. T < "expires_at"                      else 410 invite_expired
+         f. the member name is valid, satisfies
+            "name"/"name_prefix" (Section 4.4)    else 400
+         g. no identity of that name exists       else 409 name_taken
+         h. containment (Section 4.5) holds       else 403
+
+         then, ATOMICALLY: decrement "uses_left"; insert the grant
+         keyed by the token hash; append the Redemption; append
+         "member.joined" to the target space's event log (Section 6).
+         A refusal at any step changes NOTHING: no use is spent, no
+         grant exists, no event is appended, and the leader discards the
+         minted token.  The order above fixes which reason is reported
+         when several would apply (a revoked invite is "revoked" even if
+         also expired; an exhausted one is "exhausted" even if also
+         expired), so every replica -- and every client -- sees the same
+         reason.
+
+      Response, 200:
+
+         { "token":       <string>,       ; the member's token, ONCE
+           "fingerprint": <string>,       ; its grant fingerprint
+           "name":        <string>,
+           "space":       <string>,
+           "role":        <string>,
+           "scope":       Scope,          ; the minted grant's scope
+           "inviter":     { "name": <string> },
+           "retry":       <bool> }        ; true on the Section 5.5 path
+
+      The token appears in this response and nowhere else.  The client
+      MUST store it in its own credential store (file mode 0600 or the
+      platform equivalent), MUST then discard the code, and SHOULD prove
+      the credential at once (GET /v1/whoami, POST /v1/agents/beat) so
+      its confirmation to the user is true.
+
+   5.5.  Redeem retry -- a lost response must not strand the member.
+
+      THE PROBLEM.  A redeem succeeds on the authority but the response
+      is lost (a dropped connection, a client crash).  The use is spent,
+      the grant exists, and the client holds nothing.  A naive retry
+      answers "invite_exhausted"; the operator must revoke the member and
+      issue a new invite.
+
+      WHAT IS RULED OUT.  (1) Replaying the original token requires the
+      authority to keep the RAW token for a window -- in a cluster, to
+      replicate it.  That breaks Section 3.2 and the ratified "only a
+      hash is kept" rule.  (2) Answering "you already redeemed this"
+      without a token leaves the client with an identity it cannot use.
+
+      THE RULE.  A client SHOULD send a "redeem_key": at least 128 bits
+      of client-generated randomness, encoded in [A-Za-z0-9._-], created
+      ONCE per join attempt and reused unchanged on every retry of that
+      attempt.  The redeem key is a CREDENTIAL (see the trade-off
+      below) and is treated exactly like the secret and the token
+      (Section 3.2): the leader hashes it on receipt, the command and
+      the Redemption carry ONLY "redeem_key_hash" = SHA-256 over the
+      key's octets, and no list response, event, error or log ever
+      shows the key or its hash.  A later redeem carrying the SAME id,
+      a MATCHING secret and a redeem_key whose hash EQUALS a stored
+      "redeem_key_hash" of this invite, within the RETRY WINDOW
+      (RECOMMENDED 15 minutes, measured as command time minus the
+      Redemption's "at"; replicated, so every node agrees), is a RETRY:
+      apply does NOT spend a use and does NOT create a second identity.
+      Instead it ROTATES the member's token: the command carries a
+      fresh token hash and fingerprint; apply replaces the
+      grant's key with the new hash (same name, same role, same scope),
+      updates the Redemption's "fingerprint", increments its "retries",
+      and appends NO second "member.joined".  The response is the
+      Section 5.4 response with "retry": true.  Any earlier token for
+      that member -- delivered or not -- is invalid from that apply.
+
+      A retry whose member no longer exists (its grant was revoked in the
+      meantime) is refused with 403 ("member_revoked").  A redeem with a
+      redeem_key seen before but OUTSIDE the window is an ORDINARY redeem
+      (which, on a single-use invite, answers "invite_exhausted").
+
+      THE HONEST TRADE-OFF.  Within the window, anyone holding the code
+      AND the redeem_key can rotate the member's token and thereby take
+      the identity over.  The redeem_key is generated and kept by the
+      joining client only, is never printed, and is never part of the
+      code; and the attacker already needs the code, which is exactly
+      what would have let them redeem in the first place.  The window is
+      bounded so the exposure is too.  Because only the HASH of the key
+      is replicated and stored, a copy of the authority's durable state,
+      log or snapshot does not let anyone forge a retry (Section 11.3).
+      A client that cannot keep a redeem_key safe between attempts
+      SHOULD omit it, accepting that a lost response spends the use.
+      The choice of this rule over the alternatives is an owner question
+      (Section 13).
+
+   5.6.  Revoking a joined member.
+
+      DELETE /v1/admin/grants?fingerprint=<f> (ratified ACP/1 Section 15).
+      The Redemption record keeps the member's name and last fingerprint
+      for the audit trail; the list endpoint continues to show whom the
+      invite minted after the member is gone.
+
+      A space-scoped admin that may invite into a space (Section 4.5)
+      MUST also be able to remove the members it let in, or a team lead
+      can add people but never take them out:
+
+      DELETE /v1/admin/invites/<id>/member
+         Revokes the grant this invite minted (the Redemption's current
+         fingerprint) through the same replicated identity removal the
+         grants API uses.  Allowed for an unscoped admin, and for a
+         scoped admin whose grant lists the invite's space (the Section
+         4.5 containment test, applied to removal).  200 { "revoked":
+         <fingerprint> }; 404 ("member_unknown") if the invite minted no
+         member or the member is already gone; 409 if it is the last
+         identity (the ratified Section 15 rule).
+
+
+6.  Events
+
+   Events are appended to the TARGET SPACE's log (ACP/1 Section 8) by the
+   same apply that changes the state, so an inviter watching the space
+   sees them in order with everything else.  None carries a secret, a
+   token or a hash.
+
+      "invite.created"   actor  = the creator's name
+                         entity = "invite:" + id
+                         context = { "name"?: <fixed name>,
+                                     "name_prefix"?: ..., "role": ...,
+                                     "uses": N, "expires_at": ...,
+                                     "scope"?: Scope }
+
+      "invite.revoked"   actor  = the revoking admin's name, or, when
+                                  the Section 4.5 policy revokes a
+                                  departed creator's pending invites,
+                                  the authority's own actor id (the one
+                                  it stamps on its lease-expiry events)
+                         entity = "invite:" + id
+                         context = { "reason": "admin"|"creator_revoked" }
+
+      "member.joined"    actor  = the NEW member's name (the identity the
+                                  redeem authenticated and minted)
+                         entity = "invite:" + id
+                         context = { "inviter": <creator name>,
+                                     "fingerprint": <grant fingerprint>,
+                                     "role": ..., "harness"?: <string> }
+
+      "invite.expired"   OPTIONAL.  Only an authority that runs the
+                         replicated sweep of Section 4.3 MAY emit it, and
+                         only from that sweep (never from a read path or
+                         a node-local timer); actor = the authority's own
+                         actor id; entity = "invite:" + id.
+
+   "member.joined" is the event a client renders as "codexB joined".
+   Because it is in the ordinary log, an inviter's client can wait for
+   it with the existing streaming read (ACP/1 Section 8.4) and nothing
+   new.  A Section 5.5 retry appends no event; its audit record is the
+   Redemption's "retries" counter.
+
+
+7.  Capability Advertisement and Compatibility
+
+   An authority that implements this memo MUST advertise the capability
+   string "invites" in the "capabilities" list of GET /v1/healthz and
+   GET /v1/stats (EXT-1 Section 7), and MUST advertise it ONLY when it
+   implements Sections 4, 5, 6, 9 and 10 in full.  It is advertised on
+   /v1/healthz in particular because a joining client holds no token and
+   must feature-detect before it sends the secret (Section 8.5).
+
+   A client MUST treat the ABSENCE of "invites" as "this authority cannot
+   redeem invites" and MUST NOT send the secret to it; it SHOULD tell the
+   user that the server needs a newer version.  An authority without this
+   memo answers POST /v1/invites/redeem with its ordinary "not found"
+   (and no "reason" field); a client MUST NOT interpret that as
+   "invite_unknown" -- the capability probe is the only reliable signal.
+
+   The protocol version stays "acp/1": every addition is a new endpoint,
+   a new event action, a new capability string or an OPTIONAL field.
+   Old clients are unaffected.  The ONE compatibility hazard is the same
+   as for the ratified grants: invite records are replicated state that
+   an older node of the SAME deployment cannot interpret.  An authority
+   MUST carry them in a version-checked, fail-closed form, so that an
+   older binary REFUSES to apply or restore them rather than silently
+   dropping them (the EXT-7 refinement-6 rule), and operators MUST
+   upgrade every node before the first invite is created.
+
+
+8.  The "acpj1_" Invite Code
+
+   8.1.  Grammar.
+
+         code    = prefix "_" payload
+         prefix  = "acpj" version
+         version = 1*DIGIT                    ; this memo defines "1"
+         payload = base64url(JSON object)     ; RFC 4648 Section 5,
+                                              ;   NO padding
+
+      The payload is the UTF-8 encoding of ONE JSON object [RFC8259].
+      Nothing signs or hashes the code, so NO canonical form is required;
+      a producer SHOULD emit compact JSON (no insignificant whitespace)
+      with the keys in the order of Section 8.2 so codes stay short.  A
+      producer SHOULD keep a code under 1024 octets; a consumer MUST
+      accept codes up to 4096 octets.  A consumer MUST ignore ASCII
+      whitespace (space, tab, CR, LF) anywhere in a code before decoding
+      -- pastes wrap lines -- and MAY accept "=" padding.
+
+   8.2.  Fields (version 1).
+
+         Key  Type              Req.  Meaning
+         ---  ----------------  ----  -----------------------------------
+         s    [string]          MUST  Servers: ordered, non-empty list of
+                                      base URLs of the SAME authority,
+                                      tried in order (Section 8.5).  Each
+                                      is "https://" host [":" port]
+                                      [path-prefix]; no userinfo, query
+                                      or fragment.
+         w    string            MUST  The space (ACP/1 Section 7).
+         t    string            MUST  Trust: "webpki" or "sha256:" + 64
+                                      lowercase hex (Section 8.4).
+         i    string            MUST  The invite id (Section 4.2).
+         k    string            MUST  The invite secret, base64url, no
+                                      padding (Section 4.2).
+         n    string            MAY   The assigned member name.  Absent
+                                      means the redeemer chooses one
+                                      (Section 4.4); "p" may constrain it.
+         p    string            MAY   The required name prefix.
+         f    string            MAY   From: the inviter's name, for
+                                      display and for the first message.
+         e    string (rfc3339)  MAY   Advisory expiry.  The authority is
+                                      authoritative; a client MAY warn
+                                      early from it and MUST NOT refuse
+                                      on it alone.
+         m    object            MAY   Minimum client versions, keyed by
+                                      client product id, e.g.
+                                      {"acp":"0.2.5"}.  A client compares
+                                      ONLY the entry for its own id,
+                                      numerically per dotted component,
+                                      and ignores the rest.  Advisory in
+                                      the sense that only a client that
+                                      already parses version 1 can read
+                                      it; its purpose is to let such a
+                                      client refuse early when the invite
+                                      relies on something it predates.
+
+      Keys are single characters because the code is pasted, and pasted
+      lines get trimmed.  Any key not listed MUST be IGNORED by a
+      consumer (additive evolution within version 1, ACP/1 Section 18).
+      A consumer MUST refuse a code whose version digits are not "1"
+      with a message that the client needs updating; a later memo that
+      changes the meaning of an existing key, or adds a key a consumer
+      cannot safely ignore, bumps the version.
+
+   8.3.  Parsing strictness.
+
+      A consumer MUST refuse, before contacting any server, a code that:
+      lacks the "acpj" prefix; has an unknown version; is not valid
+      base64url; does not decode to a JSON object; lacks any MUST key;
+      has an "s" entry that is not an absolute https URL of the allowed
+      shape; has a "t" that is neither "webpki" nor a well-formed
+      "sha256:" pin; has an "i" that is not 32 lowercase hex characters;
+      has a "k" that is not base64url of 16..64 octets; or has an "n"/"p"
+      that violates the name grammar of Section 4.4.  The refusal MUST
+      NOT echo the "k" value.
+
+   8.4.  Trust.
+
+      "t" tells the client how to authenticate the authority's TLS
+      certificate under ACP/1 Section 4.1, which this memo neither
+      relaxes nor replaces:
+
+         "webpki"          Validate the chain against the client's system
+                           trust store (a public-CA certificate, e.g. an
+                           edge in front of the authority).  No pin.
+
+         "sha256:<hex>"    The client trusts the authority's certificate
+                           as the SOLE ROOT if and only if SHA-256 over
+                           the DER encoding of the LEAF certificate the
+                           server presents equals the pin -- the same
+                           bytes and the same string as EXT-32's
+                           "cert_fingerprint".  The pin REPLACES ONLY THE
+                           TRUSTED ROOT.  The client MUST STILL verify
+                           that the certificate is within its validity
+                           period and that its SANs cover the host it
+                           dialled (the ACP/1 Section 4.1 SAN rule).  An
+                           operator therefore lists every name or address
+                           agents will dial in the certificate's SANs.
+
+      A client MUST NOT disable verification to make a code work and MUST
+      NOT fall back from a pin to "webpki" or the reverse.  A pin
+      mismatch MUST be reported with the fingerprint the server actually
+      presented, so an operator can tell a wrong code from a changed
+      certificate.  A non-TLS form is deliberately NOT defined (owner
+      question, Section 13).
+
+   8.5.  The client join procedure (normative for interoperability).
+
+      1. Parse and validate (Section 8.3).  If "m" names this client and
+         the client is older, stop: "this invite needs a newer client".
+      2. For each URL in "s", in order: establish TLS per "t".  If trust
+         fails, record why and try the next URL.  On success, GET
+         /v1/healthz (unauthenticated) and require "protocol" "acp/1"
+         and "invites" in "capabilities"; if absent, record "server lacks
+         invites" and try the next URL.  The client MUST NOT send the
+         secret to any URL whose trust check or capability probe failed.
+      3. On the first URL that passes, POST /v1/invites/redeem (Section
+         5.4) with "i", "k", "n" or a chosen name, and a redeem_key.  On
+         a transport failure with no response, retry the SAME request
+         (same redeem_key) a bounded number of times, then try the next
+         URL with the same redeem_key.
+      4. On 200: persist a profile for the member -- server URL (the one
+         that worked), space, trust (the pin or "webpki"), the member
+         name, and the token at 0600 -- then DISCARD the code and the
+         secret from memory and from any argument buffer the platform
+         lets the client clear.
+      5. SHOULD: GET /v1/whoami and POST /v1/agents/beat to prove the
+         credential and learn who is online before telling the user.
+      6. On any error: render from "reason" (Section 9), name the invite
+         by its "i" if useful, never print "k" or the code.
+
+      If every URL fails, the client reports the LAST transport or trust
+      failure per URL and the reason it is likely (unreachable network,
+      pin mismatch, old server) -- without the secret.
+
+   8.6.  Redaction (normative for clients and authorities).
+
+      The code and the secret are bearer credentials until the invite is
+      spent.  A client MUST NOT write the code or "k" to any config file,
+      log, shell history it controls, error message, or diagnostic
+      output; a "show config"/"debug" facility MUST NOT display a code
+      or secret that was ever supplied; after a successful redeem the
+      client MUST NOT retain the code.  The invite id "i", the space, the
+      servers, the trust value and the names are NOT secret and MAY be
+      shown.  An authority MUST NOT log a presented secret, hash or
+      token, and MUST NOT echo a secret in any response (Section 3.2).
+      The CREATING client MUST print the code exactly once (its purpose
+      is to be handed over) and MUST NOT keep it afterwards; the invite
+      can be listed and revoked by its public id.
+
+
+9.  Errors
+
+   Every error body is the ACP/1 Section 6.3 shape plus ONE additive
+   field, "reason", a stable machine-readable token, so a client can
+   render its own user-facing wording for each situation without parsing
+   "error".  Receivers that do not know "reason" ignore it (ACP/1
+   Section 6.2).  Status 410 Gone is introduced by this memo (Appendix
+   B); it means "this invite existed and can never be redeemed again",
+   which distinguishes it from 404 "never existed / not yours to see".
+
+      Status  reason                           When / extra body fields
+      ------  -------------------------------  ---------------------------
+      400     invite_malformed                 bad body, id or secret
+                                               encoding, name grammar
+      400     invite_ttl_invalid               ttl 0, negative, < min or
+                                               > max; "min_sec","max_sec"
+      400     invite_uses_invalid              uses 0 or > max; "max"
+      400     invite_name_with_multiple_uses   name fixed and uses > 1
+      400     invite_name_required             multi-use redeem w/o name
+      400     invite_name_prefix               name violates "p"/prefix;
+                                               "name_prefix"
+      400     invite_role_forbidden            role "admin" (or unknown)
+      400     invite_scope_invalid             non-narrowing scope field
+      401     (ACP/1)                          admin endpoints: no/invalid
+                                               token
+      403     (ACP/1)                          admin endpoints: not admin
+      403     invite_not_contained             Section 4.5; "rule"
+      403     member_revoked                   retry for a revoked member
+      404     invite_unknown                   unknown id OR wrong secret
+                                               (indistinguishable); also
+                                               revoke/list of an id the
+                                               caller may not see
+      409     name_taken                       identity exists; "name",
+                                               "fingerprint"
+      409     invite_pending_for_name          another pending invite
+                                               fixes the name; "invite_id"
+      409     identity_mode_shared             shared-token authority
+      410     invite_expired                   "expired_at"
+      410     invite_exhausted                 "redemptions": [{name,at}]
+                                               (names and times only)
+      410     invite_revoked                   "revoked_at", "revoke_reason"
+                                               (the record's value; "reason"
+                                               stays the machine token)
+      429     rate_limited                     Retry-After (redeem)
+      429     invite_cap                       pending cap; Retry-After
+      (none)  --                               authority lacks "invites":
+                                               the client's capability
+                                               probe decides, Section 7
+
+   The "redemptions" detail on "invite_exhausted" exists so a client can
+   say "already used by codexB at 14:02"; it carries names and times
+   ONLY.  No error body carries a secret, a hash or a token.
+
+
+10. Determinism and High Availability (ACP/1 Section 17)
+
+   This memo adds replicated state and three replicated commands
+   (create, revoke, redeem) plus an OPTIONAL fourth (sweep).  It
+   preserves ACP/1 Section 17 and its ratified node-local-state
+   amendment as follows:
+
+      o  EVERY non-deterministic input is LEADER-FIXED and carried in the
+         command: the invite id, the secret HASH (create), the command
+         time, the token HASH and fingerprint and the redeem-key HASH
+         (redeem), the member name.  Apply reads no clock, no random
+         source and no node-local state.
+
+      o  EXPIRY is decided by comparing the command's own time against
+         the replicated "expires_at" (Section 4.3, 5.4 step e).  A node
+         applying a redeem a minute late, or replaying the log after a
+         restart, reaches the same verdict as the leader did.
+
+      o  ATOMICITY: use decrement + grant insert + redemption record +
+         event append are one apply (Section 5.4).  Two concurrent
+         redeems of a single-use invite are two commands; log order
+         decides; the second finds "uses_left" == 0 and is refused in the
+         same apply that would have minted it.  No lock, no clock.
+
+      o  NAME COLLISION is decided at apply against the replicated
+         identity table, so a redeem and a concurrent grant mint (ACP/1
+         Section 15) or a concurrent redeem of a different invite for the
+         same name resolve by log order, identically everywhere.
+
+      o  ADMISSION vs APPLY: rate limits (node-local by nature), the
+         constant-time secret comparison, caps, and the mint of the raw
+         token happen on the LEADER BEFORE proposing and never inside
+         apply.  Apply re-checks every STATE condition (Section 5.4
+         a-h).  The secret comparison need not be repeated at apply
+         because "secret_hash" is immutable for the record's life and
+         the command names the record by id.
+
+      o  RETRY WINDOW (Section 5.5) is computed from two replicated
+         timestamps (the command's and the Redemption's), so every node
+         classifies a redeem as retry-or-fresh identically.
+
+      o  SWEEP (Section 4.3), if implemented, is a leader-driven
+         replicated command that names the ids it removes (like lease
+         expiry); followers never decide expiry on their own.
+
+      o  SNAPSHOTS carry invite records with the identity table; a
+         joining node receives both; an older binary refuses both
+         (Section 7).
+
+      o  NOTHING secret is in the log or a snapshot: an implementation
+         SHOULD verify, as a conformance test, that the raw secret, the
+         raw token and the raw redeem key never appear in replicated
+         bytes (Section 12, C-9).
+
+   Reads (list) are served from committed state under ACP/1's ordinary
+   leader/follower read rules; a listing's "expired" status uses the
+   serving node's clock, outside the apply path, and is informational
+   (Section 4.1).
+
+
+11. Security Considerations
+
+   11.1.  A leaked code.  The code is a bearer secret, and pastes leak:
+      into transcripts, screenshots, shell history, chat logs.  Three
+      properties bound the damage: the invite is SINGLE-USE by default
+      (a second redeem answers "exhausted" and NAMES who used it and
+      when, so the inviter notices a hijack); it EXPIRES (24 hours by
+      default, never "forever"); and the authority keeps only a HASH, so
+      a copy of the authority's durable state does not yield redeemable
+      secrets.  What a leak CAN do: whoever redeems first becomes the
+      member, with that member's (bounded, single-space, non-admin)
+      authority, until revoked.  Inviters SHOULD watch for the
+      "member.joined" event and operators SHOULD revoke a member that
+      joined unexpectedly.
+
+   11.2.  Brute force on redeem, and why there is NO lock-out.  The
+      secret has >= 128 bits (RECOMMENDED 256) of entropy, compared in
+      constant time; the identifier adds another 128 bits that must be
+      known to even address the record; and redeem is RATE-LIMITED per
+      source and per id (MUST).  Online guessing is therefore
+      infeasible without any further mechanism.  A "lock the invite
+      after N failures" rule was considered and REJECTED: the invite id
+      is NOT secret -- it is the entity of "invite.created" and
+      "member.joined", which every reader of the space sees (Section
+      6) -- so a replicated lock-out would let any space member, or
+      anyone who saw an event, kill every pending invite with N bad
+      guesses, while adding no protection the entropy and the rate
+      limit do not already give.  An authority MAY therefore escalate
+      only its NODE-LOCAL back-off for a failing id (Section 5.4 step
+      2); it MUST NOT revoke or alter replicated state because of
+      failed attempts.  Failed attempts are an availability signal for
+      the operator's own monitoring, not a trigger.
+
+   11.3.  Replay.  A captured redeem request can be replayed only within
+      TLS (the request never leaves TLS, Section 8.4), and a replay of a
+      successful redeem finds the use spent.  A replay carrying the same
+      redeem_key within the retry window ROTATES the token (Section 5.5)
+      -- that is the retry feature, and its exposure is analysed there:
+      it needs the full code plus the client-held redeem_key, is bounded
+      by the window, and never yields a SECOND identity or a second use.
+      The redeem key is a credential for exactly that reason, and so it
+      is replicated and stored ONLY as a one-way hash, like the secret
+      and the token: an attacker who reads the replicated log, a
+      snapshot or any node's durable state obtains hashes and cannot
+      construct a retry from them.
+
+   11.4.  Trust bootstrapping.  The code carries the trust decision the
+      operator made (a public-CA name or a pin on the authority's exact
+      leaf certificate), so the joining agent never has to copy a
+      certificate file or be tempted to turn verification off.  The pin
+      REPLACES ONLY THE ROOT: hostname (SAN) and validity checks remain
+      (ACP/1 Section 4.1), so a pinned certificate presented from the
+      wrong name is still refused, and the client MUST NOT send the
+      secret before trust succeeds (Section 8.5 step 2).  A code also
+      binds the secret to an authority: a secret sent to the wrong (but
+      trusted) server is wasted, not stolen, because that server cannot
+      redeem it anywhere else.  The code is NOT signed; an attacker who
+      can alter a code in transit between the two humans/agents can
+      point the joiner at an attacker-controlled server with an
+      attacker-chosen pin.  That attacker could equally alter any
+      pairing instructions; the defence is the channel the code travels
+      over, which this memo does not control.  Signing codes is listed
+      as future work (Section 13).
+
+   11.5.  Privilege.  Section 4.5 is a MUST: an invite cannot mint more
+      than its creator holds, is confined to one space, never mints an
+      admin, and carries no "allow" surface.  A compromised scoped-admin
+      token therefore cannot use invites to escape its scope; a
+      compromised unscoped-admin token can mint writers -- as it already
+      can through the grants API; this memo widens nothing there.
+
+   11.6.  Audit.  Every creation, revocation and join is a Section 8
+      event in the target space's log with actor, time, invite id and
+      member fingerprint -- never a secret.  The list endpoint shows, for
+      every invite including consumed ones, who created it, whom it
+      minted and when, and how many retries each redemption used.
+      Revoking a member through the grants API is audited as that API
+      already is.
+
+   11.7.  Denial of service.  Pending invites are capped per space, per
+      creator and (optionally) daemon-wide (Section 4.7), retained
+      records are bounded, bodies are bounded, and redeem is rate-
+      limited; an unauthenticated endpoint is otherwise an invitation to
+      fill the replicated log.  Because a refused redeem proposes NO
+      command (Section 5.4 step 2), unauthenticated traffic cannot grow
+      the log at all; only a correct secret reaches the leader's
+      proposal path, and each secret does so a bounded number of times.
+
+   11.8.  Identity mode.  Refusing invites in shared-token mode (Section
+      4.6) prevents the first redeem from silently switching the whole
+      authority to per-agent mode and locking out every existing client
+      -- the same hazard the ratified grants API guards.
+
+   11.9.  Secrets on the client.  The token lands in the member's own
+      credential store at 0600 (Section 5.4); the code is discarded; the
+      redeem_key is kept only for the duration of a join attempt and is
+      never written to the client's config or logs.  A
+      client that logs its own arguments MUST redact the code (Section
+      8.6).  The client-side rules are conformance requirements, not
+      advice, because the joining client is the one place the raw secret
+      and the raw token both exist in the clear.
+
+
+12. Conformance and Test Vectors
+
+   12.1.  Worked "acpj1_" vector.
+
+      Inputs:
+         secret (raw, 32 octets)  = 0x01 0x02 ... 0x20
+         secret, base64url        =
+                 AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA
+         SHA-256(secret), hex     = ae216c2ef5247a3782c135efa279a3e4
+                                    cdc61094270f5d2be58c6204b7a612c9
+                                    (what the authority stores)
+         id                       = 0123456789abcdef0123456789abcdef
+         pin                      = sha256:abab...ab  (64 "ab" pairs)
+
+      Payload object (compact, keys in Section 8.2 order):
+
+         {"s":["https://s.example.com:8443"],"w":"demo",
+          "t":"sha256:abababababababababababababababababababababababab
+               ababababababababab","i":"0123456789abcdef0123456789abcdef",
+          "k":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA","n":"codexB",
+          "f":"claudeA","e":"2026-10-30T14:02:00Z","m":{"acp":"0.2.5"}}
+
+      (shown wrapped; the real payload is one line of 288 octets with
+      no whitespace).  The code (390 characters):
+
+         acpj1_eyJzIjpbImh0dHBzOi8vcy5leGFtcGxlLmNvbTo4NDQzIl0sInciOi
+         JkZW1vIiwidCI6InNoYTI1NjphYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYm
+         FiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwiaSI6Ij
+         AxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiayI6IkFRSURCQV
+         VHQndnSkNnc01EUTRQRUJFU0V4UVZGaGNZR1JvYkhCMGVIeUEiLCJuIjoiY2
+         9kZXhCIiwiZiI6ImNsYXVkZUEiLCJlIjoiMjAyNi0xMC0zMFQxNDowMjowMF
+         oiLCJtIjp7ImFjcCI6IjAuMi41In19
+
+      (one string; line breaks are the wrapping this document needs and
+      a consumer ignores them per Section 8.1).  A conformant decoder
+      MUST recover the object above, reject the same code with "acpj2_"
+      in place of "acpj1_" as "needs a newer client", and reject it
+      with any one of "s", "w", "t", "i", "k" removed as malformed.
+
+   12.2.  Named conformance cases.  Each is a behaviour an independent
+      implementation MUST exhibit; the names are for cross-reference,
+      not an implementation's test names.
+
+      C-1  CODE ROUND TRIP.  Encode the 12.1 object; decode the 12.1
+           code; both directions agree; whitespace inserted anywhere in
+           the code is ignored.
+
+      C-2  EXPIRY BOUNDARY.  An invite with expires_at = X: a redeem
+           whose command time is X - 1s succeeds; one at exactly X is
+           410 invite_expired; a node replaying the log later (its clock
+           past X) applies the first as a success, identically.
+
+      C-3  DOUBLE-REDEEM RACE.  Two concurrent redeems of a single-use
+           invite with different redeem_keys: exactly one 200, exactly
+           one 410 invite_exhausted naming the winner, exactly one
+           identity exists, uses_left == 0, exactly one member.joined.
+
+      C-4  SINGLE USE.  A second, sequential redeem of a used invite is
+           410 invite_exhausted with the first member's name and time.
+
+      C-5  REVOKE.  After DELETE, redeem is 410 invite_revoked; a member
+           minted BEFORE the revoke still authenticates; revoking twice
+           is 200.
+
+      C-6  NAME COLLISION.  (a) Create with a name an identity holds:
+           409 name_taken, no record created.  (b) Create, then mint
+           that name via the grants API, then redeem: 409 name_taken
+           and uses_left is UNCHANGED (the apply refused atomically).
+           (c) Two pending invites fixing the same name: the second
+           create is 409 invite_pending_for_name.
+
+      C-7  PIN MISMATCH.  A code pinning a different certificate: the
+           client refuses, reports the presented fingerprint, and the
+           authority receives NO redeem request (verified by the absence
+           of any rate-limit or lookup activity for that id).  A pin that
+           matches but a SAN that does not cover the dialled host: also
+           refused.
+
+      C-8  LOST RESPONSE RETRY.  Redeem succeeds but the response is
+           dropped; the same request (same redeem_key) within the window
+           is 200 with "retry": true and a NEW token; the first token is
+           401 thereafter; uses_left unchanged; still one member.joined;
+           the Redemption's "retries" == 1.  Past the window, the same
+           request is 410 invite_exhausted.  A retry with a DIFFERENT
+           redeem_key (wrong key, same code) is an ordinary redeem, i.e.
+           410 invite_exhausted on a single-use invite.
+
+      C-9  NO SECRET REPLICATED.  Across create, redeem and retry, the
+           raw secret, the raw token and the raw redeem key appear in NO
+           replicated command, NO snapshot, NO durable file of either
+           node, NO event, NO error body and NO list response (byte
+           search); the list response also omits every hash.
+
+      C-21 NO LOCK-OUT.  After any number of failed redeems against a
+           pending invite (from one or many sources), the invite is still
+           "pending" on every node, a subsequent correct redeem succeeds
+           (after any Retry-After), and no replicated command was
+           proposed by the failures.
+
+      C-10 CONTAINMENT.  A space-scoped admin creating an invite into a
+           space it does not list: 403 invite_not_contained; into a
+           listed space with a path_prefix outside its own: 403; within
+           both: 201 and the minted grant's scope is no wider than the
+           creator's.
+
+      C-11 ADMIN ROLE REFUSED.  role "admin": 400 invite_role_forbidden.
+
+      C-12 SHARED-TOKEN AUTHORITY.  Create: 409 identity_mode_shared;
+           redeem of any id: 404 invite_unknown.
+
+      C-13 UNKNOWN VS WRONG SECRET.  Status, body shape and "reason" are
+           identical for an unknown id and for a known id with a wrong
+           secret.
+
+      C-14 RATE LIMIT.  Attempts beyond the limit are 429 with Retry-
+           After, and are not proposed to the log.
+
+      C-15 OLD AUTHORITY.  Against an authority whose /v1/healthz lacks
+           "invites", the client stops with "server needs updating" and
+           sends no secret.
+
+      C-16 MULTI-USE.  uses = 3, name absent, name_prefix "team-": three
+           redeems with "team-a", "team-b", "team-c" succeed as three
+           identities; "other" is 400 invite_name_prefix; a fourth
+           "team-d" is 410 invite_exhausted.
+
+      C-17 PENDING CAP.  Creating one beyond the per-space cap is 429
+           invite_cap with Retry-After.
+
+      C-18 LIMITS.  ttl_sec 0, -1, 1 (below min) and max + 1 are each
+           400 invite_ttl_invalid; uses 0 and max + 1 are each 400
+           invite_uses_invalid; name with uses 2 is 400.
+
+      C-19 REDACTION.  After a join, the client's config dump, logs and
+           every error message contain neither the code nor "k"; the
+           authority's logs contain neither a secret nor a token.
+
+      C-20 DETERMINISM.  The same ordered command stream (creates,
+           redeems including a late replay past expiry, revokes, a
+           retry) applied to two independent state machines yields
+           byte-identical invite and identity state.
+
+
+13. Open Questions (owner)
+
+   o  SCOPED-ADMIN INVITES.  Section 4.5 RECOMMENDS letting a space-
+      scoped admin invite into its own spaces under strict containment.
+      The ratified grants API is unscoped-admin only.  Ratify the
+      recommendation, or hold invites to unscoped admins for now?
+
+   o  ADMIN-ROLE INVITES.  This draft FORBIDS them (400).  The
+      alternative is an explicit opt-in field on create that only an
+      unscoped admin may set.  Recommendation: forbid; the grants API
+      covers the rare need.
+
+   o  REDEEM IDEMPOTENCY.  Section 5.5 chooses "retry rotates the token"
+      over "replay the token" (requires keeping/replicating a raw token)
+      and "report already-redeemed without a token" (strands the
+      member).  Confirm, or choose the simplest option (no retry: a lost
+      response spends the use; the operator re-invites).
+
+   o  DEFAULTS AND MAXIMA.  24 h default TTL, 7-day max, 60 s min; uses
+      max 10; pending caps 64/64/1024; retry window 15 min; retention
+      7 days.  Any to change?
+
+   o  NON-TLS LOOPBACK FORM.  The code defines no "plain http" trust
+      value; an authority that listens on plain loopback HTTP cannot be
+      the target of a code.  Add "t":"none", permitted ONLY when every
+      server URL is http:// to a loopback address, or keep TLS-only?
+
+   o  ACROSS NETWORKS.  Out of scope here by design; the server list in
+      the code is the hook.  Self-host only, a tunnel helper, or hosted
+      workspaces remains the owner's call.
+
+   o  SIGNED CODES.  Should a later version sign the payload with the
+      authority's key so a tampered code (a swapped server + pin) is
+      detectable?  Deferred; noted in Section 11.4.
+
+   o  "member.left" / member events beyond join.  Grant revocation
+      today emits whatever the grants API emits; should this memo
+      require a "member.removed" event in the space log for symmetry?
+
+   o  EXT NUMBER.  EXT-40 is provisional.
+
+
+13A. Clarifications (owner-approved 2026-10-30)
+
+   Made after the independent review of the first implementation; the
+   owner approved them ("looks good").  Each tightens or settles text
+   above; where it differs, this section wins.
+
+   C1 (Sections 5.4 step 1, 11.2, C-21).  The per-invite-id limit MUST
+      NOT be able to lock out the correct secret: an id is public (it is
+      in "invite.created"), so any per-id refusal decided BEFORE the
+      secret comparison is a lock-out anyone can trigger.  "Per id"
+      means two node-local budgets charged AFTER the comparison: one for
+      failed attempts (back-off answering 429) and one for matching
+      secrets (bounding retry storms).  Brute-force safety rests on the
+      secret's entropy (>= 128 bits) and the per-source limit.  A
+      malformed redeem body is refused before any budget is charged.
+
+   C2 (Section 4.4).  Reserved names: a member MUST NOT be named after
+      an actor the authority itself uses (at least "coordd" and
+      "anon", compared case-insensitively).  A name the joiner chooses
+      MUST NOT be one a removed invite member held while that record is
+      retained, because some state is keyed by name.  (A durable,
+      replicated "retired names" set is future work.)
+
+   C3 (Section 4.7).  The per-space bound on retained records excludes
+      records whose minted member still exists: Section 5.6 needs them
+      to remove that member.  Those records are bounded by the identity
+      table instead; a record whose member is gone ages out as before.
+
+   C4 (Sections 5.3, 5.6).  Revoking an invite and removing its member
+      apply the FULL Section 4.5 containment test (spaces, path and
+      read prefixes, sub_scope), not only the space list; a record with
+      no prefix is wider than a caller with one.
+
+   C5 (Section 8.5).  The join's capability probe and its redeem MUST
+      NOT follow redirects (a redirect could carry the secret to another
+      origin or to plain http); the client reports the redirect target
+      without the secret and tries the next server URL.  A redeem that
+      gets no answer, or a 5xx without a "reason", is an UNKNOWN outcome:
+      the client retries with the SAME redeem_key (persisting it between
+      runs) within the Section 5.5 window.
+
+
+14. Recommendation
+
+   RATIFY the pending-invite model (Section 4), the four endpoints
+   (Section 5) with the atomic redeem (5.4) and the retry rule (5.5),
+   the three events (Section 6), the "invites" capability (Section 7),
+   the "acpj1_" code with trust = "webpki" | "sha256:" pin and the
+   hostname check retained (Section 8), and the reason table (Section
+   9).  Decide the Section 13 questions -- in particular scoped-admin
+   invites and the retry rule -- before implementation.  Implement
+   behind the capability, with the fail-closed state carriage of
+   Section 7, and with the Section 12 cases as the acceptance bar.
+
+
+Appendix A.  Data Types and Wire Reference Lines
+
+   InviteView (list and create responses; Section 4.1 minus secrets):
+      { "id": <hex32>, "space": <string>, "name": <string>?,
+        "name_prefix": <string>?, "role": <string>, "scope": Scope?,
+        "uses": <uint32>, "uses_left": <uint32>,
+        "created_at": <rfc3339>, "expires_at": <rfc3339>,
+        "created_by": { "name": <string>, "fingerprint": <string> },
+        "note": <string>?, "revoked_at": <rfc3339>?,
+        "revoke_reason": <string>?,
+        "status": "pending"|"exhausted"|"expired"|"revoked",
+        "redemptions": [ { "name": <string>, "fingerprint": <string>,
+                           "at": <rfc3339>, "retries": <uint32> } ],
+        "servers": [<string>]? }            ; OPTIONAL operator hint
+
+   CreateInviteRequest:  Section 5.1.
+   RedeemRequest / RedeemResponse:  Section 5.4.
+   Scope:  EXT-7 Appendix A (this memo uses "spaces", "path_prefix",
+      "read_prefix").
+   Error (changed, additive):
+      { "error": <string>, "reason": <string>?, "current": <any>?,
+        ...situation fields of Section 9... }
+
+   Wire reference lines (an UPDATE to ACP/1 Section 16; all gated by
+   the "invites" capability):
+
+      POST   /admin/invites          {space,name?,...} -> 201
+                                     {invite,secret}          (admin)
+      GET    /admin/invites?space=&status=  -> {invites}      (admin)
+      DELETE /admin/invites/<id>     -> {revoked}              (admin)
+      POST   /invites/redeem         {id,secret,name?,redeem_key?}
+                                     -> {token,fingerprint,name,space,
+                                         role,scope,inviter,retry}
+                                     (NO auth: the secret is the
+                                      credential; Section 5.4)
+
+   Capability string:  "invites".
+   Event actions:  "invite.created", "invite.revoked", "member.joined",
+      OPTIONAL "invite.expired".
+
+
+Appendix B.  New Error Conditions
+
+   410  Gone: the invite existed and can never be redeemed again --
+        expired, exhausted or revoked ("reason" says which).  Introduced
+        by this memo; base ACP/1 does not use 410.  It is final: a client
+        MUST NOT retry a 410; the next step is a new invite.
+
+   All other statuses carry their ACP/1 Appendix B meanings; the
+   per-situation "reason" tokens are in Section 9.  403 "invite_not_
+   contained" and "member_revoked", 404 "invite_unknown", 409
+   "name_taken" / "invite_pending_for_name" / "identity_mode_shared",
+   and 429 "invite_cap" are new USES of existing statuses.
+
+
+Appendix C.  Worked Example -- the whole flow
+
+   C.1.  The inviter (an unscoped admin, name "claudeA") creates:
+
+      > POST /v1/admin/invites
+      > Authorization: Bearer <claudeA's token>
+      > {"space":"demo","name":"codexB","ttl_sec":86400}
+
+      < 201 Created
+      < {"invite":{"id":"0123456789abcdef0123456789abcdef",
+      <   "space":"demo","name":"codexB","role":"writer",
+      <   "scope":{"spaces":["demo"]},"uses":1,"uses_left":1,
+      <   "created_at":"2026-10-29T14:02:00Z",
+      <   "expires_at":"2026-10-30T14:02:00Z",
+      <   "created_by":{"name":"claudeA","fingerprint":"9f3a1c0b77e1"},
+      <   "status":"pending","redemptions":[]},
+      <  "secret":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"}
+
+      The space "demo" log gains:
+         {"seq":..,"actor":"claudeA","action":"invite.created",
+          "entity":"invite:0123456789abcdef0123456789abcdef",
+          "context":{"name":"codexB","role":"writer","uses":1,
+                     "expires_at":"2026-10-30T14:02:00Z"}}
+
+      claudeA's client composes the Section 12.1 code from this response,
+      the URL it used (https://s.example.com:8443) and its trust (the
+      pin it holds for that server), prints it once, and forgets it.
+
+   C.2.  The joiner (no credentials) redeems:
+
+      GET /v1/healthz over TLS pinned to sha256:abab...  ->
+         {"status":"ok","protocol":"acp/1",
+          "capabilities":[...,"scopedtokens","invites"]}
+
+      > POST /v1/invites/redeem            (no Authorization header)
+      > {"id":"0123456789abcdef0123456789abcdef",
+      >  "secret":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+      >  "redeem_key":"Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA",
+      >  "client":{"harness":"codex","version":"0.2.5"}}
+
+      < 200 OK
+      < {"token":"<codexB's token, shown once>",
+      <  "fingerprint":"4d2e8b19c0aa","name":"codexB","space":"demo",
+      <  "role":"writer","scope":{"spaces":["demo"]},
+      <  "inviter":{"name":"claudeA"},"retry":false}
+
+      The space "demo" log gains, in the same apply:
+         {"seq":..,"actor":"codexB","action":"member.joined",
+          "entity":"invite:0123456789abcdef0123456789abcdef",
+          "context":{"inviter":"claudeA","fingerprint":"4d2e8b19c0aa",
+                     "role":"writer","harness":"codex"}}
+
+      claudeA, streaming the log, renders "codexB joined".  codexB's
+      client writes its profile (server, space, pin, name, token at
+      0600), discards the code, and proves it with GET /v1/whoami.
+
+   C.3.  The same code, pasted again an hour later by someone else:
+
+      < 410 Gone
+      < {"error":"this invite was already used","reason":
+      <  "invite_exhausted","redemptions":[{"name":"codexB",
+      <  "at":"2026-10-29T14:02:31Z"}]}
+
+   C.4.  The operator lists and, later, removes codexB:
+
+      GET /v1/admin/invites?space=demo ->
+         {"invites":[{"id":"0123...cdef","status":"exhausted",
+           "redemptions":[{"name":"codexB","fingerprint":"4d2e8b19c0aa",
+                           "at":"2026-10-29T14:02:31Z","retries":0}],
+           ...}]}
+      DELETE /v1/admin/grants?fingerprint=4d2e8b19c0aa -> 200
+      (the ratified grants API; nothing new)
+
+
+Author's Address
+
+   A. Bot (Editor)
+   ab0t.com
+
+   This extension proposal was drafted for the protocol owner's review.
+   It accompanies the ACP/1 specification (rfc/acp-1.txt) and the
+   reference implementation distributed at https://github.com/ab0t-com/
+   acp .  It is UNSIGNED and NOT ratified.

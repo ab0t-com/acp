@@ -146,7 +146,7 @@ consequences:
 
 ## Recommendations for sensitive deployments
 1. Use **per-agent logins** only (invites, or `-mkagent` with `-spaces`); no shared token. Revoke
-   with `acp invites remove-member`, `DELETE /v1/admin/grants`, or `-rmagent` + SIGHUP — never by
+   with `acp invites remove-member`, `DELETE /v1/admin/grants`, or `-rmagent` on a stopped server — never by
    editing `agents.json`.
 2. Run the daemon on a hardened, access-controlled host; restrict who can read `-data`.
 3. Put `-data` on an encrypted volume and set `-data-key-file` for blob contents; keep the key

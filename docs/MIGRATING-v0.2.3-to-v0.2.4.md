@@ -53,7 +53,8 @@ time as usual.
   file is rewritten to store only token hashes, and the old file is kept as `agents.json.raw-backup-<date>` (private,
   0600). An older `coordd` refuses to start on the new file, so **keep that backup until you're sure you won't roll
   back**. `coordd -hash-agents` converts it right away if you prefer.
-- **Manage logins live:** `GET/POST/DELETE /v1/admin/grants` (no restart), `coordd -lsagents`, `-rmagent`.
+- **Manage logins live:** `GET/POST/DELETE /v1/admin/grants` (no restart), `coordd -lsagents`; `-rmagent` on a stopped
+  server (since v0.2.5 it refuses while the server runs).
 - **A brand-new data folder now creates an admin login for you** (`owner`, token in `<data>/owner.token`) and prints
   one line to connect with. **Existing servers are unchanged.** `-shared-token` keeps the old start on a new folder.
 
@@ -94,8 +95,22 @@ time as usual.
 
 ## 8. Rolling back
 
-Keep the v0.2.3 binary. If you added or removed a login on v0.2.4, restore `agents.json.raw-backup-<date>` before
-starting v0.2.3. A cluster rolls back all nodes together.
+Keep the v0.2.3 binary. A cluster rolls back all nodes together. Stop the server before changing any file below.
+
+v0.2.3 can't read the v0.2.4 `agents.json` (it stores only token hashes; v0.2.3 stops with "agents.json version 6
+not supported"), and it needs the raw tokens. What you can bring back depends on where the logins came from:
+
+- **Logins you had before upgrading:** if the file was rewritten on v0.2.4, `agents.json.raw-backup-<date>` holds
+  them as they were then. Move the current `agents.json` aside (keep it: it is your way forward again) and put the
+  backup in its place.
+- **Logins made on v0.2.4** — the `owner` login a new data folder made on its first start, and any login made
+  through the grants API or an invite — exist only as hashes. They can't be carried back, and a folder that started
+  on v0.2.4 has no backup at all. Move the current `agents.json` aside and, with the server stopped, mint those
+  logins again with the v0.2.3 binary (`coordd -data … -mkagent <name> -role …`), then hand out the new tokens.
+  The owner's token is still in `<data>/owner.token`, but v0.2.3 can't use that file; mint the owner again too.
+
+Going forward to v0.2.4 again: put the v0.2.4 `agents.json` you set aside back in place (the logins minted on
+v0.2.3 in between are then gone; mint them again live).
 
 ---
 Need help? Check `GET /` on your server (a public "start here" page), [RUN-ACP](RUN-ACP.md) and

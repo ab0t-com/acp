@@ -35,7 +35,8 @@ Never guess these. Ask the human, all at once:
    image tag `vX.Y.Z-server`). Clients can't tell the difference; it converts either way.
 5. **Certificate:** leave `-hosts` off when agents use this machine's own names/addresses (localhost, its hostname,
    LAN/VPN IPs). Set it when they use a name the machine can't see on itself (cloud public IP, DNS name, Docker host),
-   and then list **every** name plus `localhost,127.0.0.1`, because `-hosts` replaces the automatic list. For a public
+   and list the extra names: from v0.2.5 `-hosts` adds them to the automatic list (`-hosts-exact` = only these);
+   on v0.2.4 and older it replaces the list, so there include `localhost,127.0.0.1` too. For a public
    certificate, put your own HTTPS proxy in front (coordd can't load a certificate you supply).
 6. **Back up the data folder off the machine on a schedule.** ACP doesn't schedule backups.
 
@@ -100,8 +101,10 @@ MCP-only agent (`claude mcp add acp -- env ACP_PROFILE=<name> acp-mcp`).
   joiner to trust the system certificates.
 
 **Other ways to make a login:** `POST /v1/admin/grants {"name","role","scope":{"spaces":[…]}}` (live, any node;
-the token is shown once), or on the server machine `coordd -data … -mkagent NAME -role writer -spaces team`
-(+ `-path-prefix`, `-read-prefix`, `-allow-bulk`; then `kill -HUP`). Manual client profile:
+the token is shown once), or with the server **stopped** `coordd -data … -mkagent NAME -role writer -spaces team`
+(+ `-path-prefix`, `-read-prefix`, `-allow-bulk`; then start it). Since v0.2.5 `-mkagent`/`-rmagent`/`-hash-agents`
+refuse while a server runs on that folder (it would undo the edit) and say how to do it live; the one exception is a
+running shared-key server's first login (then restart). Manual client profile:
 `acp config set <name> server=… token_file=… pin=… agent=<name>`. Teach `token_file=`, never `token=` (it lands in
 shell history; the CLI warns).
 
@@ -109,10 +112,12 @@ shell history; the CLI warns).
 
 - **Roles:** `admin` (manage), `writer` (read+write), `reader` (read). A shared key is `admin` unless
   `-shared-token-role writer|reader`.
-- **See / revoke:** `GET /v1/admin/grants`, `DELETE /v1/admin/grants?fingerprint=…` (live, replicated), or on the
-  server machine `coordd -data … -lsagents` / `-rmagent <fingerprint|name>` + `kill -HUP <pid>`. **Rotate:** mint the
-  same name again, hand it over, revoke the old fingerprint. In a cluster, `-mkagent`/`-rmagent` refuse once
-  identities are replicated; use the API or invites. Never hand-edit `agents.json`.
+- **See / revoke:** `GET /v1/admin/grants`, `DELETE /v1/admin/grants?fingerprint=…` (live, replicated) — the way on a
+  running server. `coordd -data … -lsagents` works any time; `-rmagent <fingerprint|name>` only with the server
+  stopped (it refuses while one runs: a live server rewrites `agents.json` and would bring the token back). **Rotate:**
+  mint the same name again, hand it over, revoke the old fingerprint. In a cluster, `-mkagent`/`-rmagent` refuse once
+  identities are replicated; use the API or invites. Never hand-edit `agents.json`. SIGHUP re-reads logins only, never
+  invites (manage those with `acp invite` / `acp invites`).
 - **`agents.json` stores only token hashes (v0.2.4, version 6).** The first rewrite keeps
   `agents.json.raw-backup-<UTC>` (0600). An older coordd refuses a version-6 file, so upgrade every node first and
   delete the backup once nothing needs to roll back (it still holds raw tokens).
@@ -126,8 +131,12 @@ shell history; the CLI warns).
 
 - **Workspaces (spaces)** are the isolation boundary. Any request naming one creates it. `acp spaces` lists the
   ones your login may use (persisted, survives restart). `acp admin spaces` lists all with what each holds.
-  `acp admin spaces drop <name> --confirm <name>` removes an **empty** one (refused if it holds anything).
-  `-max-spaces` (1000 per node) and `-max-spaces-per-grant` (16 new workspaces per non-admin login) bound creation.
+  `acp admin spaces drop <name> --confirm <name>` removes an **empty** one (refused if it holds anything — since
+  v0.2.5 events count too, so a workspace's history is never erased; a workspace that was only read stays removable).
+  A workspace not used since the server started is listed as unknown (`open:false`, no `empty`), not as empty; the
+  drop checks it for real. `-max-spaces` (1000 per node) and `-max-spaces-per-grant` (16 new workspaces per non-admin
+  login) bound creation; the per-login count is kept in memory per server process and per node (a restart resets it),
+  so for a hard bound give the login a `-spaces` list.
 - **Quotas** (admin, live, replicated, no flag):
   `PUT /v1/admin/quota {"space":"x","max_events":…,"max_blob_bytes":…,"max_leases":…,"max_mail":…}`.
   Over the events, bytes or mail cap → `507`; over `max_leases` → `429` + `Retry-After`. `GET /v1/stats` shows
