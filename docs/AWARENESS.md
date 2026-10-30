@@ -78,8 +78,8 @@ separately as `awareness-ws` and negotiated independently.
   `acp awareness clear`.
 - **MCP:** `acp_awareness_set`, `acp_awareness_get`, `acp_awareness_clear` — an LLM agent can post
   and read live presence, its tool descriptions teaching the ephemeral discipline.
-- **Runnable example:** [`examples/awareness-cursors/`](../examples/awareness-cursors/) — two
-  terminals, a walking cursor over both transports.
+- **Try it from a shell:** run `acp awareness watch` in one terminal and
+  `acp awareness set '{"cursor":{"line":3}}'` in another; the update appears at once and expires on its own.
 
 ## Scoping presence
 

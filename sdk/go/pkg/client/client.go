@@ -1,20 +1,26 @@
 // Package client is the Go SDK for talking to coordd. A harness embeds this to
 // get the shared filesystem + comms line; the acp CLI is a thin wrapper over it.
 //
-// Transport: HTTPS to the pinned daemon cert (pass certPath), bearer token, and
-// an agent id sent on every request. All methods are safe for concurrent use.
+// Transport: HTTPS (a pinned daemon cert or fingerprint, or the system trust
+// store for a publicly certified daemon; see TLSOptions), bearer token, and an
+// agent id sent on every request. All methods are safe for concurrent use.
 package client
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -44,32 +50,224 @@ type Client struct {
 	warnedNoChan bool            // one-time "no channels capability" warning fired
 }
 
-// New builds a client. certPath pins the daemon's self-signed cert (recommended).
-// If certPath is "" and insecure is true, TLS verification is skipped (dev only).
+// TLSOptions selects how the client trusts the daemon (ACP/1 §4.1). In order:
+//   - CertPath: pin the daemon's cert file as the sole root (hostname still checked).
+//   - Pin: "sha256:<64 hex>" of the daemon's DER leaf cert, the same string ext-32
+//     discovery publishes as cert_fingerprint. The pin replaces the root, NOT the
+//     hostname check: the cert must still cover the host you dial (§4.1 SAN MUST)
+//     and be inside its validity period. With CertPath it is checked in addition.
+//   - Insecure: skip verification (dev only; §4.1 forbids it in production).
+//   - none of these: the system trust store, i.e. a publicly certified daemon such
+//     as one behind a TLS edge (a public cert renews too often to pin).
+type TLSOptions struct {
+	CertPath string
+	Pin      string
+	Insecure bool
+}
+
+// New builds a client. certPath pins the daemon's self-signed cert (recommended
+// for a self-signed coordd); with neither certPath nor insecure, the system trust
+// store is used. If certPath is "" and insecure is true, TLS verification is
+// skipped (dev only). NewTLS also accepts a fingerprint pin.
 func New(base, token, agent, certPath string, insecure bool) (*Client, error) {
-	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	return NewTLS(base, token, agent, TLSOptions{CertPath: certPath, Insecure: insecure})
+}
+
+// NewTLS is New with the full TLSOptions.
+func NewTLS(base, token, agent string, o TLSOptions) (*Client, error) {
+	var tlsCfg *tls.Config
+	if strings.HasPrefix(strings.ToLower(base), "http://") {
+		// No TLS on http://: to this machine that's fine; to another host the token
+		// would cross the network in clear, so it needs the explicit opt-in.
+		if !plainLoopback(base) && !o.Insecure {
+			return nil, fmt.Errorf("%s is plain http:// to another host: the token would cross the network unencrypted; use https://, or pass --insecure to allow it", base)
+		}
+		if o.Pin != "" { // no TLS here, but a malformed pin is still a configuration error
+			if _, err := parsePin(o.Pin); err != nil {
+				return nil, err
+			}
+		}
+		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		var err error
+		if tlsCfg, err = tlsConfig(o, baseHost(base)); err != nil {
+			return nil, err
+		}
+	}
+	sess := make([]byte, 8)
+	rand.Read(sess)
+	tr := &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true}
+	return &Client{
+		base: base, token: token, agent: agent, session: hex.EncodeToString(sess),
+		hc: &http.Client{Timeout: 0, Transport: trustHint{tr}, CheckRedirect: refuseDowngrade},
+	}, nil
+}
+
+// RedirectError is a redirect the client refused to follow. Location is the
+// target with any userinfo, query and fragment removed (it is shown to users).
+type RedirectError struct {
+	Status   int // the 3xx status, when known
+	Location string
+}
+
+func (e *RedirectError) Error() string {
+	if e.Status != 0 {
+		return fmt.Sprintf("the server answered %d, redirecting to %s, and acp does not follow that redirect", e.Status, e.Location)
+	}
+	return fmt.Sprintf("the server redirected to %s, which would leave TLS, and acp does not follow that redirect", e.Location)
+}
+
+// redactedLocation renders a redirect target for an error: scheme, host and path only.
+func redactedLocation(u *url.URL) string {
+	if u == nil {
+		return "(no Location)"
+	}
+	v := *u
+	v.User, v.RawQuery, v.ForceQuery, v.Fragment, v.RawFragment = nil, "", false, "", ""
+	return v.String()
+}
+
+// refuseDowngrade is the client-wide redirect policy. Go's default follows up
+// to 10 hops and re-sends Authorization to the SAME host even when the hop
+// drops https for http, which would put the bearer token on the wire in clear
+// (EXT-40 review F1, swept client-wide): a hop that leaves TLS is refused.
+func refuseDowngrade(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return &RedirectError{Location: redactedLocation(req.URL)}
+	}
+	return nil
+}
+
+// TLSConfig builds the tls.Config for o (see TLSOptions).
+func TLSConfig(o TLSOptions) (*tls.Config, error) { return tlsConfig(o, "") }
+
+// baseHost is the host part of base ("" if unparsable).
+func baseHost(base string) string {
+	u, err := url.Parse(base)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+// tlsConfig is TLSConfig with the dialed host known: a TLS client sends no SNI for
+// an IP address, so the pin's hostname check needs it from the base URL.
+func tlsConfig(o TLSOptions, host string) (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	var want []byte
+	if o.Pin != "" {
+		var err error
+		if want, err = parsePin(o.Pin); err != nil {
+			return nil, err
+		}
+	}
 	switch {
-	case certPath != "":
-		pem, err := os.ReadFile(certPath)
+	case o.CertPath != "":
+		pem, err := os.ReadFile(o.CertPath)
 		if err != nil {
 			return nil, fmt.Errorf("read cert: %w", err)
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("cert %s: no certificates parsed", certPath)
+			return nil, fmt.Errorf("cert %s: no certificates parsed", o.CertPath)
 		}
-		tlsCfg.RootCAs = pool
-	case insecure:
-		tlsCfg.InsecureSkipVerify = true
+		cfg.RootCAs = pool
+	case want != nil:
+		// The pin replaces chain trust; hostname and validity are checked by
+		// pinVerifier below, so this is not "verification disabled".
+		cfg.InsecureSkipVerify = true
+	case o.Insecure:
+		cfg.InsecureSkipVerify = true
 	default:
-		return nil, fmt.Errorf("provide --cert (pin daemon cert) or --insecure")
+		// RootCAs nil = the system trust store.
 	}
-	sess := make([]byte, 8)
-	rand.Read(sess)
-	return &Client{
-		base: base, token: token, agent: agent, session: hex.EncodeToString(sess),
-		hc: &http.Client{Timeout: 0, Transport: &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true}},
-	}, nil
+	if want != nil {
+		cfg.VerifyConnection = pinVerifier(want, cfg.InsecureSkipVerify, host)
+	}
+	return cfg, nil
+}
+
+// parsePin accepts "sha256:<64 hex>" (case-insensitive), the ext-32 cert_fingerprint form.
+func parsePin(s string) ([]byte, error) {
+	v := strings.TrimSpace(s)
+	if len(v) < 7 || !strings.EqualFold(v[:7], "sha256:") {
+		return nil, fmt.Errorf("pin %q: want sha256:<64 hex> (the cert_fingerprint coordd prints at startup and serves at /.well-known/acp)", s)
+	}
+	b, err := hex.DecodeString(v[7:])
+	if err != nil || len(b) != sha256.Size {
+		return nil, fmt.Errorf("pin %q: want sha256:<64 hex> (the cert_fingerprint coordd prints at startup and serves at /.well-known/acp)", s)
+	}
+	return b, nil
+}
+
+// pinVerifier checks the presented leaf against the pin. When the pin is the only
+// trust (checkLeaf), it also enforces what chain verification would have: the
+// cert's validity period and that its SANs cover the dialed host (ACP/1 §4.1).
+func pinVerifier(want []byte, checkLeaf bool, host string) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("the daemon presented no certificate")
+		}
+		leaf := cs.PeerCertificates[0]
+		got := sha256.Sum256(leaf.Raw)
+		if subtle.ConstantTimeCompare(got[:], want) != 1 {
+			return fmt.Errorf("certificate pin mismatch: the daemon presented sha256:%x, the profile pins sha256:%x", got, want)
+		}
+		if !checkLeaf {
+			return nil
+		}
+		if now := time.Now(); now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+			return fmt.Errorf("the pinned certificate is outside its validity period (%s to %s)",
+				leaf.NotBefore.UTC().Format(time.RFC3339), leaf.NotAfter.UTC().Format(time.RFC3339))
+		}
+		name := cs.ServerName // empty when the host is an IP (no SNI): use the dialed host
+		if name == "" {
+			name = host
+		}
+		if err := leaf.VerifyHostname(name); err != nil { // "" never verifies: fail closed
+			return fmt.Errorf("the pinned certificate does not cover %q (its SANs must include the host you connect to; add it with coordd -hosts): %v", name, err)
+		}
+		return nil
+	}
+}
+
+// trustHint adds the next step to a TLS trust failure: the commonest one is a
+// self-signed coordd reached with no cert or pin configured, which the system
+// trust store rightly rejects.
+type trustHint struct{ rt http.RoundTripper }
+
+func (t trustHint) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := t.rt.RoundTrip(r)
+	if err == nil {
+		return resp, nil
+	}
+	var ua x509.UnknownAuthorityError
+	var he x509.HostnameError
+	switch {
+	case errors.As(err, &ua):
+		return nil, fmt.Errorf("%w (the daemon's certificate isn't trusted: for a self-signed coordd set cert=<its cert.pem> or pin=sha256:<fingerprint> in your profile; coordd prints both at startup)", err)
+	case errors.As(err, &he):
+		return nil, fmt.Errorf("%w (connect by a name the certificate lists, or add this one with coordd -hosts)", err)
+	}
+	return nil, err
+}
+
+// plainLoopback reports whether base is an http:// URL whose host is this
+// machine (localhost or a loopback IP).
+func plainLoopback(base string) bool {
+	u, err := url.Parse(base)
+	if err != nil || !strings.EqualFold(u.Scheme, "http") {
+		return false
+	}
+	h := u.Hostname()
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 // SetSpace selects the isolated space (filesystem + channels) this client uses.
@@ -406,6 +604,9 @@ type FollowOptions struct {
 	// fix; mirrors the TS SDK). It never fires if the open fails (that path
 	// returns the *APIError). A panic in OnOpen propagates to the caller.
 	OnOpen func()
+	// Context, when set, bounds the stream: cancelling it closes the request, and
+	// the follow returns the context's error. nil = no bound (as before).
+	Context context.Context
 }
 
 // Follow streams events from `from`, calling fn for each. Blocks until ctx-less
@@ -434,6 +635,9 @@ func (c *Client) followStream(from uint64, f *EventFilter, opts *FollowOptions, 
 	req, err := c.req("GET", path, nil)
 	if err != nil {
 		return err
+	}
+	if opts != nil && opts.Context != nil {
+		req = req.WithContext(opts.Context)
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -841,7 +1045,11 @@ func (c *Client) listPaged(path string) ([]DocInfo, error) {
 		}
 		p := path
 		if cursor != "" {
-			p += "?cursor=" + url.QueryEscape(cursor)
+			sep := "?"
+			if strings.Contains(path, "?") {
+				sep = "&"
+			}
+			p += sep + "cursor=" + url.QueryEscape(cursor)
 		}
 		var page []DocInfo
 		next, err := c.doPaged("GET", p, &page)
@@ -927,6 +1135,21 @@ func (c *Client) CRDTJSONDoc(doc string) (json.RawMessage, int, int, error) {
 	}
 	err := c.do("GET", "/v1/crdt/json/doc?doc="+doc, nil, &out)
 	return out.JSON, out.Total, out.Epoch, err
+}
+
+// CRDTOpCounts lists text documents with their op counts only (Size 0) — the daemon
+// does not load any document to answer it, so it is safe on a busy node. A daemon
+// older than v0.2.4 ignores the request and returns full sizes (it folds).
+func (c *Client) CRDTOpCounts() ([]DocInfo, error) {
+	return c.listPaged("/v1/crdt/list?sizes=0")
+}
+
+// CRDTJSONOpCounts is CRDTOpCounts for structured (JSON) documents.
+func (c *Client) CRDTJSONOpCounts() ([]DocInfo, error) {
+	if err := c.requireCRDTJSON(); err != nil {
+		return nil, err
+	}
+	return c.listPaged("/v1/crdt/json/list?sizes=0")
 }
 
 // CRDTJSONList lists structured documents (a namespace separate from text docs).
@@ -1043,6 +1266,9 @@ func (c *Client) FollowAwareness(fn func(wire.AwarenessDelta) error) error {
 		if err != nil {
 			return err
 		}
+		if req.URL.Scheme == "https" && hop.URL.Scheme != "https" { // the full header set (the token) never leaves TLS
+			return &RedirectError{Status: http.StatusTemporaryRedirect, Location: redactedLocation(hop.URL)}
+		}
 		hop.Header = req.Header.Clone()
 		if resp, err = hc.Do(hop); err != nil {
 			return err
@@ -1095,6 +1321,33 @@ func (c *Client) Stats() (map[string]any, error) {
 func (c *Client) Spaces() (map[string]any, error) {
 	var out map[string]any
 	return out, c.do("GET", "/v1/spaces", nil, &out)
+}
+
+// AdminSpace is one row of AdminSpaces: a space with persisted state. Content and
+// Empty are set only when the space is loaded on the answering node.
+type AdminSpace struct {
+	Space   string         `json:"space"`
+	Open    bool           `json:"open"`
+	Empty   *bool          `json:"empty,omitempty"`
+	Content map[string]int `json:"content,omitempty"`
+}
+
+// AdminSpaces lists every space with persisted state (admin; a scoped admin sees
+// only its own spaces).
+func (c *Client) AdminSpaces() ([]AdminSpace, error) {
+	var out []AdminSpace
+	return out, c.do("GET", "/v1/admin/spaces", nil, &out)
+}
+
+// DropSpace removes an EMPTY space (admin). The daemon refuses (409) a space that
+// holds content. dropped=false means the space did not exist (retry-safe).
+func (c *Client) DropSpace(space string) (dropped bool, err error) {
+	var out struct {
+		Dropped bool `json:"dropped"`
+	}
+	q := url.QueryEscape(space)
+	err = c.do("DELETE", "/v1/admin/spaces?space="+q+"&confirm="+q, nil, &out)
+	return out.Dropped, err
 }
 
 // GC asks the daemon to delete unreferenced blobs older than graceSec seconds.

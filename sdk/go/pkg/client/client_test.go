@@ -108,12 +108,40 @@ func newTestClient(t *testing.T, url string) *Client {
 	return c
 }
 
-func TestNewRequiresCertOrInsecure(t *testing.T) {
-	if _, err := New("https://x", "t", "a", "", false); err == nil {
-		t.Fatal("New must require --cert or --insecure")
+// Until 2026-10-29 an https:// client with no cert and no insecure was refused; it
+// now uses the system trust store (ACP/1 §4.1 SHOULD-pin, still verified; see
+// trust_test.go and tickets/acp-client-trust-modes-20261029).
+func TestNewHTTPSDefaultsToSystemRoots(t *testing.T) {
+	if _, err := New("https://x", "t", "a", "", false); err != nil {
+		t.Fatalf("https:// with no cert must use the system trust store: %v", err)
+	}
+	cfg, err := TLSConfig(TLSOptions{})
+	if err != nil || cfg.RootCAs != nil || cfg.InsecureSkipVerify || cfg.VerifyConnection != nil {
+		t.Fatalf("default trust must be plain system-roots verification: %+v %v", cfg, err)
 	}
 	if _, err := New("https://x", "t", "a", "", true); err != nil {
 		t.Fatalf("insecure New should succeed: %v", err)
+	}
+}
+
+// Plain http:// to THIS machine has no TLS to verify, so it must not demand --cert or
+// --insecure (dogfood 2026-10-29: a loopback shim at http://127.0.0.1:8443 forced
+// insecure=true). A remote http:// still needs the explicit opt-in: the token would
+// cross the network unencrypted.
+func TestNewPlainHTTPLoopbackNeedsNoCert(t *testing.T) {
+	for _, base := range []string{"http://127.0.0.1:8443", "http://localhost:8443", "http://[::1]:8443", "HTTP://LocalHost:1"} {
+		if _, err := New(base, "t", "a", "", false); err != nil {
+			t.Fatalf("%s: plain loopback must not need a cert: %v", base, err)
+		}
+	}
+	for _, base := range []string{"http://10.0.0.5:8443", "http://coordd.example:8443", "http://127.0.0.1.example:8443"} {
+		if _, err := New(base, "t", "a", "", false); err == nil {
+			t.Fatalf("%s: remote plain http:// must need the explicit --insecure", base)
+		}
+	}
+	_, err := New("http://10.0.0.5:8443", "t", "a", "", false)
+	if err == nil || !strings.Contains(err.Error(), "unencrypted") {
+		t.Fatalf("remote http:// error must say why: %v", err)
 	}
 }
 

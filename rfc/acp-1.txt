@@ -209,6 +209,21 @@ Table of Contents
    The authority MUST validate the token and SHOULD compare it in
    constant time.  An invalid or missing token MUST yield 401.
 
+====== BEGIN RATIFIED AMENDMENT · id=acp1-5.1-public-root · proposed 2026-10-29 · RATIFIED by the protocol owner 2026-10-29 ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-10-29 (proposed
+     2026-10-29, for self-discovery and onboarding) per the amendment-
+     governance SOP; now NORMATIVE.  Marker retained for provenance. ]
+
+   An authority MAY serve a public discovery document at GET / (and
+   GET /v1/) without authentication.  It MUST NOT contain workspace,
+   agent or identity data, or anything else not available without a
+   token; it SHOULD describe how to obtain access and where the
+   documentation lives.  Its shape is informative (a
+   "discovery_version" key versions it): clients MUST NOT depend on any
+   field of it for protocol behaviour -- capability detection remains
+   GET /v1/healthz.
+====== END RATIFIED AMENDMENT · id=acp1-5.1-public-root ======
+
    5.2.  Identity
 
    An authority operates in one of two identity modes:
@@ -633,6 +648,70 @@ Table of Contents
    POST /v1/admin/cluster/join    - Section 14.3.
 
    /v1/admin/* operations REQUIRE the admin role (Section 5.3).
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-15-admin-grants · proposed 2026-10-29 · RATIFIED by the protocol owner 2026-10-29 ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-10-29 (proposed
+     2026-10-29, from a security review, and the live
+     grants API) per the amendment-governance SOP; now NORMATIVE.  Marker
+     retained for provenance. ]
+
+   GET    /v1/admin/grants        - list identities: fingerprint, name,
+                                    role, created, scope.  NEVER a token.
+   POST   /v1/admin/grants        - mint { name, role?, scope? } (role
+                                    defaults to writer) -> { token,
+                                    fingerprint }.  The token is returned
+                                    ONCE; the authority stores only a
+                                    one-way hash of it.
+   DELETE /v1/admin/grants?fingerprint=F | ?name=N
+                                  - revoke one identity.  A name held by
+                                    several identities -> 409 listing the
+                                    fingerprints; removing the LAST
+                                    identity -> 409 (the authority would
+                                    fall back to shared-token mode).
+
+   These require an UNSCOPED admin.  In a cluster the identity table is
+   replicated state: a change applies on every node, a joining node
+   receives the table, and no raw token is ever replicated.  An authority
+   in shared-token mode refuses the first grant via this API (it would
+   switch authentication mode live).
+====== END RATIFIED AMENDMENT · id=acp1-15-admin-grants ======
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-15-admin-spaces · proposed 2026-10-29 · RATIFIED by the protocol owner 2026-10-29 ======
+   [ AMENDMENT -- RATIFIED by the protocol owner 2026-10-29 (proposed
+     2026-10-29, from a security review: spaces could be created but
+     never reclaimed) per the amendment-governance SOP; now NORMATIVE.
+     Section 7 is unchanged: a space is still created on first use.
+     Marker retained for provenance. ]
+
+   GET    /v1/admin/spaces        - list the spaces that hold persisted
+                                    state: { space, open, empty?,
+                                    content? } per space.  A scoped admin
+                                    sees only the spaces its grant lists.
+   DELETE /v1/admin/spaces?space=S&confirm=S
+                                  - remove space S.  "confirm" MUST repeat
+                                    the name (400 otherwise).  The
+                                    authority MUST refuse (409, naming what
+                                    the space holds) to remove a space that
+                                    holds content: files or their version
+                                    history, blobs, documents or the record
+                                    of a deleted document, a directory
+                                    tree, mail, a lease ever issued (so a
+                                    fencing token never repeats), or a
+                                    quota setting.  A space holding only
+                                    events MAY be removed.  The default
+                                    space MUST NOT be removed.  Removing an absent
+                                    space succeeds with { dropped: false }
+                                    (retry-safe).  A scoped admin may remove
+                                    only a space its grant lists.
+
+   In a cluster a removal is replicated: the content check is made
+   against replicated state at the command's own time, so every node
+   decides alike, and a node that holds no state for S does nothing.
+   After a removal the name is free; using it again creates a new,
+   empty space (Section 7) whose event sequence starts again at 1.  A
+   client resuming an event stream of a removed space MUST start from
+   the beginning, not from a cursor it held before the removal.
+====== END RATIFIED AMENDMENT · id=acp1-15-admin-spaces ======
 
 ====== BEGIN RATIFIED AMENDMENT · id=acp1-15-gc-retained-history · proposed 2026-09-11 · RATIFIED by the protocol owner 2026-09-11 ======
    [ AMENDMENT -- RATIFIED by the protocol owner 2026-09-11 (proposed

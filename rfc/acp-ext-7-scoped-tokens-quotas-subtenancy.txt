@@ -594,6 +594,32 @@ Table of Contents
             already counts the EXPANDED recipient set).
          o  max_groups    -> creating a group beyond the cap yields 429.
 
+====== BEGIN RATIFIED AMENDMENT · id=ext7-5.1-max-mail · proposed 2026-10-29 · RATIFIED by the protocol owner 2026-10-29 ======
+      [ AMENDMENT -- RATIFIED by the protocol owner 2026-10-29 (proposed
+        2026-10-29, from a security review) per the
+        amendment-governance SOP; now NORMATIVE.  It adds one optional
+        quota dimension; it changes no existing field.  Marker retained
+        for provenance. ]
+
+      The Quota of Section 5.1 gains an OPTIONAL
+
+             "max_mail": <uint64>?   ; retained mailbox messages in the space
+
+      enforced as:
+
+         o  max_mail      -> a mail send (ACP/1 Section 10) that would
+            exceed the RETAINED cap yields 507 with { used, limit };
+            reading mail plus mail retention frees room.  Absent or 0 is
+            unbounded, as for every cap in this section.  The decision is
+            a function of replicated state, so every replica refuses the
+            same send, and a refused send does not consume its
+            Idempotency-Key.
+
+      "max_mail_fanout" is UNCHANGED: it remains the EXT-1 Section 6
+      group fan-out cap (recipients per group send) and does not bound
+      one-to-one mail.
+====== END RATIFIED AMENDMENT · id=ext7-5.1-max-mail ======
+
    5.3.  Advertisement.
 
       GET /v1/stats SHOULD report each configured quota alongside its

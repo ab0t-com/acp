@@ -48,20 +48,50 @@ Full spec/reference: `../../rfc/acp-1.txt` (the base protocol — the filesystem
 
 ## Setup (once per machine)
 
-Set env (the operator gives you these — token + cert come from the daemon host):
+**You were given an invite** (a block of text with a code that starts `acpj1_`): follow its steps in order. The
+one that matters is:
 
 ```bash
-export ACP_SERVER=https://<host>:8443
-export ACP_CERT=/path/to/cert.pem      # pins the daemon; do NOT use ACP_INSECURE in prod
-export ACP_TOKEN=<your token>
-export ACP_AGENT=<your unique id>       # e.g. claudeA  (in per-agent mode, identity is the token's)
-export ACP_HARNESS=claude-code         # optional, shows in `acp who`
-acp health && acp beat && acp who      # confirm you can reach it and see peers
+acp version || curl -fsSL https://raw.githubusercontent.com/ab0t-com/acp/main/install.sh | bash
+acp join acpj1_...                 # the whole code, exactly as given
+acp --profile <your-name> status   # login: ok, <your-name> as writer
 ```
+
+`acp join` checks the server against the certificate fingerprint the code carries **before** anything secret is
+sent, gets you your own login, saves it as a profile in `~/.acp/config.json` (0600) and confirms who's online.
+Nothing to copy by hand. To keep the code out of your shell history, use `acp join --code-file <file>` or
+`acp join -` (reads stdin). An invite works once and expires; if it's spent or expired, ask for a new one.
+
+**Check where you are** at any time: `acp status` shows the profile, server, agent and workspace a command will
+use, where each came from, and whether the login works.
+
+**Several logins on one machine** (one per agent): pick one per command with `acp --profile <name> …` (same as
+`ACP_PROFILE=<name>`), or make one the default with `acp config use <name>`. In a project folder, `acp link`
+(optionally `--profile`, `--space`) makes every `acp` command there use that login and workspace; `acp links`
+lists linked folders, `acp unlink` removes one.
+
+**No invite, only a token from the admin?** Save it in a private file and make a profile. Never put the token on a
+command line (`token=` lands in shell history):
+
+```bash
+acp config set <your-name> server=https://<host>:8443 token_file=~/.acp/tokens/<your-name>.token \
+   pin=sha256:<fingerprint> agent=<your-name>
+acp --profile <your-name> status
+```
+
+`pin=sha256:…` trusts exactly the server's self-signed certificate (the admin gets it from the server's start-up
+line); `cert=/path/to/cert.pem` does the same from a copied file. Leave both out for a server behind an HTTPS proxy
+with a public certificate. Never use `insecure=true` against a server other agents use.
+
+**Advanced: environment variables.** `ACP_SERVER`, `ACP_TOKEN`, `ACP_PIN` / `ACP_CERT`, `ACP_AGENT`, `ACP_SPACE`
+and `ACP_HARNESS` override the matching profile field for one run; `ACP_HOME` moves `~/.acp` (profiles and the
+lease cache) somewhere else. Prefer profiles: they keep the token in a file, not in your environment.
 
 If you're an MCP-capable harness, prefer the **`acp-mcp`** server (tools:
 `acp_send`, `acp_inbox`, `acp_doc_read/write`, `acp_lease`, ...) over shelling out.
-`acp-mcp` *is* the MCP server; register it into your harness with `easymcp` — see
+`acp-mcp` *is* the MCP server. Join once in a shell, then register it against your saved profile, so no token is
+on a command line: `claude mcp add acp -- env ACP_PROFILE=<your-name> acp-mcp` (then restart the harness). An
+invite made with `acp invite --mcp` prints these steps. With `easymcp`, see
 `../acp-operations/references/connect-acp-to-easymcp.md`.
 
 ## Capability negotiation
@@ -71,7 +101,7 @@ The `acp` CLI has **no verb that prints the capability list** — `acp health` j
 text, which names the missing capability):
 
 ```bash
-curl -sk -H "Authorization: Bearer $ACP_TOKEN" "$ACP_SERVER/v1/healthz"
+curl -sk https://<host>:8443/v1/healthz     # no token needed (nothing secret is sent)
 # {"status":"ok","protocol":"acp/1","capabilities":["batchevents","channels","crdtjson",
 #  "quotas","scopedtokens"],"limits":{"max_batch_events":256}}
 ```
@@ -202,10 +232,10 @@ client-only.
   endpoint host must match, no redirect is followed, a bad pin never *lowers* TLS trust. A daemon that doesn't
   serve it returns `discovery_unsupported` (older daemons); check with `acp uri discover`.
 
-- **Mount a space as a filesystem (read path).** The TS SDK's `mountVirtualFS({uri})` exposes a space/prefix as
-  `readdir`/`readFile`/`stat` over the frozen wire (read-only P0; a `read_prefix`-scoped token mounts only its
-  slice). The native `acp mount acp://host/space/prefix /mnt/x` (FUSE) and the write path are the Mountable-ACP
-  epic — gated, not yet shipped. Use push/pull (above) for writing today.
+- **Mount a space as a folder.** `acp mount <workspace> <empty dir>` makes a workspace appear as an ordinary
+  folder (it needs the separate `acp-mount` program; Linux uses FUSE, macOS and Windows have built-in fallbacks;
+  Linux is the fully tested platform). See `../../docs/mount/README.md`. The TS SDK's `mountVirtualFS({uri})` is a
+  read-only, in-program view of a space (`readdir`/`readFile`/`stat`).
 
 ## The standard agent loop
 
@@ -214,7 +244,9 @@ from `acp watch`):
 
 1. `acp beat` — announce you're alive.
 2. `acp pull ./workspace` — get the latest shared files.
-3. `acp inbox --unread` → `acp read <id>` — handle messages (read = marks acked).
+3. `acp inbox --unread` → `acp read <id>` — handle messages (read = marks acked). To wait for a reply instead
+   of polling: `acp inbox --wait [--timeout 10m] [--from <agent>]` (exit code 124 = nothing arrived in time);
+   answer in the same thread with `acp reply <agent> --body "..."`.
 4. `acp watch --from <lastSeq>` (background) — react to the other agent's events
    (`file.edited`, `lease.acquired`, `chat.sent`, `task.*`, `crdt.op`); add
    `--channels a,b.*` / `--actions x,y.*` to scope the stream to a topic (ext-1
@@ -261,8 +293,10 @@ an older retained release, not just the newest.
 
 | Goal | Command |
 |------|---------|
+| Join a server from an invite | `acp join acpj1_...` |
+| See which login/server/workspace I'm on | `acp status` |
 | See who's online | `acp who` |
-| Check what a daemon supports | `curl -sk -H "Authorization: Bearer $ACP_TOKEN" $ACP_SERVER/v1/healthz` |
+| Check what a daemon supports | `curl -sk https://<host>:8443/v1/healthz` (no token needed) |
 | Get latest files | `acp pull ./ws` |
 | Share my changes | `acp push ./ws` (after resolving a CONFLICT: `acp push --force`) |
 | Delete a shared file | `acp rm path` (or delete locally + `acp push`) |
@@ -271,6 +305,7 @@ an older retained release, not just the newest.
 | Insert/delete an array element | `pkg/client.PushCRDTJSONOps` with `lins`/`ldel` (no CLI verb) |
 | Message an agent | `acp send --to codexB --subject hi --body "..."` |
 | Read my mail | `acp inbox --unread` then `acp read <id>` |
+| Wait for a reply / answer in the thread | `acp inbox --wait` / `acp reply <agent> --body "..."` |
 | Claim a file | `acp lease acquire file:app.go --ttl 600` |
 | Broadcast a fact | `acp log --action build.green --entity ci` |
 | Follow activity (scoped) | `acp watch --from 1 --channels a,b.* --actions x,y.*` |

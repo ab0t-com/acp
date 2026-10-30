@@ -558,6 +558,25 @@ Table of Contents
          "deny": a value a binary cannot enforce never loads as an
          unenforced no-op).
 
+====== BEGIN RATIFIED AMENDMENT · id=ext34-4.5.3-allow-cluster · proposed 2026-10-29 · RATIFIED by the protocol owner 2026-10-29 ======
+      [ AMENDMENT -- RATIFIED by the protocol owner 2026-10-29 (proposed
+        2026-10-29, from a security review)
+        per the amendment-governance SOP; now NORMATIVE.  Marker retained
+        for provenance. ]
+
+      4.5.3.1.  The "cluster" surface.  "allow" gains a second known
+         value, "cluster": the authority to change cluster membership
+         (ACP/1 Section 14.3, /v1/admin/cluster/join and .../leave).
+         Cluster membership is refused to every SCOPED grant -- a space-
+         or path-scoped admin administers its own slice, never the
+         cluster every tenant depends on -- unless that admin grant
+         carries allow ["cluster"].  An UNSCOPED admin always has it.
+         "cluster" is meaningful only on an admin grant; a binary MUST
+         refuse it at mint and load on any other role.  A join MUST be
+         refused when the candidate's raft address is unreachable,
+         conflicts with an existing member, or would exceed the voter cap.
+====== END RATIFIED AMENDMENT · id=ext34-4.5.3-allow-cluster ======
+
       4.5.4.  Minting (informative).
 
             coordd -mkagent bot-7 -role writer              ; denied

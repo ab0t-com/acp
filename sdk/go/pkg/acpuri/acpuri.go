@@ -793,6 +793,8 @@ type Profile struct {
 	Default bool
 	// Cert is the pinned daemon cert path (PEM); "" = system roots.
 	Cert string
+	// Pin is "sha256:<hex>" of the daemon's leaf cert (the cert_fingerprint form); "" = none.
+	Pin string
 	// Insecure skips TLS verification when Cert is "" (dev only) — the Go SDK's
 	// client.New flag; the TS Profile has no equivalent (its fetch trusts the platform roots).
 	Insecure bool
@@ -1006,7 +1008,7 @@ func ClientFor(u *URI, profiles ProfileStore) (*client.Client, *Resolved, *Profi
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	c, err := client.New(resolved.BaseURL, profile.Token, profile.Agent, profile.Cert, profile.Insecure)
+	c, err := client.NewTLS(resolved.BaseURL, profile.Token, profile.Agent, client.TLSOptions{CertPath: profile.Cert, Pin: profile.Pin, Insecure: profile.Insecure})
 	if err != nil {
 		return nil, nil, nil, err
 	}

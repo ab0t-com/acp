@@ -6,17 +6,17 @@
 # install.sh fetches). The source is PRIVATE — NEVER add a build/compile stage or COPY source here.
 # If you need a source build, that is the maintainer-only acp/Dockerfile, not this file.
 #
-#   Pull:   docker pull ab0tcom/acp:v0.2.0        # or :latest
-#   Build:  docker build --build-arg VERSION=v0.2.0 -t ab0tcom/acp:v0.2.0 .
-#   Run:    docker run -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.0 -hosts <host>,<ip>
+#   Pull:   docker pull ab0tcom/acp:v0.2.4        # or :latest
+#   Build:  docker build --build-arg VERSION=v0.2.4 -t ab0tcom/acp:v0.2.4 .
+#   Run:    docker run -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.4 -hosts <host>,<ip>
 #   Full run/TLS/compose guide: docs/DOCKER.md
 #
 # Server DB mode (ACPDB): build the server variant — it runs coordd-server out of the box:
 #   docker build --build-arg ARCHIVE=acp-server --build-arg DAEMON=coordd-server \
-#     --build-arg BINS="coordd-server acp-server acp-mcp-server" -t ab0tcom/acp:v0.2.0-server .
-#   docker run -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.0-server -hosts <host>,<ip>
+#     --build-arg BINS="coordd-server acp-server acp-mcp-server" -t ab0tcom/acp:v0.2.4-server .
+#   docker run -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.4-server -hosts <host>,<ip>
 FROM alpine:3.20
-ARG VERSION=v0.2.0
+ARG VERSION=v0.2.4
 ARG REPO=ab0t-com/acp
 ARG ARCHIVE=acp                        # release bundle prefix: "acp" (local) | "acp-server" (server DB mode)
 ARG BINS="coordd acp acp-mcp"          # local bundle → coordd acp acp-mcp; server → coordd-server acp-server acp-mcp-server
@@ -48,8 +48,10 @@ RUN printf '#!/bin/sh\nexec "${ACP_DAEMON:-coordd}" "$@"\n' > /usr/local/bin/acp
 
 USER acp
 WORKDIR /data
-# coordd writes its shared token + self-signed cert into /data on first run and keeps all space
-# state here — mount a named volume to persist across restarts.
+# On first run with a NEW /data, coordd makes an admin login "owner" (token in /data/owner.token,
+# 0600; `docker compose exec -T acp cat /data/owner.token`) plus its self-signed cert, and keeps all
+# space state here — mount a named volume to persist across restarts. Append `-shared-token` to the
+# command for the old one-shared-key start (/data/token). An existing volume keeps its mode.
 VOLUME ["/data"]
 EXPOSE 8443
 # Liveness: the no-auth health endpoint (self-signed TLS → skip verification).

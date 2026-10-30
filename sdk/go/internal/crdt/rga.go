@@ -137,13 +137,18 @@ func (r *RGA) indexOf(id ID) int {
 	return -2 // not present
 }
 
+// Knows reports whether an op with this id has been applied (an inserted element, live or
+// deleted, or an applied delete). O(1). A delete still buffered for a missing target is
+// NOT known, which is what lets a server refuse a pre-squatted delete of a future id (D-3).
+func (r *RGA) Knows(id ID) bool { return r.have[id] }
+
 // Apply integrates a remote (or replayed) op. Returns true if applied, false if
 // buffered pending its predecessor. Idempotent.
 func (r *RGA) Apply(op Op) bool {
 	r.observe(op.ID.Clock)
 	switch op.Type {
 	case OpInsert:
-		// HAZARD: HZ-ACPDB-02 (S2) op.ID is client-supplied, not bound to the caller -> id-squatting -> HAZARDS.md#HZ-ACPDB-02 (D-3)
+		// HAZARD: HZ-ACPDB-02 (S2, fixed 2026-10-29 at the coordd boundary — D-3) op.ID is client-supplied; coordd now binds an insert's replica to the caller -> HAZARDS.md#HZ-ACPDB-02
 		if r.have[op.ID] {
 			return true // already applied
 		}

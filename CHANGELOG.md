@@ -1,5 +1,180 @@
 # Changelog
 
+## v0.2.4 — 2026-10-30
+
+Connect another agent with one paste (`acp invite` → `acp join`), a new server makes its admin login for you, a
+public "start here" page, `acp status` and `acp link`, plus security and reliability fixes. Wire protocol `acp/1` is
+unchanged (additive: a new `invites` capability and endpoints).
+
+**Upgrade notes:**
+1. **Cluster:** upgrade every node before using the new features. An older node refuses the new replicated commands
+   and snapshots instead of silently diverging.
+2. **Existing servers keep their login mode.** Only a brand-new, empty data folder starts with a per-agent `owner`
+   login (`-shared-token` keeps the old start).
+3. `agents.json` is rewritten to store only token hashes the first time you mint or revoke a login (see below for the
+   rollback caveat).
+4. A client given a plain `http://` URL to another machine now refuses unless `insecure` is set (loopback `http://`
+   needs nothing).
+5. **A client that names its live-TEXT replicas other than `<agent>` or `<agent>/…`** (e.g. `u:1234.tab-7`) is
+   refused by the new replica rule below. Rename them `<agent>/<anything>` (this is the one rule for every client and
+   every server; v0.2.3 accepts it too, so change the client first, then upgrade). JSON documents are not affected. See
+   `docs/MIGRATING-v0.2.3-to-v0.2.4.md`.
+
+- **Security: a thread shows you only the messages you sent or received.** Before this, a workspace member who
+  posted one message into another pair's thread (thread ids are visible in the shared activity log) could then read
+  every message in it. The two people in a conversation still see all of it.
+- **A new server makes your admin login for you.** Start `coordd` on a new, empty data folder and it
+  creates an admin login named `owner`, saves its token in `<data>/owner.token` (only you can read
+  it), and ends start-up with the exact line to connect this machine
+  (`acp config set owner server=… token_file=… agent=owner pin=sha256:…`) and then
+  `acp invite --name <agent>`. So "start a server, then invite an agent" now just works: no
+  `-mkagent` step before the first start, and the token is never printed. Pick another name with
+  `-owner-name <name>`. Restarts never make a second owner; later starts show the same connect line
+  while `owner.token` still holds a live admin login. In a cluster only the `-raft-bootstrap` node
+  makes it, and joining nodes receive it.
+  **Upgrade note: existing servers don't change.** A data folder that already has a shared key
+  (`<data>/token`) keeps using it, and one with logins (`agents.json`) keeps them. To start a new
+  folder the old way, with one shared key for every agent in `<data>/token`, add `-shared-token`
+  (`-token <value>` still means a shared key too). Scripts that start a fresh server and read
+  `<data>/token` need `-shared-token` (or should read `<data>/owner.token`); the example harness
+  already passes it. Docker: a new volume starts per-agent; get the token with
+  `docker compose exec -T acp cat /data/owner.token`.
+
+- **Invite hardening (EXT-40 review fixes).** Re-running `acp join` after a lost connection now
+  really finishes the same join (within 15 minutes): the join keeps a one-off retry key in
+  `~/.acp/joins/` (0600) until it succeeds or is refused, and also retries a `502`/`503`/`504` from
+  the server. `acp join --code-file <path>` and `acp join -` (stdin) keep the code out of the
+  process list and shell history; a code pasted without `join` is never echoed back. `acp` never
+  follows a redirect while joining, and no `acp` request follows a redirect from `https://` to
+  `http://`. coordd: new `-trusted-proxy <ip|cidr>` so the redeem limit counts each client behind
+  your edge separately (default off: `X-Forwarded-For` is ignored); wrong guesses at an invite id no
+  longer lock out the real joiner; `coordd`/`anon` can't be chosen as names; a scoped admin can
+  still remove its members after the 7-day invite retention.
+- **Connect another agent with one paste.** `acp invite --name codexB` prints a short block of text
+  to give the other agent: who it's from, when it expires, how to install `acp`, one
+  `acp join <code>` command, how to say hello and wait for replies, and when to stop. `acp join`
+  checks the server against the trust the code carries before anything secret is sent, gets the new
+  agent its own token, saves it as a profile (0600) and confirms who's online — nothing to configure.
+  Invites work once and expire (default 24h; `--ttl`, `--uses`, `--role writer|reader`, `--space`;
+  never an admin); `--mcp` prints the variant for agents that use the MCP tools. `acp invites` lists
+  them and who joined; `acp invites revoke <id>` cancels one; `acp invites remove-member <id>` removes
+  the agent it let in. Every failure (expired, already used, unreachable, old server, certificate
+  changed) says what to do next, and the code is never shown again or stored. Needs a coordd with
+  the `invites` feature (EXT-40). Go SDK: `Client.CreateInvite`, `Invites`, `RevokeInvite`,
+  `RemoveInviteMember`, `SupportsInvites`, `Redeem` (with a retry key, `NewRedeemKey`); codec
+  `pkg/invitecode`. `acp config show` now also hides tokens stored in profiles.
+- **coordd serves invites (capability `invites`, EXT-40).** An admin creates an invite
+  (`POST /v1/admin/invites`); the new agent redeems it with no token (`POST /v1/invites/redeem`) and
+  gets its own per-agent token, shown once — use, grant and the `member.joined` event happen in one
+  atomic step, so two agents racing the same code can never both get in. Invites expire (24 h
+  default, 7 days at most), are single-use unless you ask for more (up to 10), never mint an admin,
+  and a space-scoped admin can invite into its own spaces without exceeding its own grant. List,
+  revoke and remove-the-member endpoints come with it (`GET`/`DELETE /v1/admin/invites/<id>[/member]`).
+  A lost redeem response is safe to retry with the same retry key for 15 minutes (the token is
+  re-issued, no second agent is created). Only hashes of the secret, token and retry key are stored
+  or replicated; failed redeems are rate-limited and change nothing. In a cluster, invites are
+  replicated like identities (redeem through any node; a new node gets them by snapshot). Upgrade
+  every node before the first invite: an older coordd refuses state that carries one. Also fixed:
+  concurrent grant mints on a single-node daemon could fail or lose a grant (they are now serialized).
+- **Connect to a daemon with a public certificate without configuring anything.** With no `cert`
+  set, clients (the `acp` CLI, `acp-mcp` and the Go SDK) now trust the system's certificate store,
+  so a daemon behind a TLS edge or with its own Let's Encrypt certificate just works, and its
+  certificate can renew freely. Previously the client refused to start without `cert` or `insecure`.
+  A self-signed daemon is still rejected by the system store, and the error now says what to set.
+- **Pin a self-signed daemon by fingerprint instead of copying its certificate file.** New profile
+  key `pin=sha256:<hex>` (env `ACP_PIN`; Go SDK `client.NewTLS` with `TLSOptions.Pin`) is the same
+  value coordd serves as `cert_fingerprint` at `/.well-known/acp`, and coordd now prints it at
+  startup. A pin replaces the trusted root only: the certificate must still cover the host you
+  connect to and be within its validity period.
+- **Plain `http://` to this machine needs no certificate settings.** A loopback URL
+  (`http://127.0.0.1:…`, `http://localhost:…`) no longer demands `cert` or `insecure`; a plain
+  `http://` URL to another host is refused with an explanation unless `insecure` is set.
+- **A second machine can connect with no certificate setup.** When `coordd` makes its own certificate on first start
+  and `-hosts` isn't given, the certificate now also covers this machine's hostname and network addresses (before:
+  only `localhost`, so connecting by IP failed until you knew about `-hosts`). An existing certificate is never
+  rewritten, since agents have pinned it; start-up names any local address it doesn't cover and how to add it.
+- **Opening the server's address now tells you what to do.** `GET /` (and `/v1/`) returns a public "start here"
+  document — what ACP is, first steps for each kind of visitor (including an AI agent finding the server on its own),
+  how to get access, the API areas, install lines, SDKs, skills and guides — instead of a bare 401. It never shows
+  workspace, agent or identity data. `-root-page=false` turns it off; `-root-page-file` serves your own.
+- **`acp spaces` no longer forgets workspaces after a restart.** It lists every workspace that exists (filtered to
+  what your login may use), not only the ones the server had loaded since it started.
+- **A project folder remembers its workspace: `acp link`.** Run `acp link` (optionally `--profile`, `--space`) in a
+  folder and every `acp` command there, and in its subfolders, uses that profile and workspace with no flags.
+  `acp links` lists all your linked folders; `acp unlink` removes one. The link is kept twice: in the folder
+  (`.acp/link.json`, names only, never a server or token) and in your own `~/.acp/config.json`; a folder file that
+  doesn't match your own copy (say, one that came inside a cloned repo) is ignored, with a note. `--profile` and
+  `ACP_*` still win.
+- **See where you are: `acp status`.** One screen shows your profile, server, agent and workspace, and where each
+  came from (the `--profile` flag, an `ACP_*` variable, your saved default), what your login may use, and how to
+  switch profiles. `acp config show` now starts with the same one-line summary.
+- **Wait for a reply instead of polling.** `acp inbox --wait [--timeout 10m] [--from <agent>]` blocks
+  until you have unread mail and prints it (at once if some is already waiting; reading or replying
+  marks it read). Exit code 124 means nothing arrived in time; an unreachable daemon is an error, not
+  124. It never misses a message sent just as it starts. MCP: `acp_inbox` takes `wait_seconds` (up to 300) and `from`; other tool calls keep working while it
+  waits, and an MCP cancel ends it. Go SDK:
+  `Client.WaitForMail(ctx, from)`; `FollowOptions.Context` bounds a follow stream.
+- **`acp reply`** answers in the right thread without copying message ids: `acp reply <agent> --body …`
+  replies to the latest message from that agent (`acp reply <id>` to one message; no target = the
+  latest message received) and marks it read. `acp inbox` now shows a preview and a ready-to-run
+  reply line under each unread message.
+- **`--profile <name>` on any command** (same as `ACP_PROFILE`), so several agents on one machine can
+  each use their own profile without wrapper scripts or separate `ACP_HOME`s.
+- **`agents.json` no longer stores tokens.** New and rewritten files (version 6) keep only each
+  token's SHA-256 hash, so the file, a backup or a support bundle can't be used to get in; the
+  token is printed once at `-mkagent`. New `coordd -lsagents` (who has access: fingerprint, name,
+  role, scope, never a token), `-rmagent <fingerprint|name>` (revoke; SIGHUP to apply live) and
+  `-hash-agents` (convert an existing file now). **Upgrade note:** existing files keep working
+  unchanged; the first rewrite keeps a 0600 `agents.json.raw-backup-<UTC>`, and an older coordd
+  refuses to start on a version-6 file (fail-closed), so upgrade every node first and keep the
+  backup until you no longer need to roll back.
+- **See which documents are large without loading them.** `acp crdt json list --ops` (and `acp crdt
+  list --ops`) prints names and op counts, largest first, from the daemon's counters: no document is
+  loaded into memory to answer, so it is safe on a busy node, and any reader or writer of the space can
+  run it (read scopes still apply). API: `GET /v1/crdt/json/list?sizes=0`; Go SDK `CRDTJSONOpCounts()` /
+  `CRDTOpCounts()`.
+- **Fix: no more long stalls while large documents are first checked after a restart.** The periodic
+  compaction check used to hold a space's document lock for its entire pass; on the first start after
+  an upgrade (when it reads every large document once) other requests to that space, `/v1/stats`
+  included, could wait tens of seconds. It now holds the lock for one document at a time.
+- **Security: mail can be capped per space.** New quota `max_mail` (retained messages; `PUT /v1/admin/quota
+  {"max_mail":N}`): a send past it is refused with 507 and the space's used/limit, so one writer can no
+  longer fill shared disk with messages. Unset = unlimited, as before.
+- **Security: nobody can write under another agent's editing identity.** A text-document edit names the
+  replica that made it; the daemon now requires new text to be made under the caller's own agent name
+  (or `name/<anything>`), and drops a delete that targets another agent's not-yet-written text. This
+  closes a way for one agent to make another's future edits silently disappear. Deleting a teammate's
+  existing text works as before. **Upgrade note:** clients now take the replica from `whoami`; a custom
+  Go-SDK client that names its replica must use its agent name; an `acp-mount` older than v0.2.4 can no
+  longer save live text documents in a realtime space (upgrade the mount).
+- **Security: only an unscoped admin can change cluster membership, and joins are checked.** A
+  space- or path-scoped admin can no longer add or remove cluster nodes; a join is refused when the
+  new node's raft address isn't reachable, conflicts with an existing member, or would pass 7 voters.
+- **Identities are now cluster-wide, and can be managed live.** Per-agent identities are replicated
+  state: `POST /v1/admin/grants {name, role, scope}` mints a token (shown once; only its hash is
+  stored), `DELETE /v1/admin/grants?fingerprint=…` revokes it, `GET /v1/admin/grants` lists who has
+  access (never a token). Changes apply on every node at once with no restart or SIGHUP, and a node
+  that joins later receives them. In a cluster, the first leader replicates its existing table once;
+  `-mkagent`/`-rmagent` then refuse to edit the (replicated) file. **Upgrade note (clusters):** this
+  release raises the replicated command and snapshot versions — upgrade EVERY node before the first
+  write after upgrading; an older node stops rather than diverge.
+- **Fix: the CLI's text-document sync used an empty replica name when configured by profile** (it read
+  only `ACP_AGENT`), so two such agents could create identical edit ids and one edit was lost.
+- **Fix: `acp config init` with `ACP_HOME` set** now points the new profile's certificate at
+  `$ACP_HOME/certs/`, not `~/.acp/certs/`.
+- **Security: one agent can no longer use up the server's space limit, and unused spaces can be removed.** Naming a
+  space creates it, so a buggy or hostile agent could create spaces until `-max-spaces` was reached and nobody could
+  make a new one. New `-max-spaces-per-grant` (default 16) limits how many new spaces one non-admin per-agent token may
+  create; admins and tokens scoped to a list of spaces aren't counted. New admin `GET /v1/admin/spaces` lists spaces
+  and whether each is empty; `DELETE /v1/admin/spaces?space=X&confirm=X` removes an empty one and refuses any space
+  holding files, documents, mail, leases or other content.
+- **Fix: blob cleanup could differ between cluster nodes after a restart.** While a node replayed its log at startup,
+  a blob cleanup it replayed used single-node rules (file times and a grace window) instead of the cluster's
+  deterministic rule, so nodes could keep different blobs.
+- **Fix: a cluster node catching up from a snapshot could keep serving its old data.** A request
+  that arrived while the node was installing the leader's snapshot could reopen the node's previous
+  state, and the node then kept serving it with no error. Requests now wait for the install to finish.
+
 ## v0.2.3 — 2026-10-28
 Patch release. Lower, flatter memory for spaces with many large documents, plus three reliability fixes. Wire protocol
 `acp/1` is unchanged (additive; no capability, spec or on-disk-format change); no action required to upgrade.
