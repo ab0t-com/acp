@@ -832,7 +832,7 @@ func (c *Client) Ack(id string) error {
 }
 func (c *Client) Thread(id string) ([]wire.Message, error) {
 	var out []wire.Message
-	return out, c.do("GET", "/v1/mail/thread?id="+id, nil, &out)
+	return out, c.do("GET", "/v1/mail/thread?id="+url.QueryEscape(id), nil, &out)
 }
 
 // --- leases ---
@@ -975,16 +975,36 @@ func (c *Client) Commit(req wire.CommitRequest) (wire.Manifest, error) {
 // compaction barrier. If the doc was compacted (epoch advanced), the call fails
 // with a 409 APIError (Conflict) whose Current is the new epoch — resync first.
 func (c *Client) PushCRDTOps(doc string, ops []crdt.Op, epoch int) (int, int, error) {
+	res, err := c.PushCRDTOpsResult(doc, ops, epoch)
+	return res.Total, res.Epoch, err
+}
+
+// CRDTPushResult is the full answer to a text-document push (acp-1 §12.3 and the
+// §12.3.1 accounting, v0.2.5). Dropped counts ops the server did NOT apply and never
+// will from this push: a delete of another agent's text the document does not hold
+// (it cannot be told apart from erasing that agent's future text). Pull the document
+// and, if the text is there now, push the delete again. Pending counts ops that were
+// stored but wait for text that has not arrived (an insert's left neighbour or a
+// delete's target); they apply by themselves when it lands, so don't assume they are
+// visible yet. Both are 0 when the server leaves them out (every older server).
+type CRDTPushResult struct {
+	Doc     string `json:"doc"`
+	Total   int    `json:"total"`
+	Epoch   int    `json:"epoch"`
+	Dropped int    `json:"dropped,omitempty"`
+	Pending int    `json:"pending,omitempty"`
+}
+
+// PushCRDTOpsResult is PushCRDTOps returning the whole CRDTPushResult, including how
+// many ops were dropped or are pending.
+func (c *Client) PushCRDTOpsResult(doc string, ops []crdt.Op, epoch int) (CRDTPushResult, error) {
 	body := map[string]any{"doc": doc, "ops": ops}
 	if epoch >= 0 {
 		body["epoch"] = epoch
 	}
-	var out struct {
-		Total int `json:"total"`
-		Epoch int `json:"epoch"`
-	}
+	var out CRDTPushResult
 	err := c.do("POST", "/v1/crdt/ops", body, &out)
-	return out.Total, out.Epoch, err
+	return out, err
 }
 
 // PullCRDTOps fetches ops with index >= from, the doc's total op count, and its
@@ -1010,7 +1030,7 @@ func (c *Client) CRDTText(doc string) (string, int, error) {
 		Text  string `json:"text"`
 		Total int    `json:"total"`
 	}
-	err := c.do("GET", "/v1/crdt/doc?doc="+doc, nil, &out)
+	err := c.do("GET", "/v1/crdt/doc?doc="+url.QueryEscape(doc), nil, &out)
 	return out.Text, out.Total, err
 }
 
@@ -1133,7 +1153,7 @@ func (c *Client) CRDTJSONDoc(doc string) (json.RawMessage, int, int, error) {
 		Total int             `json:"total"`
 		Epoch int             `json:"epoch"`
 	}
-	err := c.do("GET", "/v1/crdt/json/doc?doc="+doc, nil, &out)
+	err := c.do("GET", "/v1/crdt/json/doc?doc="+url.QueryEscape(doc), nil, &out)
 	return out.JSON, out.Total, out.Epoch, err
 }
 
@@ -1324,7 +1344,10 @@ func (c *Client) Spaces() (map[string]any, error) {
 }
 
 // AdminSpace is one row of AdminSpaces: a space with persisted state. Content and
-// Empty are set only when the space is loaded on the answering node.
+// Empty are set only when the space is loaded on the answering node (Open); for a
+// space not loaded since that node started, both are absent — UNKNOWN, not "has
+// content" and not "empty". DropSpace still checks such a space for real. Every
+// non-zero Content count blocks removal, events included (v0.2.5).
 type AdminSpace struct {
 	Space   string         `json:"space"`
 	Open    bool           `json:"open"`
@@ -1337,6 +1360,18 @@ type AdminSpace struct {
 func (c *Client) AdminSpaces() ([]AdminSpace, error) {
 	var out []AdminSpace
 	return out, c.do("GET", "/v1/admin/spaces", nil, &out)
+}
+
+// DropSpaceDiscardingEvents is DropSpace for a space whose only content is its event log:
+// events is the space's exact event count (the 409 refusal states it), so its history is
+// discarded only on purpose (v0.2.5).
+func (c *Client) DropSpaceDiscardingEvents(space string, events int) (dropped bool, err error) {
+	var out struct {
+		Dropped bool `json:"dropped"`
+	}
+	q := url.QueryEscape(space)
+	err = c.do("DELETE", "/v1/admin/spaces?space="+q+"&confirm="+q+"&discard_events="+strconv.Itoa(events), nil, &out)
+	return out.Dropped, err
 }
 
 // DropSpace removes an EMPTY space (admin). The daemon refuses (409) a space that
@@ -1368,7 +1403,7 @@ func (c *Client) Compact(doc string) (int, error) {
 	}
 	path := "/v1/admin/compact"
 	if doc != "" {
-		path += "?doc=" + doc
+		path += "?doc=" + url.QueryEscape(doc)
 	}
 	err := c.do("POST", path, nil, &out)
 	return out.Dropped, err

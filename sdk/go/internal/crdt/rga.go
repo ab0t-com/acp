@@ -206,8 +206,13 @@ func (r *RGA) drainPending() {
 				r.integrate(elem{id: op.ID, originLeft: op.OriginLeft, val: runeOf(op.Val)})
 				r.have[op.ID] = true
 			} else {
-				if i := r.indexOf(op.ID); i >= 0 {
+				// The SAME guarded mutation as Apply's delete branch (and the TS engine's
+				// drainPending): tombstone once, live-- once. Pre-fix this branch set the
+				// flag without live--, so a delete that arrived before its target left
+				// LiveCount one too high (HZ-ACPDB-44, Docs investigation D3).
+				if i := r.indexOf(op.ID); i >= 0 && !r.els[i].deleted {
 					r.els[i].deleted = true
+					r.live--
 				}
 				r.have[op.ID] = true
 			}

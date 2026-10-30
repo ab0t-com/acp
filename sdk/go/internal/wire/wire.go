@@ -196,11 +196,14 @@ type VersionInfo struct {
 
 // PathVersion is one element of GET /v1/history?path= (ext-33 §4.7.3): a
 // retained version at which the path's entry differs from the previous
-// retained record. Hash/Size/Mtime are absent when Deleted.
+// retained record. Hash/Size/Mtime are absent when Deleted. Note is the commit
+// note of the version record it names (EXT-42 W1.4, additive and OPTIONAL:
+// absent when the commit had none; an older authority never sends it).
 type PathVersion struct {
 	Version   uint64  `json:"version"`
 	At        string  `json:"at,omitempty"`
 	Actor     string  `json:"actor,omitempty"`
+	Note      string  `json:"note,omitempty"`
 	Hash      string  `json:"hash,omitempty"`
 	Size      *int64  `json:"size,omitempty"`
 	Mtime     string  `json:"mtime,omitempty"`

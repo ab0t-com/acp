@@ -7,7 +7,7 @@
 // the operation type in the SDK signatures AND generate correct operations
 // locally. The typical authoring flow:
 //
-//	doc := crdt.New("replica-id")     // a local RGA replica
+//	doc := crdt.New("alice/editor-1") // a local replica named <your agent id> or <agent>/<suffix> (the server refuses other names)
 //	doc.Apply(peerOp)                 // fold in ops pulled from the daemon
 //	ops := doc.GenerateOps("new full text")  // diff -> ops to push
 //	// client.PushCRDTOps(name, ops, epoch)

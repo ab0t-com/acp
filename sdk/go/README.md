@@ -198,7 +198,7 @@ Many editors converge on one document with no locks and no lost updates. You kee
 a local replica (`crdt.RGA`), fold in ops you pull, and push ops you generate.
 
 ```go
-doc := crdt.New("replica-A")                 // stable, unique replica id per client
+doc := crdt.New("alice/editor-1")            // your agent id, or `<agent>/<suffix>` (one per session); the server refuses other names
 
 ops, total, epoch, err := c.PullCRDTOps("notes.txt", 0)
 for _, op := range ops {

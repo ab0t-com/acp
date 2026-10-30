@@ -200,3 +200,112 @@ func TestLiveCountIsConstantTime(t *testing.T) {
 		t.Fatalf("large doc LiveCount=%d, want 2000", large.LiveCount())
 	}
 }
+
+// TestLiveCountDrainedDeleteIsCounted is the inverted proof of HZ-ACPDB-44 (Docs
+// investigation D3): a delete that arrives BEFORE its target is buffered, then drained
+// by drainPending when the insert lands. drainPending's delete branch used to set the
+// tombstone without live--, so every such delete left LiveCount one too high — and
+// Go disagreed with the TS engine, which decrements on drain. The counter must be
+// exact in every delivery order, and a re-delivered delete must not double-count.
+func TestLiveCountDrainedDeleteIsCounted(t *testing.T) {
+	x := ID{Clock: 1, Replica: "a"}
+	y := ID{Clock: 2, Replica: "a"}
+	ins := func(id, origin ID, v string) Op { return Op{Type: OpInsert, ID: id, OriginLeft: origin, Val: v} }
+	del := func(id ID) Op { return Op{Type: OpDelete, ID: id} }
+
+	// 1. delete first, then its target: integrates (live++) and drains (live--).
+	r := New("s")
+	if r.Apply(del(x)) {
+		t.Fatal("a delete of an absent target must buffer, not apply")
+	}
+	r.Apply(ins(x, Zero, "x"))
+	if r.Text() != "" || r.LiveCount() != 0 || r.PendingLen() != 0 {
+		t.Fatalf("after drain: text=%q LiveCount=%d pending=%d, want \"\"/0/0", r.Text(), r.LiveCount(), r.PendingLen())
+	}
+	assertLive(t, r, "after a drained delete")
+	// Re-delivery of the same delete (at-least-once channels, op-log replay) is a no-op.
+	r.Apply(del(x))
+	assertLive(t, r, "after re-delivering the drained delete")
+	if r.LiveCount() != 0 {
+		t.Fatalf("re-delivered delete drove LiveCount to %d, want 0", r.LiveCount())
+	}
+
+	// 2. a chain where BOTH the insert and the delete of y wait on x: x lands last.
+	r2 := New("s")
+	r2.Apply(ins(y, x, "y")) // origin x absent -> buffered
+	r2.Apply(del(y))         // target y absent -> buffered
+	r2.Apply(ins(x, Zero, "x"))
+	if r2.Text() != "x" || r2.PendingLen() != 0 {
+		t.Fatalf("chain: text=%q pending=%d, want \"x\"/0", r2.Text(), r2.PendingLen())
+	}
+	assertLive(t, r2, "after draining an insert and its delete together")
+	if r2.LiveCount() != 1 {
+		t.Fatalf("chain: LiveCount=%d, want 1", r2.LiveCount())
+	}
+
+	// 3. a delete that never finds its target stays buffered and never touches the counter.
+	r3 := New("s")
+	r3.GenerateOps("ab")
+	r3.Apply(del(ID{Clock: 99, Replica: "ghost"}))
+	assertLive(t, r3, "with a delete still buffered")
+	if r3.LiveCount() != 2 || r3.PendingLen() != 1 {
+		t.Fatalf("ghost delete: LiveCount=%d pending=%d, want 2/1", r3.LiveCount(), r3.PendingLen())
+	}
+
+	// 4. the same op set in every order converges on the same count (the §17 property
+	// the compaction gate needs: replicas that saw different orders agree).
+	ops := []Op{ins(x, Zero, "x"), ins(y, x, "y"), del(x), del(y)}
+	perms := [][]int{{0, 1, 2, 3}, {3, 2, 1, 0}, {2, 0, 3, 1}, {1, 3, 0, 2}, {3, 1, 2, 0}}
+	for _, p := range perms {
+		rp := New("p")
+		for _, i := range p {
+			rp.Apply(ops[i])
+		}
+		assertLive(t, rp, "order %v", p)
+		if rp.LiveCount() != 0 || rp.PendingLen() != 0 {
+			t.Fatalf("order %v: LiveCount=%d pending=%d, want 0/0", p, rp.LiveCount(), rp.PendingLen())
+		}
+	}
+}
+
+// TestLiveCountUnderBufferedDeletes closes the gap TestLiveCountUnderConcurrentMerge
+// left: its streams were inserts (and deletes of already-present targets), so the
+// delete branch of drainPending was never exercised and the drift survived. Here each
+// side's deletes are delivered BEFORE the inserts they target, under duplicates.
+func TestLiveCountUnderBufferedDeletes(t *testing.T) {
+	a, b := New("A"), New("B")
+	aIns := a.GenerateOps("alpha")
+	aDel := a.GenerateOps("ala") // tombstones p,h
+	bIns := b.GenerateOps("beta")
+	bDel := b.GenerateOps("ba") // tombstones e,t
+	// Deletes first (buffered), twice; then the inserts, reversed (mostly buffered).
+	for _, stream := range [][]Op{aDel, aDel, rev(aIns)} {
+		for _, op := range stream {
+			b.Apply(op)
+		}
+	}
+	for _, stream := range [][]Op{bDel, bDel, rev(bIns)} {
+		for _, op := range stream {
+			a.Apply(op)
+		}
+	}
+	assertLive(t, a, "on A after buffered deletes")
+	assertLive(t, b, "on B after buffered deletes")
+	if a.PendingLen() != 0 || b.PendingLen() != 0 {
+		t.Fatalf("pending not drained: A=%d B=%d", a.PendingLen(), b.PendingLen())
+	}
+	if a.Text() != b.Text() || a.LiveCount() != b.LiveCount() {
+		t.Fatalf("replicas disagree: A=%q/%d B=%q/%d", a.Text(), a.LiveCount(), b.Text(), b.LiveCount())
+	}
+	if a.LiveCount() != 5 { // "ala" + "ba"
+		t.Fatalf("LiveCount=%d, want 5", a.LiveCount())
+	}
+}
+
+func rev(ops []Op) []Op {
+	out := make([]Op, len(ops))
+	for i, op := range ops {
+		out[len(ops)-1-i] = op
+	}
+	return out
+}
