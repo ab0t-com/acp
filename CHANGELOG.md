@@ -12,6 +12,8 @@ only `POST` (a reader login could write through `GET`). ACP is licensed Apache-2
 protocol is still `acp/1`: this release adds fields and routes and changes some behaviour, each listed below with an
 upgrade note.
 
+The TypeScript SDK changes below are in `@ab0t/acp` 0.1.1 on npm.
+
 **Upgrading from v0.2.5? Read [docs/MIGRATING-v0.2.5-to-v0.2.6.md](docs/MIGRATING-v0.2.5-to-v0.2.6.md) first.**
 
 ### Docs
@@ -146,7 +148,7 @@ upgrade note.
 - **TypeScript SDK: get a deleted document back.** `deleteDoc`, `docTrash` and `restoreDoc` (and `deleteJSONDoc`,
   `jsonDocTrash`, `restoreJSONDoc` for structured documents) delete a live document, list what can come back, and restore
   it. `docVersions` and `docVersionAt` read the text a server tidy-up removed from a text document, whole or at any
-  operation. An older server answers with `NoDocUndoError`. (Not published to npm yet.)
+  operation. An older server answers with `NoDocUndoError`.
 - **The Go SDK can follow events for you, like the TypeScript one.** `FollowForever` reconnects and resumes by itself,
   and `OnResync` tells you when the events you missed are gone (retention removed them, or the server's history went
   back), before the next event arrives. `Subscribe` runs many subscribers over one shared connection, each with its own
@@ -176,7 +178,7 @@ upgrade note.
 - **Changes behaviour:** **TypeScript SDK: "unsaved changes" signal.** `mountVirtualFS(...).hasPending()` is true from the first buffered
   change until the server acknowledged it — including while a flush is on the wire, when `status().pending` already
   reads 0 — and `onPending(unsaved, status)` reports each change, so a page can warn before it closes. The document
-  sessions have the same `hasPending()` / `onPending`. (These TypeScript additions are not published to npm yet.) ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#ts-has-pending))
+  sessions have the same `hasPending()` / `onPending`. ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#ts-has-pending))
 
 ### Changed
 - **Changes behaviour:** **In a cluster, a v0.2.5 node stops as soon as a v0.2.6 node leads.** A v0.2.6 leader
@@ -670,11 +672,11 @@ upgrade note.
 - **TypeScript live mount: no more phantom conflicts when a file is moved and deleted before the next save.** The same
   case as the Go mount above: an old copy of your own file came back, with a conflict reported and nobody else involved.
   It also happened after two saves of one file whose replies were both lost. A teammate's file caught by your delete is
-  still found and put back. (This part of the TypeScript SDK has not been published to npm yet.)
+  still found and put back.
 - **TypeScript live mount: after a lost reply, reads show your renames correctly, and a delete after a rename runs.** A
   file renamed onto a used or deleted name could read as missing, a chain of renames could show the wrong file at a name
   until the next barrier, and a file you renamed and then deleted right after a lost reply stayed on the server, or
-  ended in a false "move" conflict. (This part of the TypeScript SDK has not been published to npm yet.)
+  ended in a false "move" conflict.
 - **Go live mount (`acp-mount`): reads after a lost reply show renames correctly, folders included.** A file renamed
   onto a deleted name, with a new file at its old name, could read as missing until the next barrier. A folder made
   with its reply lost, then renamed, with its old name used again, showed the wrong files at the new name. A file in a
@@ -1244,7 +1246,7 @@ upgrade note.
   your whole file with the server's latest text, so a line a teammate had just added was sent as your deletion (and
   text they had just deleted came back). The mount now carries your own edit across unchanged, as the CLI, the MCP
   bridge and the Go mount do: both edits stay. If the server keeps compacting, the write stays pending and the
-  flush says so. (This part of the TypeScript SDK has not been published to npm yet.)
+  flush says so.
 - **TypeScript mounts after a lost reply:** when the server applied a flush but the reply never arrived, the retry
   treated the mount's own landed files as someone else's and wrote `.conflict` copies of your own bytes (live mount:
   new files, overwrites and renames; both mounts: a second `.conflict.2` copy of a conflict copy already written).
@@ -1294,7 +1296,7 @@ upgrade note.
   the file, or a tool that wrote before it read) now fails the flush with `EPERM`: nothing is sent, the save stays
   pending, and every other change in the flush still lands. Save the file again with its text and it goes through;
   a mount opened with `allowBulk: true` lets a wipe you mean through. Characters are counted the same way as in the
-  Go tools (an emoji is one character). (This part of the TypeScript SDK has not been published to npm yet.) ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#mount-refuse-corrupt))
+  Go tools (an emoji is one character). ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#mount-refuse-corrupt))
 - **TypeScript live mount: saving a shared text file again while the mount was still sending your last save stopped
   co-editing on it.** The second save was sent as an ordinary file, so the shared text file went to the trash and a
   plain file took its place (you could restore it, but your teammates' edits no longer reached you). The new save now
@@ -1302,15 +1304,14 @@ upgrade note.
   is kept, and nothing is sent twice, whether the earlier send worked, failed, lost its reply or met a server tidy-up.
   The same fix covers saving, renaming and saving again before a flush, and a live mount taking over a CAS mount's
   pending new file where someone has since made a shared text file (now a conflict copy, the text file untouched).
-  (This part of the TypeScript SDK has not been published to npm yet.)
+
 - **TypeScript mounts: saving a file again while the mount was still sending your last save made a false conflict
   copy.** On a live mount, the newer save was compared with the file as it was before your earlier save landed, so
   your own earlier save looked like a teammate's change: the path kept the older save and your newest one went to
   `<name>.conflict`. The same happened when you renamed or deleted the file during the send, renamed a file right
   after saving it, or saved again after a send whose reply was lost (on both mounts). In that last case, deleting or
   renaming a new file could also leave it on the server. The mount now knows its own earlier saves: your newest save
-  lands at the path, and a real teammate write in the meantime is still reported as a conflict. (This part of the
-  TypeScript SDK has not been published to npm yet.)
+  lands at the path, and a real teammate write in the meantime is still reported as a conflict.
 - **TypeScript live mount: an editor's "save to a temp file, then rename it over the file" could put your earlier save
   back.** When an editor saved this way twice before the mount sent anything, or saved this way and then saved or
   deleted the file again, the mount sent an extra copy of the first save and then threw it away. The mount mistook
@@ -1319,7 +1320,7 @@ upgrade note.
   edits leave behind. If the reply to such a save is lost, the retry recognises that the save already landed and no
   longer leaves a second copy of the temp file. When a teammate's write arrives in the instant before your
   temp-file save lands, their file is put back and yours goes to `<name>.conflict`, the same as for an ordinary save.
-  (This part of the TypeScript SDK has not been published to npm yet.)
+
 - **Changes behaviour:** **TypeScript mounts: renaming a folder over an empty folder now works, and folder removals no longer take a
   teammate's new file with them.** The live mount refused `mv src dst` when `dst` was an empty folder; now the empty
   folder is replaced (it goes to the trash), as on the Go mount and in POSIX. Both TypeScript mounts now give the
@@ -1328,15 +1329,13 @@ upgrade note.
   you removed or replaced while it was empty, the live mount now reports a conflict and leaves their content and your
   folder where they are; before, your `rmdir` sent the folder to the trash with their file inside, without a word. On
   a CAS space, the mount also lost an empty folder you renamed (it existed under neither name afterwards), and let a
-  folder be renamed over one holding only sub-folders, merging the two. (This part of the TypeScript SDK has not been
-  published to npm yet.) ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#ts-rename-eisdir))
+  folder be renamed over one holding only sub-folders, merging the two. ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#ts-rename-eisdir))
 - **TypeScript live mount: no more false "delete" conflicts after a lost reply.** If the server's reply to a save that
   replaced a file by renaming another over it (`rm b; mv c b`, or a folder renamed over an empty folder) was lost,
   and a teammate then changed another file from that same save, the retry reported a "delete" conflict on the name
   your own rename now holds. Your files were never touched, but the warning was wrong. Now a delete removes only the
   file it was made for: if your own rename is already at that name, the delete counts as done. If a teammate's file is
-  there, you still get a conflict and their file stays. This is the same rule the Go mount uses. (This part of the
-  TypeScript SDK has not been published to npm yet.)
+  there, you still get a conflict and their file stays. This is the same rule the Go mount uses.
 - **Links no longer borrow the TLS trust of an unrelated profile.** `acp uri read`, `acp uri discover` and `acp open`
   applied the default profile's certificate, pin and `insecure` setting to whatever host a pasted link named, so a
   development profile with `insecure` switched off certificate checks for a stranger's server. Trust now comes from the
@@ -1394,8 +1393,7 @@ upgrade note.
   place: your teammates' edits made meanwhile are kept, the old text stays in the document's history, the 90 % wipe
   guard applies, and the temp file is removed. If the temp file or the document cannot be read at that moment, the
   rename fails and nothing changes. A file that is not text (a NUL byte or invalid UTF-8) still replaces the
-  document as before, byte-exact, and the document goes to the trash intact, so you can restore it. (This part of
-  the TypeScript SDK has not been published to npm yet.)
+  document as before, byte-exact, and the document goes to the trash intact, so you can restore it.
 - **Go mount (`acp mount`, live space): writing a non-text file into a shared live text file no longer garbles the
   text.** Bytes that are not text (a NUL byte, or invalid UTF-8 such as part of an image) saved into a live text file
   were turned into replacement characters (`�`) when the save was sent, for everyone. Now such a save is refused with
@@ -1409,19 +1407,19 @@ upgrade note.
   Now `writeFile` refuses such a save with `EINVAL`, naming the file, and nothing is saved or sent. Your bytes are
   untouched, so save them as a plain file under another name. A text file that starts with a byte-order mark (BOM)
   now keeps it: before, the mount dropped it from the shared document on every save. The Go mount already kept it.
-  (This part of the TypeScript SDK has not been published to npm yet.)
+
 - **Changes behaviour:** **TypeScript mounts: reading a text file and saving it back no longer removes its byte-order mark (BOM).**
   `readTextFile` dropped a leading BOM, so the everyday `writeFile(p, await readTextFile(p))` silently changed a
   shared document or file that starts with one. Now `readTextFile` (both mounts) and `client.readBlobText` keep it, so
   reading and saving back gives the exact same bytes, as Node's `fs.readFile(p, "utf8")` and the Go mount do.
-  (This part of the TypeScript SDK has not been published to npm yet.) ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#ts-bom))
+  ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#ts-bom))
 - **Changes behaviour:** **TypeScript SDK: text with half a character is refused instead of silently changed.** A JavaScript string can hold
   a lone UTF-16 surrogate (half of an emoji, for example after cutting a string in the wrong place). It has no UTF-8
   form, so `writeFile(path, string)` saved `U+FFFD` (`�`) in its place without a word, on any file. Now both mounts
   refuse such a string, or such a path, with `EINVAL` naming the file, and nothing is saved or sent. The rest of the
   SDK does the same with a `MalformedTextError`: `putBlob(string)`, any request whose JSON holds such a string (mail,
   notes, document edits, presence), and `TextDocSession.setText`, where the server would have stored `U+FFFD` while
-  your own copy kept the original. (This part of the TypeScript SDK has not been published to npm yet.) ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#ts-lone-surrogate))
+  your own copy kept the original. ([upgrade note](docs/MIGRATING-v0.2.5-to-v0.2.6.md#ts-lone-surrogate))
 - **An `acp://` address with half a character in it now points nowhere, instead of at another file.** In the
   TypeScript SDK, a file name holding a lone UTF-16 surrogate was written into the address as `%EF%BF%BD` (`U+FFFD`,
   `�`) — the name of a different, real file — so a share link, a canonical address or a lookup could quietly point at
@@ -1431,8 +1429,7 @@ upgrade note.
   the same answer the Go SDK gives for text that is not UTF-8; the Go SDK now also refuses a hand-built address with
   such text in `Lookup`, `ClientFor`, `ReadCapability` and `SameResource`, and sends nothing. Names with any real
   character, including emoji, `U+10FFFF` and a real `U+FFFD`, work as before. The `acp://` specification (ext-32)
-  states the rule, and shared Go and TypeScript test vectors pin it. (This part of the TypeScript SDK has not been
-  published to npm yet.)
+  states the rule, and shared Go and TypeScript test vectors pin it.
 - **A signed download URL, a discovery endpoint or a profile server with a fake IP address in brackets is now refused
   the same way everywhere.** Only a real IPv6 address, with no zone, may sit in `[...]`. The Go SDK used to leave this
   to Go's URL library, whose answer changes between Go releases: on older ones `https://[1::2::3]:8443` was accepted as
