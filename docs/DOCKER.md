@@ -24,7 +24,7 @@ docker run -d --name coordd \
   --restart on-failure:5 \
   -p 8443:8443 \
   -v acp-data:/data \
-  ab0tcom/acp:v0.2.5
+  ab0tcom/acp:v0.2.6
 ```
 
 **Database storage:** identical flags, just the `-server` tag (it runs `coordd-server` for you):
@@ -34,7 +34,7 @@ docker run -d --name acpdb \
   --restart on-failure:5 \
   -p 8443:8443 \
   -v acpdb-data:/data \
-  ab0tcom/acp:v0.2.5-server
+  ab0tcom/acp:v0.2.6-server
 ```
 
 Either is a full ACP server: shared filesystem, mailbox, event log, live documents, leases, presence. Three
@@ -101,7 +101,7 @@ with **`-hosts`**:
 
 ```bash
 docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data \
-  ab0tcom/acp:v0.2.5 -addr :8443 -data /data -hosts coordd.example.com,10.0.0.5,localhost,127.0.0.1
+  ab0tcom/acp:v0.2.6 -addr :8443 -data /data -hosts coordd.example.com,10.0.0.5,localhost,127.0.0.1
 ```
 
 - **From v0.2.5 `-hosts` adds to the automatic names** (`-hosts-exact` keeps only the listed ones). On v0.2.4 and
@@ -131,7 +131,7 @@ Pass flags after the image name. The most common:
 | `-awareness-ws` | enable the WebSocket transport for live presence |
 | `-max-docs N` | cap live documents per workspace |
 
-Run `docker run --rm ab0tcom/acp:v0.2.5 -h` for the full list, and [OPERATIONS.md](OPERATIONS.md) for what each
+Run `docker run --rm ab0tcom/acp:v0.2.6 -h` for the full list, and [OPERATIONS.md](OPERATIONS.md) for what each
 does. Group commit and the presence HTTP tier are on by default; the presence **WebSocket** transport is opt-in
 via `-awareness-ws`.
 
@@ -143,7 +143,7 @@ keeps them.
 ```yaml
 services:
   acp:
-    image: ab0tcom/acp:v0.2.5               # a fixed version; you choose when to upgrade
+    image: ab0tcom/acp:v0.2.6               # a fixed version; you choose when to upgrade
     command: ["-addr", ":8443", "-data", "/data",
               "-hosts", "coordd.example.com,localhost,127.0.0.1"]   # every name agents use
     ports:
@@ -201,12 +201,12 @@ docker compose pull && docker compose up -d      # after changing the image tag 
 or, with `docker run`:
 
 ```bash
-docker pull ab0tcom/acp:v0.2.5
+docker pull ab0tcom/acp:v0.2.6
 docker rm -f coordd
-docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.5
+docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.6
 ```
 
-Pin a version (`ab0tcom/acp:v0.2.5`) in production and bump deliberately. Read the release notes in
+Pin a version (`ab0tcom/acp:v0.2.6`) in production and bump deliberately. Read the release notes in
 [CHANGELOG.md](../CHANGELOG.md) first: v0.2.4 rewrites the logins file in a form older versions refuse, and keeps a
 backup beside it for rolling back.
 

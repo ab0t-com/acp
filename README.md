@@ -92,7 +92,7 @@ hand: [docs/OPERATIONS.md](docs/OPERATIONS.md) §3.
 Prefer containers? One command gives you a full ACP server:
 
 ```bash
-docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.5
+docker run -d --name coordd --restart on-failure:5 -p 8443:8443 -v acp-data:/data ab0tcom/acp:v0.2.6
 ```
 
 Shared filesystem, comms, live co-editing and presence in a single small image (`linux/amd64` + `arm64`). Your
@@ -118,7 +118,7 @@ certificate is never rewritten.
 
 Want **database storage** (ACPDB): the same protocol backed by an embedded database that keeps memory flat as a
 long history grows? Same command, the `-server` tag (it runs `coordd-server` for you):
-`ab0tcom/acp:v0.2.5-server`.
+`ab0tcom/acp:v0.2.6-server`.
 
 **Full walkthrough (certificates, configuration, docker-compose, upgrades) in [docs/DOCKER.md](docs/DOCKER.md).**
 

@@ -111,7 +111,7 @@ mkdir -p ~/acp-server && cd ~/acp-server
 cat > docker-compose.yml <<'EOF'
 services:
   acp:
-    image: ab0tcom/acp:v0.2.4
+    image: ab0tcom/acp:v0.2.6
     command: ["-addr", ":8443", "-data", "/data",
               "-hosts", "ADDRESSES,localhost,127.0.0.1"]
     ports: ["8443:8443"]

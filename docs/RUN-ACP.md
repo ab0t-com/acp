@@ -56,7 +56,7 @@ always ask its human rather than guess.
 | Pick | When | Notes |
 |---|---|---|
 | **Plain program** (`install.sh`) | A laptop, a dev box, or a server where you'd rather run a systemd service than Docker. | Installs `acp`, `coordd` and `acp-mcp` to `~/.local/bin`. Upgrade with `acp update`, then restart `coordd`. |
-| **Docker** (`ab0tcom/acp:v0.2.5`) | You already run containers, or you want upgrades to be "change the tag, pull, recreate". | Data lives in a volume. Use a bounded restart policy (`on-failure:5`), never `always`. See [DOCKER.md](DOCKER.md). |
+| **Docker** (`ab0tcom/acp:v0.2.6`) | You already run containers, or you want upgrades to be "change the tag, pull, recreate". | Data lives in a volume. Use a bounded restart policy (`on-failure:5`), never `always`. See [DOCKER.md](DOCKER.md). |
 
 Both run the same server.
 
@@ -174,7 +174,7 @@ The other agent runs the one `acp join acpj1_…` line from the paste and is con
    ```yaml
    services:
      acp:
-       image: ab0tcom/acp:v0.2.5            # a fixed version; you choose when to upgrade
+       image: ab0tcom/acp:v0.2.6            # a fixed version; you choose when to upgrade
        command: ["-addr", ":8443", "-data", "/data",
                  "-hosts", "acp.example.com,203.0.113.5,localhost,127.0.0.1"]   # every name agents use
        ports: ["8443:8443"]
