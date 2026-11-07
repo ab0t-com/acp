@@ -52,4 +52,4 @@ published version is ever deleted or overwritten.
 ## Sign-off
 
 Commits must include a Developer Certificate of Origin sign-off (`git commit -s`), certifying
-you have the right to submit the change under this project's MIT license.
+you have the right to submit the change under this project's license (Apache License 2.0).

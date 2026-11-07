@@ -9,9 +9,9 @@ ACP gives two (or more) agent harnesses on different machines a **shared filesys
 and a **comms line** through one coordination daemon (`coordd`). You are a *client*.
 This skill is the playbook for getting work done through it.
 
-Full spec/reference: `../../rfc/acp-1.txt` (the base protocol — the filesystem model is
+Full spec/reference: `rfc/acp-1.txt` in the ACP repository (the base protocol — the filesystem model is
 §11 blobs+manifest, the text CRDT §12, leases §10, the event log §8),
-`../../rfc/acp-ext-5-structured-crdt.txt` (the structured-CRDT spec).
+`rfc/acp-ext-5-structured-crdt.txt` in the ACP repository (the structured-CRDT spec).
 
 ## Mental model (read first)
 
@@ -65,6 +65,13 @@ Nothing to copy by hand. To keep the code out of your shell history, use `acp jo
 **Check where you are** at any time: `acp status` shows the profile, server, agent and workspace a command will
 use, where each came from, and whether the login works.
 
+**A new workspace:** a name nothing has written to does not exist yet. Commands that only read say `no such workspace
+"x"` and exit non-zero (`acp status` says it and exits 0), so a typo is not mistaken for an empty folder. The first
+write creates it: `acp push`, `acp put`, `acp send`, `acp crdt sync`, the MCP write tools or a read-write mount.
+
+**Another workspace for one command:** `acp --space <workspace> <command>` (also `--workspace`, before or after the
+command).
+
 **Several logins on one machine** (one per agent): pick one per command with `acp --profile <name> …` (same as
 `ACP_PROFILE=<name>`), or make one the default with `acp config use <name>`. In a project folder, `acp link`
 (optionally `--profile`, `--space`) makes every `acp` command there use that login and workspace; `acp links`
@@ -96,14 +103,12 @@ invite made with `acp invite --mcp` prints these steps. With `easymcp`, see
 
 ## Capability negotiation
 
-The `acp` CLI has **no verb that prints the capability list** — `acp health` just prints
-`ok`. To know what a daemon supports, hit `/v1/healthz` directly (or read the SDK's error
-text, which names the missing capability):
+`acp health` just prints `ok`. To know what a daemon supports, ask it with `acp uri discover`
+(or read the SDK's error text, which names the missing capability):
 
 ```bash
-curl -sk https://<host>:8443/v1/healthz     # no token needed (nothing secret is sent)
-# {"status":"ok","protocol":"acp/1","capabilities":["batchevents","channels","crdtjson",
-#  "quotas","scopedtokens"],"limits":{"max_batch_events":256}}
+acp uri discover acp://<host>/             # no token needed: what this server offers
+# prints the server's address, its capabilities and a certificate fingerprint
 ```
 
 `channels`, `crdtjson`, `quotas`, `scopedtokens` are unconditional on any current daemon.
@@ -141,7 +146,7 @@ duplicate); a cycle-forming move is ignored (stays put, nothing vanishes). Featu
 `crdtjson-move` in `/v1/healthz`. Delete+reinsert (the old way) duplicated the subtree and
 dropped concurrent edits. Full array/path discipline (path-as-array vs slash-string;
 `create_intermediate` only vivifies maps, so seed a new array as a container literal): the
-structured-CRDT spec `../../rfc/acp-ext-5-structured-crdt.txt`.
+structured-CRDT spec `rfc/acp-ext-5-structured-crdt.txt` in the ACP repository.
 
 **The CLI's structured-doc surface is `get`/`set`/`del`/`mv`/`list` — no `lins`/`ldel` verb:**
 
@@ -166,8 +171,12 @@ text for prose/code, JSON for structured state (dashboards, forms, config).
 
 ## File-sync: the push/pull/merge model (STALE vs CONFLICT)
 
+Keep generated files out with a `.acpignore` at the top of the folder (gitignore patterns, shared like any file). An ignored
+path is never pushed, never read as a deletion and never touched by a pull. `acp push --dry-run` shows what a push would do;
+`acp ignore check <path>` says why a path is or isn't ignored.
+
 `acp push`/`acp pull` share a content-addressed, CAS-versioned manifest (git-like). The
-mechanics that matter in practice — the base protocol §11 (`../../rfc/acp-1.txt`) has the
+mechanics that matter in practice — the base protocol §11 (`rfc/acp-1.txt` in the ACP repository) has the
 full model:
 
 - **On `pull`:** non-overlapping edits (base→local and base→remote touch different
@@ -186,10 +195,18 @@ full model:
   again with the same conflict — even after you've hand-edited the markers away. You
   must **`acp push --force`** after resolving (this only overrides the stale-base check
   for paths you touched; it does not blindly clobber other agents' unrelated changes).
-  Don't `acp pull` again mid-resolution — it regenerates fresh markers around your
+  A pull leaves a file with markers in it alone until you resolve them, so your
   partial edit; finish resolving in one pass, then force-push.
 
 ## Addressing: the `acp://` URI scheme (ext-32)
+
+**If you were handed an `acp://` link and are not sure what to do, read `acp help uri` first** (plain-language
+guide: what an address is, how to get your workspace's address, read/write/share, signed share links, common errors).
+Quick decision: a workspace or folder address -> `acp ls <it>`; a file address -> `acp show <it>`, `acp put <it> <file>`;
+a link with `?e=…&h=…&s=…` -> `acp show "<link>" --out file` (no login needed); a bare `acp://host/` ->
+`acp uri discover acp://host/`; anything odd -> `acp uri parse "<it>"`. Never put a token in an address. Your own
+workspace's address: `acp status`. Through MCP: `acp_read_address`, `acp_list_address`, `acp_write_address`, `acp_share`,
+`acp_address_info`.
 
 `acp://host[:port]/space/path` is ACP's **address** — the "URL of the shared filesystem." It resolves
 CLIENT-side to the plain wire (`https://host:port/v1/…` + an `X-ACP-Space` header); it adds no new operation,
@@ -201,6 +218,19 @@ client-only.
   address is refused *before any request*. Auth comes from your local profile (matched by the address's
   host:port) or, for a shared file, from a signed capability in the link (below). This is by design: URLs get
   pasted, logged, and stored — a bearer token must not.
+
+- **A command's target can be an address.** `acp show|ls|put|pull|push|share|mount` take an address where they take a
+  path, and use your profile for that host:port, so you can reach another workspace without changing your default.
+  `?v=N` works on `show`, `ls`, `share` and `mount` (a pinned mount is read-only). `acp pull acp://host/space/docs/ ./work`
+  brings one folder and touches nothing outside it. `acp put` won't overwrite an existing file unless you add `--replace`,
+  which checks it is still the version you last read with `acp show` (or the `--base <hash|version>` you name) and
+  stops if a teammate wrote since; `--force` is last writer wins. To merge with other people's edits use `pull` + `push`.
+
+- **`acp send --to kai,max,nia` sends to each person** (`acp_send` too). A name nobody goes by stops the whole list before
+  anything is sent. For something everyone should read, a channel is usually better than a list.
+
+- **Through MCP an address never picks a login.** The bridge keeps the login it was started with: the address tools reach
+  any workspace that login reaches on its own server, and refuse another server (a share link still reads from anywhere).
 
 - **One-string connect (CLI + MCP).** Instead of `ACP_SERVER` + space + token, point a tool at one address:
   ```bash
@@ -220,11 +250,11 @@ client-only.
   acp uri discover  acp://host/                       # bare-host bootstrap (see Discovery)
   ```
 
-- **Share a file as a link (no login).** For handing a specific file to someone without a profile, mint a
-  **signed, scoped, expiring capability link** (needs a daemon advertising `bloburl`): the `acp://…?h=<hash>&sp&e&k&s`
-  form carries a capability (not a token) that resolves to a tokenless one-shot fetch. `acp uri link
-  <blob-capability-url> <path>` builds one; `acp uri read` (or any resolver) fetches it. The link is
-  **version-pinned** — it names the exact bytes you shared; edit the file and re-mint. (A *living*, path-signed
+- **Share a file as a link (no login).** `acp share <path|address> [--ttl 10m|2h|600]` prints a **signed, scoped, expiring
+  link** (needs a daemon advertising `bloburl`): the `acp://…?h=<hash>&sp&e&k&s` form carries a capability (not a token)
+  that resolves to a tokenless one-shot fetch; the reader runs `acp show "<link>"`. On a self-signed server the reader
+  must trust it first (`acp join <code>`; the refusal says so); an expired link says expired. MCP: `acp_share`. The link is
+  **version-pinned** — it names the exact bytes you shared; edit the file and share again. (A *living*, path-signed
   link that tracks edits is planned, not shipped.)
 
 - **Discovery (`.well-known/acp`).** A bare `acp://host/` bootstraps from `GET https://host/.well-known/acp`
@@ -234,7 +264,7 @@ client-only.
 
 - **Mount a space as a folder.** `acp mount <workspace> <empty dir>` makes a workspace appear as an ordinary
   folder (it needs the separate `acp-mount` program; Linux uses FUSE, macOS and Windows have built-in fallbacks;
-  Linux is the fully tested platform). See `../../docs/mount/README.md`. The TS SDK's `mountVirtualFS({uri})` is a
+  Linux is the fully tested platform). See `acp help mount`. The TS SDK's `mountVirtualFS({uri})` is a
   read-only, in-program view of a space (`readdir`/`readFile`/`stat`).
 
 ## The standard agent loop
@@ -245,7 +275,7 @@ from `acp watch`):
 1. `acp beat` — announce you're alive.
 2. `acp pull ./workspace` — get the latest shared files.
 3. `acp inbox --unread` → `acp read <id>` — handle messages (read = marks acked). To wait for a reply instead
-   of polling: `acp inbox --wait [--timeout 10m] [--from <agent>]` (exit code 124 = nothing arrived in time);
+   of polling: `acp inbox --wait [--timeout 10m] [--from <agent>]` (it stays unread until `acp read` or `acp reply`; exit code 124 = nothing arrived in time);
    answer in the same thread with `acp reply <agent> --body "..."`.
 4. `acp watch --from <lastSeq>` (background) — react to the other agent's events
    (`file.edited`, `lease.acquired`, `chat.sent`, `task.*`, `crdt.op`); add
@@ -260,6 +290,30 @@ from `acp watch`):
 6. `acp log --action <ns.action> --entity <path> --note "..."` — broadcast what you did.
 7. `acp send --to <agent> --subject ... --body ...` — ask questions / hand off.
 
+## Team communication patterns (tools, not rules)
+
+Pick what fits; nothing forces a shape. Every message and event already carries when and who —
+add the topic (a subject, an entity, a note). Full guide: `acp help team`, and `docs/AGENT-TEAMS.md` in the ACP repository;
+`acp help comms` opens with the same table. `acp help team` is one screen on working together (co-edit, claim, see, agree, finish), a menu of tools with the exact commands; the invite paste, `acp help`, `acp status` and the clash refusals all point at it.
+
+| Need | Command |
+|---|---|
+| ask one agent | `acp send --to <a> --subject <topic> --body "…" [--refs plan.md]` (point at files, don't paste) |
+| answer | `acp reply <agent\|msg_id> --body "…"` (same thread); `acp thread <id>` reads it, opener first |
+| announce | `acp log --channel team --action status.done --entity <what> --note "…"` |
+| for someone in particular | add `--to <a,b>`; they read `acp events --for-me` (also `@name` in a note) |
+| who holds what | `acp who` (each agent's row ends `holds <resource> (10m left)`; MCP `acp_who`: `holds`; never a token) |
+| remember | one short `TEAM.md` (one screen: goal, who's on what, decisions, open questions, links) |
+| decide | `decisions/NNNN-<title>.md`, never edited once accepted (supersede instead) |
+| keep a record | `JOURNAL.md`, **one line per entry** (`<time> <who> <topic>: <what>`), as a live doc (`acp crdt sync`) or one file per agent |
+| claim | `acp lease acquire <thing> --ttl 600` (`--json` in a script: `status` is `acquired` or `held`; held exits 2) |
+| say why a file changed | `acp push --note "…"` / `acp rm <path> --note "…"` (shows in `acp history`) |
+| notice mail | `acp inbox --brief` in a hook or status line (prints nothing when there's none) |
+
+Two agents appending to ONE shared plain file without a lease always conflict; use a live document
+or one file per agent. Threads show you only messages you sent or received. A room shared with people
+uses the `chat.msg` shape (`acp/docs/ROOM-MESSAGES.md`).
+
 ## `acp update` — self-update the CLI
 
 `acp update [--check] [--force] [--version vX.Y.Z]` checks the release channel's
@@ -272,6 +326,13 @@ an older retained release, not just the newest.
 
 ## Best practices (do these)
 
+- **Building a web page or browser agent?** Keep the ACP login in a small backend on the page's own site; the token is
+  never in the page. Read `docs/BROWSER.md` (and the tested example `examples/guides/browser-backend/`) first.
+- **Conflict markers wait for you.** A pull leaves a file holding markers alone, however many times you run it, and
+  `push --force` won't publish them; resolve them, or add `--allow-markers` if they belong there.
+- **A pull never throws a file away.** A file gone from the server moves to `.acp/trash/v<version>/` for 7 days. If most of
+  the folder would go, or the server's history no longer holds what you synced, pull stops and changes nothing: read
+  what it says, then `--allow-bulk-delete` (you mean it) or `--reset-base` (keep every file).
 - **Pull before you push.** Push auto-rebases on version races but a fresh pull avoids
   surprises and lets the 3-way merge work from the right base.
 - **Own your lane.** Agree on a file/dir split so you mostly edit *different* files —
@@ -280,9 +341,16 @@ an older retained release, not just the newest.
   need longer. A crashed holder's lease auto-expires (fencing tokens keep it safe).
 - **Talk through the log, not just mail.** `acp log` is the shared memory both agents
   replay; use clear namespaced actions (`spec.section.done`, `build.green`).
+- **A file and a live document can share a name, and they are two things.** `push`/`pull` move the file, `crdt sync` the
+  live text; mixing them on one name ends in a conflict. Pick one per name; `push` and `pull` say so when they meet one.
 - **For same-file live editing, use `crdt sync`/`crdt json`, not push/pull.** They
   converge with no conflict step (structured JSON still needs the `lins`/`ldel`
   discipline for arrays — see above).
+- **First time on a live doc in a folder:** `acp crdt list`, then `acp crdt sync <doc>`: an existing doc lands in a
+  file, you add your text there and sync again; a new doc starts from the file you wrote. If you already wrote a file
+  and the doc has text, sync refuses: `--merge` keeps both (use this one); `--replace-shared` REPLACES the shared text
+  and deletes what others wrote, and stops above 10% of it without `--confirm-truncate`. Over MCP, `acp_doc_read`
+  first: `acp_doc_write` refuses to delete text you never read (`merge: true` keeps both).
 - **A CONFLICT needs `push --force` after you resolve the markers** — a plain `push`
   bounces again by design (see "File-sync" above). A STALE push usually just needs a
   plain `acp pull` first.
@@ -291,16 +359,25 @@ an older retained release, not just the newest.
 
 ## Common tasks → commands
 
+Commands are also grouped (`acp mail …`, `acp events …`, `acp files …`, `acp history …`, `acp docs …`; `acp <group>
+--help`). The flat spellings below keep working exactly the same.
+
 | Goal | Command |
 |------|---------|
 | Join a server from an invite | `acp join acpj1_...` |
 | See which login/server/workspace I'm on | `acp status` |
 | See who's online | `acp who` |
-| Check what a daemon supports | `curl -sk https://<host>:8443/v1/healthz` (no token needed) |
+| Check what a daemon supports | `acp uri discover acp://<host>/` (no token needed) |
+| What's shared? | `acp ls` (or `acp ls acp://host/space/docs/`) |
+| Read / write one file | `acp show <path\|address>` / `acp put <path\|address> <file>` |
+| Share one file with no login | `acp share <path>` -> send the link; reader: `acp show "<link>"` |
+| My workspace's address | `acp status` (the `address:` line) |
 | Get latest files | `acp pull ./ws` |
 | Share my changes | `acp push ./ws` (after resolving a CONFLICT: `acp push --force`) |
-| Delete a shared file | `acp rm path` (or delete locally + `acp push`) |
+| Delete a shared file or folder | `acp rm path` (or delete locally + `acp push`); a folder at the bulk minimum needs `--confirm-bulk` |
 | Co-author one text file live | `acp crdt sync spec.md ./spec.md` / `acp crdt watch spec.md ./spec.md` |
+| Delete a live doc / bring it back | `acp docs delete spec.md`, `acp docs trash`, `acp docs restore spec.md` (JSON docs: `acp docs json …`) |
+| Read an earlier version of a live doc | `acp docs versions spec.md`, then `acp docs versions spec.md --epoch N` (kept from before a compaction) |
 | Read/write a structured doc | `acp crdt json get board` / `acp crdt json set board status '"green"'` |
 | Insert/delete an array element | `pkg/client.PushCRDTJSONOps` with `lins`/`ldel` (no CLI verb) |
 | Message an agent | `acp send --to codexB --subject hi --body "..."` |
@@ -308,11 +385,15 @@ an older retained release, not just the newest.
 | Wait for a reply / answer in the thread | `acp inbox --wait` / `acp reply <agent> --body "..."` |
 | Claim a file | `acp lease acquire file:app.go --ttl 600` |
 | Broadcast a fact | `acp log --action build.green --entity ci` |
+| Read a whole conversation | `acp thread <id>` (opening message first; `--json` for the raw form) |
+| Read mail or history as text | `acp read <id> --text`, `acp history --text` |
+| Say why you changed files | `acp push ./ws --note "…"` |
+| Recent activity, readable | `acp events` (for a script: `--plain` or `--json`) |
+| Events meant for me | `acp events --for-me` |
 | Follow activity (scoped) | `acp watch --from 1 --channels a,b.* --actions x,y.*` |
 | Health/counters | `acp health` / `acp stats` |
 | Connect by one address | `export ACP_URI=acp://host/space/` (or `acp --uri acp://host/space/ <cmd>`) |
 | Inspect / normalize an address | `acp uri parse\|canonical\|resolve acp://host/space/path` |
-| Share a file as a link (no login) | `acp uri link <blob-capability-url> <path>` → send it; recipient `acp uri read "<link>"` |
 | Bootstrap from a bare host | `acp uri discover acp://host/` |
 | Update the CLI | `acp update --check` / `acp update` |
 
@@ -324,11 +405,12 @@ an older retained release, not just the newest.
 - **Whole-array `set` on a structured CRDT doc silently drops a concurrent element
   change** — always use `lins`/`ldel` for array structure, `set` only for scalar fields.
 - After resolving a CONFLICT's markers, a plain `acp push` bounces again — you need
-  `acp push --force`; don't `acp pull` again mid-resolution (it regenerates markers).
+  `acp push --force`; a pull leaves a file with markers in it alone until then.
 - `ACP_AGENT` only sets your label in shared-token mode; in per-agent mode your identity
   is fixed by your token (you can't impersonate another agent).
-- A `423` on push means another agent holds a lease on that path — wait or coordinate
-  via mail. A `409` is a version race (push auto-retries/rebases); a `STALE` label on
+- A `423` on push means another agent holds a lease on that path. The refusal names who
+  and until when, with the commands to ask them and to wait (no polling); `acp who` shows
+  who holds what. A `409` is a version race (push auto-retries/rebases); a `STALE` label on
   push means "pull first," not "blocked forever."
 - Don't assume every daemon has every extension — `batchevents`/`bloburl` are
   conditionally advertised; probe `/v1/healthz` rather than trial-and-error.

@@ -55,3 +55,17 @@ func TestQueryNamesAreEscaped(t *testing.T) {
 		}
 	}
 }
+
+func TestServerVersion(t *testing.T) {
+	body := `{"status":"ok","version":"v0.2.6","capabilities":[]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) }))
+	t.Cleanup(ts.Close)
+	c, _ := New(ts.URL, "tok", "a", "", true)
+	if v, err := c.ServerVersion(); err != nil || v != "v0.2.6" {
+		t.Fatalf("got %q %v", v, err)
+	}
+	body = `{"status":"ok","capabilities":[]}` // a server from before the field
+	if v, err := c.ServerVersion(); err != nil || v != "" {
+		t.Fatalf("an older server: empty, got %q %v", v, err)
+	}
+}

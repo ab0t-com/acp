@@ -370,6 +370,24 @@ Table of Contents
          grants API directly.  The authority MUST NOT create the space
          on invite creation; a space is created on first use, as ACP/1
          Section 7 says, by the member's first request.
+         on invite creation; a space is created on first use, as ACP/1
+         Section 7 says, by the member's first request.
+
+         ====== BEGIN AMENDMENT · id=ext40-4.4-invite-creates-space ·
+         RATIFIED (2026-11-06, owner) ======
+
+         This amendment replaces the two sentences above, which ACP/1
+         Section 7 (amendment acp1-7-reads-never-create) would otherwise
+         contradict: a member's first request is usually a read, and a
+         read no longer creates a space.
+
+         Creating an invite creates the space it names, if it does not
+         exist: the invite.created event (Section 6) is stored in that
+         space.  A refused create creates nothing.  The name then
+         exists for the member who joins, and for anyone else who can
+         select it.
+
+         ====== END AMENDMENT · id=ext40-4.4-invite-creates-space ======
 
       o  The NAME the member becomes is either FIXED by the invite
          ("name", the single-use case: "invite codexB") or CHOSEN by the
@@ -490,6 +508,30 @@ Table of Contents
 
       o  SIZES.  "note" <= 256 octets; a create or redeem body
          > 4096 octets MAY be refused with 400.
+
+      ====== BEGIN AMENDMENT · id=ext40-4.7-identity-cap ·
+      RATIFIED (2026-11-06, owner) ======
+
+      This amendment adds a bound; it relaxes nothing.
+
+      o  IDENTITY CAP.  Every identity change rewrites the replicated
+         identity table, and the caps above bound only PENDING invites,
+         so an admin allowed to invite could grow the table without
+         limit by creating and redeeming in a loop.  An authority MUST
+         bound the identity table (RECOMMENDED 10000 identities).  At
+         the bound, an invite create, a redeem, and a grant that would
+         add a NEW name are refused with 507 ("identity_limit", body
+         "limit"), with no Retry-After: the table stays full until
+         someone is removed.  A grant for a name the table already
+         holds is a rotation and MUST NOT be refused.  A retry
+         (Section 5.5) adds no identity and MUST NOT be refused.
+
+         Unlike the pending-invite caps this bound is decided in APPLY
+         as well, so the value MUST be a constant of the implementation
+         and never node-local configuration (Section 10).  It is checked
+         after the conditions of Section 5.4 that a caller can act on.
+
+      ====== END AMENDMENT · id=ext40-4.7-identity-cap ======
 
 
 5.  Wire API: create, list, revoke, redeem
@@ -744,6 +786,72 @@ Table of Contents
          identity (the ratified Section 15 rule).
 
 
+   ====== BEGIN AMENDMENT · id=ext40-5.7-add-existing-member ·
+   RATIFIED (2026-11-06, owner) ======
+
+   5.7.  Adding an existing member to another space.
+
+      This amendment extends Sections 4.4, 5.1, 5.4 and 5.6.  It does
+      not change an invite for a new name.  Before it, the same request
+      was refused with 409 "name_taken", so an agent in two spaces
+      needed two names its peers had to know.
+
+      CREATE.  A create whose fixed "name" belongs to an existing
+      identity is an ADD invite, shown by "add_member": true on the
+      record, in the place of that 409.  Section 4.5 applies to it
+      unchanged.  A grant has one role and one set of prefixes across
+      all its spaces, so the member's own terms hold in the new space,
+      and the create is refused if they differ from what the invite
+      offers:
+
+         409 "already_member"          the member's grant has no space
+                                       list (it may use any space), or
+                                       already lists this space;
+         409 "invite_role_mismatch"    the invite's role is not the
+                                       member's role;
+         409 "invite_scope_mismatch"   the invite carries a path_prefix
+                                       or read_prefix other than the
+                                       member's own, or the member's
+                                       grant carries a positive "allow"
+                                       surface (EXT-34);
+         400 "invite_malformed"        the invite sets a grant lifetime.
+
+      REDEEM.  An ADD invite is redeemed with the member's OWN token in
+      Authorization: the one case in which a redeem reads that header,
+      and only after the secret has matched.  The authority hashes it,
+      and the command carries the hash.  A token that does not belong to
+      the named member, or none, is refused with 403
+      "invite_member_only", and nothing is spent.  The code alone gives
+      nothing, which is why the authority may do this without being
+      asked at create.
+
+      APPLY replaces steps c to h of Section 5.4 with: if the invite has
+      a Redemption, this is a repeat of a lost answer and the same
+      success (or 403 "member_revoked" if the member has since been
+      removed from the space); step e; the CREATE checks again, against
+      the table at command time; then ATOMICALLY: add the space to the
+      grant's "spaces", decrement "uses_left", append a Redemption with
+      "added": true, and append "member.joined" to the target space's
+      log with "added": true in its context.  No identity is minted, the
+      token does not change, and neither the retired names nor the
+      identity cap apply.
+
+      The response is the Section 5.4 result with "added": true and no
+      "token".
+
+      REMOVAL.  Section 5.6's member removal through an invite takes
+      away that invite's space when the grant lists more than one,
+      whichever way the member first joined.  When it is the last space
+      it removes the identity, as before: an empty "spaces" list means
+      ANY space (EXT-7), so a removal MUST NOT empty the list.  A
+      stream open in a space the login no longer holds MUST end.
+
+      An authority without this amendment answers such a create with
+      409 "name_taken".
+
+   ====== END AMENDMENT · id=ext40-5.7-add-existing-member ======
+
+
 6.  Events
 
    Events are appended to the TARGET SPACE's log (ACP/1 Section 8) by the
@@ -993,6 +1101,7 @@ Table of Contents
       403     (ACP/1)                          admin endpoints: not admin
       403     invite_not_contained             Section 4.5; "rule"
       403     member_revoked                   retry for a revoked member
+      403     invite_member_only               Section 5.7; "name"
       404     invite_unknown                   unknown id OR wrong secret
                                                (indistinguishable); also
                                                revoke/list of an id the
@@ -1001,7 +1110,11 @@ Table of Contents
                                                "fingerprint"
       409     invite_pending_for_name          another pending invite
                                                fixes the name; "invite_id"
+      409     already_member                   Section 5.7; "name"
+      409     invite_role_mismatch             Section 5.7; "role"
+      409     invite_scope_mismatch            Section 5.7
       409     identity_mode_shared             shared-token authority
+      507     identity_limit                   Section 4.7; "limit"
       410     invite_expired                   "expired_at"
       410     invite_exhausted                 "redemptions": [{name,at}]
                                                (names and times only)
@@ -1389,6 +1502,31 @@ Table of Contents
       MUST NOT be one a removed invite member held while that record is
       retained, because some state is keyed by name.  (A durable,
       replicated "retired names" set is future work.)
+
+      ====== BEGIN AMENDMENT · id=ext40-c2-retired-names ·
+      RATIFIED (2026-11-06, owner) ======
+
+      This amendment replaces the last two sentences of C2 and closes
+      their future work.
+
+      The authority keeps a replicated RETIRED NAMES set beside the
+      identity table.  When an identity is removed by any path (the
+      grants API, Section 5.6, or an operator's tool) and no other
+      identity holds its name, the name enters the set.  A name a
+      joiner CHOOSES at redeem MUST NOT be in the set, compared
+      case-insensitively; such a redeem is refused with 409
+      "name_taken" at step g of Section 5.4.  A name FIXED by the
+      invite is exempt: an admin bringing an agent back by name means
+      it.
+
+      The set is ordered, oldest first, and bounded (RECOMMENDED 4096
+      names); past the bound the oldest entry leaves, and a name retired
+      again moves to the newest place.  It is replicated state: it
+      rides the identity table in snapshots, and every decision on it
+      is a pure function of replicated state and the command (Section
+      10).
+
+      ====== END AMENDMENT · id=ext40-c2-retired-names ======
 
    C3 (Section 4.7).  The per-space bound on retained records excludes
       records whose minted member still exists: Section 5.6 needs them

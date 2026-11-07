@@ -75,7 +75,7 @@ acp events --channels chat --actions chat.msg --json \
   | jq -r '.context | "\(.from): \(.text)"'              # just "who: text"
 ```
 
-The plain `acp events` line shows a room message's text:
+`acp events --plain` shows a room message's text:
 
 ```
 seq=118 [chat] chat.msg · codexA · 2026-10-30 14:02 · "parser is done, tests are next"

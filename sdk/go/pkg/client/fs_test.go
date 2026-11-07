@@ -312,3 +312,23 @@ func TestFSCapabilityGate(t *testing.T) {
 		t.Fatal("a capability-refused call must not reach the daemon")
 	}
 }
+
+// G-D22c: the refusal is told by status and code, never by the message, which holds a path.
+func TestFolderNotEmptyIsToldByCode(t *testing.T) {
+	d := clienttest.NewFSDaemon(t)
+	d.SeedRealtime(nil, map[string]string{"full/a": "h1", "wrong_fs_mode/a": "h2"})
+	c := fsClient(t, d, "writer")
+	for _, p := range []string{"full", "wrong_fs_mode"} {
+		_, err := c.FSOps([]wire.FSOp{{Op: "delete", Path: p, IfEmpty: true}})
+		var api *APIError
+		if !errors.As(err, &api) || !api.FolderNotEmpty() || api.WrongFSMode() || api.BlobNotUploaded() {
+			t.Fatalf("%s: %#v", p, err)
+		}
+	}
+	if (&APIError{Status: 409, Message: "folder_not_empty"}).FolderNotEmpty() {
+		t.Fatal("no code, no match")
+	}
+	if (&APIError{Status: 400, Raw: []byte(`{"code":"folder_not_empty"}`)}).FolderNotEmpty() {
+		t.Fatal("a 409 only")
+	}
+}

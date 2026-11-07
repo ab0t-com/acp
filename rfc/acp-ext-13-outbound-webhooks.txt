@@ -57,8 +57,9 @@ Status of This Memo
 
 Copyright Notice
 
-   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
-   license as the reference implementation and the base specification.
+   Copyright (c) 2026 ab0t.  Licensed under the Apache License, Version
+   2.0, the same license as the reference implementation and the base
+   specification.
 
 
 Table of Contents

@@ -237,3 +237,38 @@ func mutate(rng *rand.Rand, s string) string {
 	}
 	return string(r)
 }
+
+// A log replaced under a replica shows in the op at the replica's place, whichever kind
+// that op is: a delete's id is its target's, and the target is another document's.
+func TestLogReplacedSeesADeleteAtOurPlace(t *testing.T) {
+	mine := New("mine")
+	mine.GenerateOps("one\n") // synced to 4 ops
+
+	theirs := New("theirs")
+	var log []Op
+	for _, text := range []string{"abc", "bc", "bc and a good deal more\n"} {
+		log = append(log, theirs.GenerateOps(text)...)
+	}
+	if log[3].Type != OpDelete {
+		t.Fatalf("the test's shape: op 3 is %+v", log[3])
+	}
+	if !mine.LogReplaced(log[3:], len(log), 4) {
+		t.Fatal("a delete of an element this replica never held is another document's")
+	}
+
+	// The same log, read by a replica that holds it: a delete at the place is no alarm.
+	reader := New("reader")
+	for _, op := range log[:4] {
+		reader.Apply(op)
+	}
+	if reader.LogReplaced(log[3:], len(log), 4) {
+		t.Fatal("this replica took that delete: the log is the one it knows")
+	}
+	if !reader.Knows(log[3].ID) {
+		t.Fatal("a delete applied is known")
+	}
+	// An insert keeps its rule, a shorter log says so outright, and a first read has no place.
+	if !mine.LogReplaced(log[:1], len(log), 1) || mine.LogReplaced(log, len(log), 0) || !mine.LogReplaced(nil, 3, 4) {
+		t.Fatal("the other rules moved")
+	}
+}

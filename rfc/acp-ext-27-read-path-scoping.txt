@@ -75,8 +75,9 @@ Status of This Memo
 
 Copyright Notice
 
-   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
-   license as the reference implementation and the base specification.
+   Copyright (c) 2026 ab0t.  Licensed under the Apache License, Version
+   2.0, the same license as the reference implementation and the base
+   specification.
 
 
 Table of Contents
@@ -278,6 +279,26 @@ Table of Contents
       grants the read" -- if an in-scope file and an out-of-scope file
       share bytes, the token was already entitled to those bytes via
       its in-scope reference.
+
+      ====== BEGIN AMENDMENT · id=ext27-5.2-realtime-tree ·
+      RATIFIED (2026-11-06, owner) ======
+
+      This amendment extends Section 5.2 and items B.1 and B.4 of the
+      amendment below to a space in realtime mode (EXT-31), which they
+      predate.  A token may list a live file through GET /v1/fs/tree
+      (EXT-28 Section 5.3), so it must be able to read that file's
+      bytes.
+
+      In a realtime space, a path of a LIVE file node of the tree is a
+      path for the reachability rule, alongside the manifest paths and
+      the EXT-33 retained records.  The rule is otherwise unchanged:
+      ANY in-scope path holding the hash grants the read; an
+      out-of-scope hash stays indistinguishable from a missing one; and
+      the lookup cost stays independent of the hash and the token.  The
+      answer follows the tree: a file moved out of scope or into the
+      trash stops granting the read at that op.
+
+      ====== END AMENDMENT · id=ext27-5.2-realtime-tree ======
 
    5.3.  Collaborative documents -- empty-doc for out-of-scope.
 

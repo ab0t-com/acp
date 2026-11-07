@@ -1,0 +1,62 @@
+{
+  "comment": "ext-43 Appendix A. A path ending in / is a directory candidate met by a scan; any other path is a file. A client's matcher must give these answers.",
+  "cases": [
+    {"name": "A.1", "file": "__pycache__/\n", "paths": {
+      "__pycache__/a.pyc": true, "src/__pycache__/m.cpython-312.pyc": true, "__pycache__": false, "src/__pycache__x/a.pyc": false, "__pycache__/": true}},
+    {"name": "A.2", "file": "*.log\n!keep.log\n", "paths": {
+      "a.log": true, "logs/b.log": true, "keep.log": false, "logs/keep.log": false, "a.log.txt": false}},
+    {"name": "A.3", "file": "build/\n!build/keep.txt\n", "paths": {
+      "build/x": true, "build/keep.txt": true}},
+    {"name": "A.4", "file": "/build\n", "paths": {
+      "build": true, "build/x": true, "src/build/x": false}},
+    {"name": "A.5", "file": "doc/*.txt\n", "paths": {
+      "doc/a.txt": true, "doc/sub/a.txt": false, "x/doc/a.txt": false}},
+    {"name": "A.6", "file": "**/foo\n", "paths": {
+      "foo": true, "a/b/foo": true, "a/foo/x": true, "foox": false}},
+    {"name": "A.7", "file": "a/**/b\n", "paths": {
+      "a/b": true, "a/x/b": true, "a/x/y/b/z": true, "ab": false, "x/a/b": false}},
+    {"name": "A.8", "file": "foo/**\n!foo/keep\n", "paths": {
+      "foo/x": true, "foo/keep": false, "foo/keep/y": true, "foo": false}},
+    {"name": "A.9", "file": "*\n!*.py\n", "paths": {
+      "a.py": false, "src/a.py": true, "README": true}},
+    {"name": "A.10", "file": "\\#notes\n\\!bang\ntrail\\ \n", "paths": {
+      "#notes": true, "!bang": true, "trail ": true, "trail": false}},
+    {"name": "A.11", "file": "a?c\n", "paths": {
+      "abc": true, "ac": false, "a/c": false}},
+    {"name": "A.12", "file": "Build/\n", "paths": {
+      "build/x": false, "Build/x": true}},
+    {"name": "A.13 empty", "file": "", "paths": {"anything": false, "a/b": false}},
+    {"name": "A.13 comments and blanks", "file": "# only a comment\n\n   \n\n", "paths": {"anything": false, "#": false}},
+    {"name": "last match wins", "file": "!a\na\n", "paths": {"a": true}},
+    {"name": "a lone double star is a star", "file": "**\n", "paths": {"a": true, "a/b": true}},
+    {"name": "double star in the middle of a segment", "file": "a**b\n", "paths": {"axxb": true, "a/b": false}},
+    {"name": "anchored double star", "file": "/**\n", "paths": {"a": true, "a/b": true}},
+    {"name": "several double stars", "file": "**/a/**/b/**\n", "paths": {"a/b/c": true, "x/a/y/b/z": true, "a/b": false}},
+    {"name": "escaped star is literal", "file": "\\*.txt\n", "paths": {"*.txt": true, "a.txt": false}},
+    {"name": "escaped bracket is literal", "file": "\\[x]\n", "paths": {"[x]": true}},
+    {"name": "not bracket-free in a comment", "file": "# [abc]\n", "paths": {"a": false}},
+    {"name": "question mark is one character", "file": "?\n", "paths": {"\u00e9": true, "ab": false}},
+    {"name": "no normalization", "file": "\u00e9\n", "paths": {"\u00e9": true, "e\u0301": false}},
+    {"name": "leading spaces are significant", "file": " a\n", "paths": {" a": true, "a": false}},
+    {"name": "CRLF", "file": "a\r\nb\r\n", "paths": {"a": true, "b": true}},
+    {"name": "BOM", "file": "\ufeffa\n", "paths": {"a": true}},
+    {"name": "directory-only anchored", "file": "src/gen/\n", "paths": {"src/gen/x": true, "src/gen": false, "src/gen/": true, "x/src/gen/y": false}},
+    {"name": "negation under an unselected directory", "file": "logs/*\n!logs/keep\n", "paths": {"logs/a": true, "logs/keep": false}}
+  ],
+  "invalid": [
+    {"file": "[Dd]ebug/\n", "line": 1},
+    {"file": "/\n", "line": 1},
+    {"file": "!\n", "line": 1},
+    {"file": "!/\n", "line": 1},
+    {"file": "a//b\n", "line": 1},
+    {"file": "//x\n", "line": 1},
+    {"file": "../x\n", "line": 1},
+    {"file": "./x\n", "line": 1},
+    {"file": "a/../b\n", "line": 1},
+    {"file": "x\\\n", "line": 1},
+    {"file": "ok\n# fine\n<<<<<<< local\n", "line": 3},
+    {"file": "a\n=======\n", "line": 2},
+    {"file": ">>>>>>> remote\n", "line": 1},
+    {"file": "ok\na[b\n", "line": 2}
+  ]
+}

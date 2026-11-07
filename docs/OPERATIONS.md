@@ -34,20 +34,24 @@ is relative to the directory you start from.
 |------|---------|---------|
 | `-addr` | `:8443` | listen address |
 | `-data` | `./acp-data` | state directory |
+| `-data-must-exist` | `false` | refuse to start (exit 78) when `-data` holds no server state yet — an unmounted volume or a mistyped path otherwise looks like a first start and gets a brand-new empty server. Turn it on once the server exists (systemd units, containers); leave it off for the first start and for a node joining a cluster |
+| `-token-file PATH` | — | read the token from a file, the same as `-token` but off the process list (the way to give a joiner its admin login). Refused with `-token`, and start-up stops on a missing or empty file; a file others can read is a warning |
 | `-token` | — | run in shared-token mode with this token (else: an existing `<data>/token` is read; a NEW folder makes the `owner` login unless `-shared-token`); ignored once per-agent logins exist |
 | `-shared-token` | `false` | on a NEW data folder, start in shared-token mode (create `<data>/token`) instead of making the `owner` login; no effect on an existing folder |
 | `-owner-name` | `owner` | name of the admin login a NEW data folder makes on its first start (token in `<data>/owner.token`) |
 | `-shared-token-role` | `admin` | role the shared token grants while no per-agent identity exists: `admin`, `writer` or `reader` |
 | `-hosts` | (auto) | SANs baked into a NEW self-signed cert. Unset: the cert covers loopback, this machine's hostname and its network addresses. Set it for a cloud VM's public IP, a DNS name, or a Docker host's address (not visible from inside). From v0.2.5 the names are **added** to the automatic list (`-hosts-exact`: only these); on v0.2.4 and older setting it replaces the list, so include `localhost,127.0.0.1` there. (`coordd -h` shows `127.0.0.1,localhost` as its default; unset really means the automatic list.) An existing cert is never rewritten (agents pinned it); start-up names addresses it lacks |
 | `-data-key-file` | (off) | file holding a 32-byte key (or 64 hex chars) that encrypts blob contents at rest; or set `ACP_DATA_KEY`. See §4 "Encryption at rest" |
-| `-root-page` / `-root-page-file` | `true` / — | the public start-here document at `GET /` (§2b); `false` turns it off, a file replaces it |
+| `-root-page` / `-root-page-file` | `true` / — | the public start-here document at `GET /` (§2b) and the token-free `GET /openapi.json`; `false` turns the page off and puts the OpenAPI document behind a token, a file replaces the page |
 | `-enforce-leases` | `true` | reject commits to a path another agent holds a lease on |
 | `-max-body` | `268435456` (256MB) | max request body |
 | `-rate` | `50` | per-agent request rate (req/s), burst = 4× |
-| `-event-retention N` | `50000` | keep only the last N events per space (0 = unlimited, warned at startup); periodic compaction |
+| `-max-streams-per-login N` | `64` | open event and awareness streams one login may hold on this server, over every workspace; past it `429 too_many_streams`; `0` = unlimited. `/v1/stats` shows `open_streams` |
+| `-event-retention N` | `50000` | keep the last N events of each kind per space, audit and conversation counted separately, at most 4×N in all (0 = unlimited, warned at startup); periodic compaction |
 | `-mail-retention N` | `5000` | keep only the last N READ messages per recipient (unread mail is always kept; 0 = unlimited) |
 | `-max-spaces` / `-max-spaces-per-grant` | `1000` / `16` | spaces open on this node / new spaces one non-admin per-agent grant may create through this server process — counted in memory, per process and per node (§2b) |
 | `-idem-window N` | `10000` | idempotency keys remembered per space (exact-replay window; older keys re-apply). Replicated + persisted; in cluster mode set the SAME value on every node |
+| `-expires-in D` | — | with `-mkagent`: end the grant after this long (e.g. `24h`). An ended grant answers `401 grant_expired` and stays listed until you revoke it. Using this makes `agents.json` version 7, which older servers refuse |
 | `-mkagent NAME` | — | create a per-agent token, print it **once**, exit (switches to per-agent mode); `agents.json` stores only its hash. For a **stopped** server: refused while one runs on `-data` (use the grants API or `acp invite`), except a single-node shared-key server's first login |
 | `-lsagents` | — | list identities (fingerprint, name, role, scope; never a token), exit |
 | `-rmagent FINGERPRINT\|NAME` | — | revoke one identity, exit (refuses the last identity and an ambiguous name). For a **stopped** server: refused while one runs on `-data` — revoke live with `DELETE /v1/admin/grants` |
@@ -57,7 +61,7 @@ is relative to the directory you start from.
 | `-spaces s1[,s2…]` | (any space) | space allowlist for `-mkagent`: the token may select only these spaces |
 | `-path-prefix p1[,p2…]` | (unscoped) | write scope for `-mkagent`: the token may only commit paths / take lease names inside a listed subtree (`…/`) — see 2b-scopes |
 | `-read-prefix p1[,p2…]` | (reads everything) | read scope for `-mkagent`: the token reads only its slice of the TREE; out-of-scope reads look missing. NOT confinement (events/mail/presence/stats stay space-wide) — see 2b-read-scopes |
-| `-cap-key-file f1[,f2…]` | (off) | signing key file(s) for blob capability URLs; enables the `bloburl` capability |
+| `-cap-key-file f1[,f2…]` | (off) | signing key file(s) for blob capability URLs; enables the `bloburl` capability. This is what lets people share a file by link: [ACP-ADDRESSES.md](ACP-ADDRESSES.md) |
 | `-cap-max-ttl` | `900` | maximum capability-URL lifetime in seconds (mint clamps to this) |
 | `-cap-rate` | `10` | per-IP req/s on the unauthenticated `/v1/cap/` fetch path (burst 4×; 0 = unlimited) |
 | `-trusted-proxy ip\|cidr[,…]` | (none) | YOUR reverse proxies. Only for a request whose TCP peer is listed do the unauthenticated per-source limits (invite redeem, `/v1/cap/`) key on the right-most `X-Forwarded-For` hop that is not itself listed; otherwise `X-Forwarded-For` is ignored. Set it when coordd sits behind an edge, or every joiner shares the edge's budget. List only hosts where every process is trusted: whoever connects FROM a listed address picks its own source key |
@@ -82,6 +86,11 @@ startup, carried as `k=` in URLs).
 3. After ≥ `-cap-max-ttl` seconds, drop the old file from the list and restart.
    Retiring a key **immediately invalidates** every URL signed with it — that is also
    the bulk-revocation lever on suspected compromise (skip the grace step).
+
+**With a data key** (`-data-key-file`), a share-link fetch decrypts the whole blob in memory, so only 4 run at
+once on a node. Each answer must then make progress every 30 s and, after its first 30 s, keep an average of
+64 KiB/s; a slower reader gets a cut answer and can fetch the rest again with a `Range` (v0.2.6). This keeps a
+reader that reads nothing from holding a slot every other link needs.
 
 ## 2. Auth modes
 
@@ -122,9 +131,12 @@ With the daemon running, an UNSCOPED admin manages identities over HTTP — no s
 the way to change logins on a running server (the offline `-mkagent`/`-rmagent` refuse while it runs):
 
     GET    /v1/admin/grants                         # who has access (fingerprint, name, role, created, scope)
-    POST   /v1/admin/grants  {"name":"bot","role":"writer","scope":{"spaces":["team"]}}
+    POST   /v1/admin/grants  {"name":"bot","role":"writer","scope":{"spaces":["team"]},"ttl_sec":86400}
+                                                    # ttl_sec or expires_at: optional, the login then ends by itself
                                                     # -> {"token": ... (shown ONCE), "fingerprint": ...}
-    DELETE /v1/admin/grants?fingerprint=<fp>        # revoke (or ?name= when unique)
+    DELETE /v1/admin/grants?fingerprint=<fp>        # revoke (or ?name= when unique); also closes its open streams
+
+An invite can carry an end too: `acp invite --name bot --grant-ttl 90d` ends the joiner's login 90 days after it joins.
 
 In a **cluster** the identity table is replicated: a change applies on every node at once, a node that joins later
 receives it, and only token hashes are ever replicated. The first leader after upgrading replicates its existing table
@@ -144,7 +156,7 @@ commands wrap this; the endpoints are:
            # "uses" (default 1, max 10; a fixed "name" means uses 1), "name_prefix", "scope":{"path_prefix","read_prefix"}, "note"
     GET    /v1/admin/invites[?space=&status=pending|exhausted|expired|revoked]   # who created what, who joined; never a secret
     DELETE /v1/admin/invites/<id>                                  # revoke: future redeems only (200, idempotent)
-    DELETE /v1/admin/invites/<id>/member[?name=]                   # remove the agent this invite let in
+    DELETE /v1/admin/invites/<id>/member[?name=]                   # remove the access this invite gave: its workspace, or the agent if that was its last
     POST   /v1/invites/redeem {"id","secret","name"?,"redeem_key"?} # NO token needed: the secret is the credential
 
 - **What a leak can do:** the code works once and expires (default 24 h; there is no never-expiring invite). A second
@@ -187,7 +199,7 @@ spaces share nothing. This is how multiple independent collaborations — or one
 working with several different teams/services — coexist on one daemon without seeing
 each other.
 
-- A space is created on first use; list them: `acp spaces` or `GET /v1/spaces` (every space that exists, also right
+- A space is created by its first write; list them: `acp spaces` or `GET /v1/spaces` (every space that exists, also right
   after a restart; a grant scoped to some spaces sees only those).
 - `acp stats` reports the current space; pass `ACP_SPACE=...` to target another.
 - On one box, run many harnesses against many servers/spaces freely — client state is
@@ -203,23 +215,28 @@ does, install lines, SDKs, skills and guides. It never contains workspace, agent
 turns it off (those paths need a token again); `-root-page-file <file.json>` serves your own document instead
 (it's public — nothing secret in it). Capability detection for programs stays `GET /v1/healthz`.
 
+The same switch covers `GET /openapi.json` (v0.2.6), the server's OpenAPI 3.1 description of every endpoint,
+with `info.version` set to its release: token-free while the start page is on; with `-root-page=false` it needs a
+token (any role). It holds no workspace, agent or identity data either.
+
 ### Who can see what in a space
-Everyone who can read a space can follow its activity log. A direct message's **body** is only for its recipient,
-but its **subject** appears in the log (`chat.sent`) so the team can see who's talking about what. Put private
-details in the body, not the subject.
+Everyone who can read a space can follow its activity log. A direct message's **subject and body** are only for its
+sender and recipient (from v0.2.6). The log (`chat.sent`) shows who messaged whom and when, which still tells the team
+who is talking. Log entries written before the upgrade keep their subjects until retention removes them.
 
 ### How many spaces, and removing unused ones (v0.2.4)
-Any request that names a space creates it, reads included, so two limits keep one caller from filling the daemon:
+The first write that stores something in a space creates it (from v0.2.6 a read never does: it answers `404` with code
+`space_not_found` and holds no slot), so two limits keep one caller from filling the daemon:
 - **`-max-spaces`** (default 1000): spaces open on this node. It counts per process: on one node a restart resets it
   (spaces on disk reload as they are used); a cluster node reopens every space at start.
 - **`-max-spaces-per-grant`** (default 16; `0` = off): new spaces one non-admin per-agent grant may create. Over it the
   request fails with a message naming the limit. Not counted: admins, a grant scoped to a list of spaces (its list
   already bounds it), and shared-token mode (there is no per-agent identity to count; `-max-spaces` is the bound there).
   **What it counts, exactly:** spaces created through THIS server process, kept in memory. A restart starts the count
-  again from 0, and in a cluster each node counts the spaces created through it (a read on a follower creates the
-  space there), so one grant can create up to this many per node and per process lifetime. It stops a runaway
+  again from 0, and in a cluster each node counts the spaces created through it, so one grant can create up to this
+  many per node and per process lifetime. It stops a runaway
   client, not a determined one; for a hard bound give the grant a space list (`-spaces` / `scope.spaces`).
-  (Replicating the counter would cost a cluster write on every first read of a space; not done.)
+  (Replicating the counter would cost a cluster write on every new space; not done.)
 
 **See and remove spaces** (admin; a scoped admin only within its own spaces):
 ```
@@ -233,8 +250,8 @@ real, so just try it: a space with content is refused and the answer says what i
 
 Removal **refuses (409) any space that holds content**: files or their history, blobs, documents, a directory tree,
 mail, live leases, a quota setting, or **events** (since v0.2.5: a space's event log is its activity history, and
-removing the space would erase it). A read or a presence ping leaves no event, so a space created by mistake (a
-typo'd name, a read) is still removable. It's replicated in a
+removing the space would erase it). A space that holds nothing, such as one a read created before v0.2.6, is
+removable. It's replicated in a
 cluster, the `default` space can't be removed, and removing a space that isn't there is a no-op. The name is free again
 afterwards, and a slot goes back to the grant that created it. This endpoint never deletes real content: a space that
 holds anything stays. **If the name is used again it is a new space whose event numbers start at 1:** a watcher that resumes with an old
@@ -341,7 +358,8 @@ coordd -data /var/lib/acp -mkagent pod-42a -role writer \
   event/stats/presence filter exists.
 - **Rules at mint and load:** every `read_prefix` must end in `/` (refused otherwise);
   every `path_prefix` the token can write must be covered by a `read_prefix` (a write
-  scope wider than the read scope is refused — write-path responses would leak).
+  scope wider than the read scope is refused — write-path responses would leak). A token
+  with a `read_prefix` and no `path_prefix` writes only inside its `read_prefix` (v0.2.6).
   A read-scoped grant writes the **v4** `agents.json` envelope: a coordd older than
   read scopes refuses to start on it (fail-closed, see the upgrade note above).
 - **Commit-by-hash and possession:** a read-scoped token may reference a blob hash in
@@ -371,6 +389,15 @@ node down, ~1s failover, no committed-data loss). Bootstrap one node, `-join` tw
 clients are unchanged. Full steps + ops (rolling upgrade, backup, failover) are in the
 **`acp-cluster` skill**. Single-node mode
 (no `-raft-addr`) remains the default for dev/small setups.
+
+**Rolling upgrade (to v0.2.6 and after):** back up every node; find the leader (`GET /v1/cluster/status`) and leave
+it running; upgrade the followers one at a time, each back as a follower of the same leader, at the new
+`command_schema_v`, and caught up (`GET /v1/stats` `events` as on the leader) before the next; upgrade the leader last,
+once a majority runs the new version. A newer leader's first command stops every older node (a v0.2.6 leader sends
+one at once: its log epoch), so a newer node must never lead an older majority; a restarted follower cannot take the
+lead from a leader that is up (raft pre-vote). If the leader is lost early and the older nodes stop (`OPERATOR
+ACTION: refusing to apply …`, no majority, writes `503`), start each stopped node on the new binary with the same
+flags and data: it applies the command it stopped at, and nothing is lost.
 
 Idempotency keys are **replicated state**: a client retrying with an
 `Idempotency-Key` after a failover or restart gets the original result replayed, never a
@@ -409,10 +436,12 @@ production (upgrade all nodes to the same build) and treat these as current cave
   then be an unscoped admin token: the shared token no longer works.
 - **First start of a cluster:** only a node started with `-raft-bootstrap` on a NEW data folder (and no `-token` /
   `-shared-token`) makes the `owner` login; when it first leads, identity seeding replicates it to the cluster.
-  A node that joins never makes its own owner: its join request carries its own token (`-token`, else
-  `<data>/token`), so give it an unscoped admin login's token of the cluster — `-token "$(cat <bootstrap
-  data>/owner.token)"`, or copy that token into the joiner's `<data>/token` (0600) before its first start (it stays
-  off the process list) — and it receives the cluster's table. A joiner with its own random token is refused (401);
+  A node that joins never makes its own owner: its join request carries its own token (`-token-file`, `-token`,
+  else `<data>/token`), so give it an unscoped admin login's token of the cluster: copy `<bootstrap data>/owner.token`
+  to the joiner (0600) and start it with `-token-file <that file>`, or put the token in the joiner's `<data>/token`
+  before its first start. Avoid `-token "$(cat ...)"`: a value on the command line is visible to every local user in
+  the process list, and the server warns about it. The joiner then receives the cluster's table. A joiner with its own
+  random token is refused (401);
   since v0.2.5 the joiner logs why and what to do (`cluster join: … refused this node's token (401) …`) instead of
   giving up silently.
 - Cluster-membership admin (`join`/`leave`) is not yet a distinct capability from space admin — restrict
@@ -422,7 +451,10 @@ production (upgrade all nodes to the same build) and treat these as current cave
 
 A cluster has two node↔node channels: the **Raft transport** (all replicated data) and the
 **inter-node HTTP** channel (leader write-forwarding + membership join/leave, which carries a
-cloned `Authorization` bearer token). Both are hardened by one step:
+cloned `Authorization` bearer token). A forwarded write has no total time limit, so a large upload through a
+follower takes as long as the client needs; it ends when the client sends nothing for 30 s (`408`), or the leader
+takes or sends nothing for 30 s, or gives no answer within 30 s of the whole body (`502`: the write may still
+commit, so read before you retry). Both channels are hardened by one step:
 
 ```bash
 coordd -init-cluster-ca -data /srv/acp          # once
@@ -458,16 +490,46 @@ them changes a normal single-file push, pull or edit:
   mostly-emptied checkout** (an unmounted volume, an `rm -rf`, a container restarted without its volume)
   instead of deleting the tracked paths remotely — pass `--allow-bulk-delete` only when the deletion is meant.
   `--force` overrides **only** a stale edit of a file you changed; deleting a path another agent changed since
-  your base needs the separate `--force-delete`.
+  your base needs the separate `--force-delete`. A file you have not changed since your last sync is never
+  sent, with or without `--force`: another agent's newer version (or deletion) of it stands, and your next
+  `acp pull` brings it.
+- **One `acp push` or `acp pull` at a time per folder:** a second one waits up to 30 seconds for the first, then
+  stops with "another `acp push` or `acp pull` is running in …". The lock is `<folder>/.acp/lock`; the system
+  releases it when the process ends, so a crash never leaves the folder locked. Temporary download files start
+  with a dot and are never pushed.
+- **`acp pull` stays inside your folder:** it never writes or removes a file through a folder that is a link to
+  somewhere else (reported as a conflict), and never writes shared paths inside `.git`, `.acp` or `.acp-crdt`
+  folders (skipped with a note), so a writer to the space cannot plant a git hook or change your sync state.
 - **`acp pull`** refuses a manifest **older** than your sync base (a server restored to an older snapshot, a
   profile repointed at another space or server), never deletes local files when the manifest version is
-  unchanged since your last sync or when the paths are outside your token's read scope, and hash-verifies
-  every downloaded blob before it replaces a local file. `acp pull --reset-base` starts a fresh base for the
-  new target **without deleting anything** (differences are saved as `<path>.remote`).
-- **`acp crdt push`** refuses a file that would delete 90 % or more of a document of 256+ characters (an
-  emptied or wrong file) unless `--confirm-truncate`; the daemon's automatic op-log compaction also skips
-  such a document while its text is recoverable, so `acp crdt pull` (or an admin reading the op-log) can
-  restore it. An explicit `acp admin compact <doc>` still compacts.
+  unchanged since your last sync, when the paths are outside your token's read scope or when it cannot learn
+  that scope (it keeps them and decides again next pull), and hash-verifies every downloaded blob before it
+  replaces a local file. `acp push` refuses the same older manifest, and a workspace this folder synced with that no
+  longer exists, and keeps the sync record. `acp pull --reset-base` starts a fresh base for the new target **without
+  deleting anything** (differences are saved as `<path>.remote`); on a workspace that is gone, an `acp push` after it
+  creates the workspace again. `acp pull --force` replaces your changes with a newer
+  shared version but never deletes a file you changed (the other side deleted it): it is kept and reported.
+  Files whose names start with a dot (`.env`, `cfg/.rc`) are not scanned, but pull looks at each shared one
+  directly before it writes or removes it: one you edited is a conflict (the shared version is saved as
+  `<path>.remote`), never overwritten; an unedited one is updated, or removed when the other side deleted it,
+  like any file; a folder or link where a shared file goes is never replaced or removed, even with `--force`.
+  On a disk that treats names differing only in letter case as one file (macOS, Windows), pull writes the
+  first of two such shared files and reports the other by name instead of writing both into one file, and push
+  never deletes or overwrites either of them.
+- **`acp crdt push`** refuses a file that would delete more than 90 % of a document of 256+ characters (an
+  emptied or wrong file) unless `--confirm-truncate` (the MCP bridge's `acp_doc_write` applies the same rule:
+  such a write is refused unless it carries `confirm_truncate: true`); the daemon's automatic op-log compaction also skips
+  such a document while its text is recoverable, so `acp crdt pull <doc> <file> --discard-local` (or an admin
+  reading the op-log) can restore it.
+- **`acp crdt pull` and `acp crdt watch`** never write the shared text over a file that has edits not synced yet:
+  pull stops and says so (`acp crdt sync` sends the edits; `--discard-local` throws them away and takes the shared
+  text), and watch leaves the file alone until you sync. `acp crdt sync` likewise leaves a file you edited while
+  it was running as it is (your newer edits go out with the next sync). In a folder with no sync state for the
+  document (`.acp-crdt/` is per folder), `acp crdt sync` takes a file equal to the shared text as synced and
+  refuses one that differs (it used to add the whole file again and duplicate the document). `--merge` keeps the
+  whole shared text and adds the file's new lines; `--replace-shared` (formerly `--adopt-local`) replaces the shared
+  text with the file, and stops if that deletes more than 10% of it unless `--confirm-truncate` is added. An explicit
+  `acp admin compact <doc>` still compacts.
 - **Audit breadcrumbs:** every `file.edited` / `file.deleted` event carries `before.hash` — the content hash
   the path pointed at before the commit — so `GET /v1/events` can be replayed to recover what a mistaken
   delete removed, as long as blob GC has not run. Keep GC a deliberate, manual step.
@@ -476,6 +538,12 @@ them changes a normal single-file push, pull or edit:
   `spaces.pre-restore-<UTC timestamp>` (the newest two are retained; the daemon logs the path). It is an
   ordinary `spaces/` tree: to go back, stop the daemon, move the live `spaces/` aside and move the retained
   tree to `spaces/`. Remove retained trees once a restore is confirmed — they hold a full copy of the data.
+  A node that holds a workspace it cannot open always counts as holding data, so that workspace's files are kept.
+- **A backup is complete or it is not written:** if a workspace cannot be opened on this node (its log line says
+  `OPERATOR ACTION: space "<name>" unavailable`), `coordd admin dump`, `coordd admin migrate-store` and cluster
+  snapshots stop with an error naming that workspace instead of producing a copy without it. Repair the workspace
+  (the error names the repair), or move its folder out of `spaces/` if you mean to leave it out, then retry. In a
+  cluster the Raft log keeps growing until then, because no snapshot can be taken.
 
 ### Manifest history, retention & undo (capability `"history"`)
 
@@ -497,6 +565,21 @@ flag, a buggy client) is recoverable for the window, and **undo is a commit**. T
   are then reclaimed by the next `acp admin gc`. History-retained blobs **count toward `max_blob_bytes`** — a
   space can hit `507` from deleted-but-retained bytes; `GET /v1/stats.history` shows the history-only
   `blob_bytes` vs `live_blob_bytes` split so you can lower the window, prune + GC, or raise the quota.
+- **Deleted live documents** (v0.2.6) are kept in a document trash for the same `history_ttl_sec` window
+  (`GET /v1/crdt/trash`, `POST /v1/crdt/trash/restore {doc, gen}`; `/v1/crdt/json/…` for structured documents),
+  at most 1000 per space, dropped by the same history prune once the window passes. The trash does not count
+  toward `max_docs`, but a space whose only content is trashed documents is not empty (removing it waits for
+  the window). `history_ttl_sec: 0` keeps no document trash. Deleting a document copies it first, so a delete on a
+  full disk fails: free disk, or set `history_ttl_sec: 0`, which also ends file history.
+- **Text documents keep an undo window** (v0.2.6): each compaction that drops something keeps the previous
+  operation log as a retained version for `history_ttl_sec`, the last 16 per document and 1000 per space, so a very
+  busy document's window can be shorter than the TTL. `GET /v1/crdt/versions?doc=` lists them. They cost disk (a copy
+  of the log per compaction), not memory, and hold deleted text; `history_ttl_sec: 0` keeps none, and compaction is
+  otherwise unchanged. Structured documents are not covered. `acp admin compact` with no document keeps these too,
+  leaves the trash alone, and skips a document held after a mass delete: name the document to compact it anyway.
+- **What retained documents can cost:** the trash and the kept versions of text documents share a limit of 1 GiB per
+  workspace, and structured documents have their own. Past it the oldest copy goes first, so the window can be shorter
+  than the TTL. The copy just made always stays, so one very large document can go past the limit by its own size.
 - **Data that must be forgotten on delete** (a disclosure concern — retained content stays readable to
   in-scope readers for the window): set `history_ttl_sec`/`history_min_versions` low, run
   `POST /v1/admin/history/prune` then `acp admin gc`, and note a checkpoint pins content until an admin
@@ -516,6 +599,12 @@ against the certificate fingerprint the code carries, gets the agent its own tok
 works; nothing to copy by hand. `acp invites` shows who joined. Invite by an address the other machine can reach
 (the profile's `server`, or `ACP_SERVER=https://<host>:8443 acp invite …`) and that the certificate covers.
 
+**Add an agent to another workspace:** run the same command for a name that already has a login:
+`acp invite --name codexB --space proj2`. The agent runs `acp join` where its login lives, and it can then use
+`proj2` with the token it has (`acp --space proj2 …`); nothing new to store. The role must match its login (one
+login has one role). Only that agent's own login can use the invite. `acp invites remove-member <id>` takes that
+workspace away and the login keeps the others.
+
 **By hand** (a token minted with `-mkagent` or `POST /v1/admin/grants`):
 
 ```bash
@@ -526,6 +615,43 @@ acp --profile codexB status        # login: ok, codexB as writer
 
 `cert=/path/to/cert.pem` works instead of `pin=`; neither is needed for a daemon behind a proxy with a public
 certificate. Env vars (`ACP_SERVER`, `ACP_TOKEN`, `ACP_PIN`/`ACP_CERT`, `ACP_AGENT`) override any profile field.
+
+### Browser front door (people in a web page)
+
+To let people use a workspace from a web page, put **a backend on the page's own site** between the browser
+and coordd. coordd is not opened to browsers: it answers no cross-site requests, browsers reject its
+self-signed certificate, and an ACP login in a page can be read by any script on that page. The full guide for
+page authors is [BROWSER.md](BROWSER.md); a tested backend is in `examples/guides/browser-backend/`.
+
+```
+browser ──https──▶ app.example.com (TLS edge) ──▶ your backend ──https, cert verified──▶ coordd :8443
+                   /         → the page             holds one ACP login per person
+                   /acp/v1/* → forwarded            forwards an allowlist of routes
+```
+
+1. **HTTPS for the page's site.** Terminate TLS for `app.example.com` at your edge or proxy with a certificate
+   browsers trust, and serve the page and the backend from that one site (same site: no cross-site rules, and
+   the session cookie stays first-party). Prefer HTTP/2 there: each open tab holds a live event stream, and over
+   HTTP/1.1 a browser allows only about six connections per site.
+2. **coordd stays where it is**, with its own certificate. The backend verifies it (give it coordd's `cert.pem`,
+   or use a public certificate); never run the backend with TLS verification off. coordd's port does not need
+   to be reachable from the internet, only from the backend.
+3. **One login per person, by invite.** Run coordd with one login per agent (the default for a new data folder;
+   a shared-key server is refused by the example backend). Invite each person with `acp invite --name <person>
+   --space <workspace>`; the person pastes the code into the page and the backend redeems it. Every person then
+   has their own name in the log, their own rate budget and a login limited to that workspace. Remove someone
+   with `acp invites remove-member <id>`: their next request fails and the backend signs them out.
+4. **Give the backend's address to coordd as a proxy.** All redemptions arrive from the backend, so start coordd
+   with `-trusted-proxy <the backend's address>` (and have the backend send `X-Forwarded-For`, as the example
+   does); otherwise everyone joining shares the backend's limit of ten attempts a minute.
+5. **Streams.** The backend must pass `GET /v1/events?follow=true` and `GET /v1/awareness?follow=true` through
+   unbuffered. If your edge cuts idle connections (often after 60–100 seconds), the SDK reconnects and resumes
+   by itself; raise the idle timeout on the `/acp/` path if you see constant reconnects.
+6. **Keep the edge's own limits in mind:** request body size (file uploads go through `POST /v1/blobs`), and
+   no response buffering on `/acp/`.
+
+What a page must never get: a token in its HTML, script, URL or browser storage; the admin routes
+(`/v1/admin/*`); the invite routes. The backend's allowlist is the line.
 
 ## 4. Day-2 maintenance
 
@@ -544,7 +670,12 @@ certificate. Env vars (`ACP_SERVER`, `ACP_TOKEN`, `ACP_PIN`/`ACP_CERT`, `ACP_AGE
   `acp admin gc --grace 600` (keeps blobs newer than 10 min to avoid racing an
   in-flight push). Safe to run live; schedule it (cron) if churn is high.
 - **Compaction:** the event log compacts automatically when `-event-retention` is set
-  (default 50000; `0` = unlimited, and warned loudly at startup). The mailbox keeps every
+  (default 50000; `0` = unlimited, and warned loudly at startup). Audit events (file, lease,
+  document and admin records) and conversation (messages and your own actions) are counted
+  separately, so a large commit cannot evict the conversation before it. Plan for up to
+  **4×N events per space** on disk and in memory, not N: a space where one kind is rare can
+  sit near that ceiling. With `max_events` set, the tail stops at half the quota; with
+  per-label event quotas, it stays at N. The mailbox keeps every
   unread message plus the newest `-mail-retention` READ messages **per recipient**
   (default 5000) — so the retained floor is *recipients × N*, not N, and an
   never-acknowledged flood is not bounded by this setting at all. CRDT op-logs compact
@@ -559,9 +690,11 @@ certificate. Env vars (`ACP_SERVER`, `ACP_TOKEN`, `ACP_PIN`/`ACP_CERT`, `ACP_AGE
   (`-max-docs`), event log (`-event-retention`), mailbox (`-mail-retention`, per
   recipient), lease TTL (`-lease-max-ttl`). Client-supplied identifiers are length-bounded
   at the boundary (agent id 256 B, lease resource 1 KiB, idempotency key 256 B, document
-  name 256 B). In **cluster mode `-max-docs` and `-idem-window` MUST match on every
-  node** — both are checked inside the replicated apply, so a node configured differently
-  would accept a write its peers refuse.
+  name 256 B). In **cluster mode `-idem-window` MUST match on every node**: it is checked
+  inside the replicated apply, so a node configured differently would accept a write its
+  peers refuse. `-max-docs` and `-enforce-leases` are the leader's: each document write and each
+  commit carries the value (v0.2.6), so a node with another value decides the same way; set
+  them alike anyway, since any node can lead.
 - **MCP bridge:** to let an MCP harness use ACP, register `acp-mcp` against a saved profile, so no token is
   on a command line: `claude mcp add acp -- env ACP_PROFILE=<name> acp-mcp` (`acp invite --mcp` prints these steps
   for the joining agent).
@@ -569,16 +702,44 @@ certificate. Env vars (`ACP_SERVER`, `ACP_TOKEN`, `ACP_PIN`/`ACP_CERT`, `ACP_AGE
   shutdown) or snapshot the filesystem, then copy `-data` off the machine, on a schedule (ACP
   does not schedule backups itself). The event log and CRDT op-logs are append-only JSONL; the
   manifest/leases are JSON; blobs are immutable. Restore = stop, put the folder back, start.
+  **`<data>/log-epoch`** (a cluster node) holds the log epoch this node last applied, part of the log id clients
+  read; it is a cache, safe to remove: the node then shows no log id until the next epoch applies, which for a cluster node is at the next leader change. A file that
+  cannot be read or makes no sense is set aside at start as `log-epoch.bad-<time>` (logged), never refusing the start.
+  **Reverting a VM (or container) to a snapshot that includes its memory is a restore too:** the process comes back
+  with its old state and no start, so its log id does not change and clients cannot see the restore. Restart coordd
+  after such a revert (every node of a cluster), so it starts a new log epoch.
+  In a cluster, back up and restore the whole `-data` folder (its `spaces/` and `raft/` belong
+  together). From v0.2.6 a node whose `spaces/` was put back on its own from an older stopped
+  copy refuses to start ("not from the same point in time") instead of silently missing every
+  change made since; restore `-data` whole, or wipe `-data/raft` and re-join to rebuild the node.
+  A rebuild is stop, `rm -rf -data/raft`, start with `-join <member>`: the node moves its old stores
+  aside whole, as `spaces.pre-restore-<time>` beside `spaces/`, and fills an empty tree from the cluster.
+  Delete that folder once the node has caught up. A node with an empty `-data/raft` over a `spaces/` that
+  holds data never moves it unasked: with neither flag it stops and asks for `-join` to rebuild, or `-raft-bootstrap` to make this data the first node of a new cluster. The check on `spaces/`
+  needs a record written at a graceful stop: after a crash on a node that started from a local snapshot there may
+  be none, so treat it as a safety net, and always restore `-data` whole. A login with an end date cannot be
+  brought back with `-mkagent` on a cluster, so keep one admin login with no end date. `coordd admin dump` and
+  `migrate-store` take `--data-key-file` for an encrypted store. Both carry the workspaces and, since v0.2.6,
+  the logins and pending invites; copy `cert.pem`, `key.pem`, `owner.token`, a shared-key `token` and the
+  cluster CA files to the new data folder yourself.
   With `-data-key-file`, back the key up separately: the blobs are unreadable without it.
 - **Encryption at rest:** `-data-key-file <file>` (or `ACP_DATA_KEY`) holds a 32-byte key
   (`openssl rand -hex 32` makes one); blob contents are then stored AES-256-GCM encrypted, keyed
-  by plaintext hash so dedup still works. A wrong key fails closed at start (exit 78). Every
+  by plaintext hash so dedup still works. The first start with a key writes a small sealed
+  check file, `datakey.check`, in `-data` (keep it with the data; it holds no key). From v0.2.6
+  a start with a wrong key, or with no key on an encrypted `-data`, stops with "data key: …"
+  (exit 78) before anything is opened; before v0.2.6 it started and failed only on reads. Every
   cluster node needs the same key. Metadata (events, mail, manifest, leases, raft logs) is not
   encrypted by ACP: put `-data` on an encrypted volume for full coverage. Keep the key outside
   `-data`.
 - **Upgrade:** `acp update` (or re-running `install.sh`) replaces the binaries but does not restart
-  a running `coordd`; restart it yourself. Docker: bump the tag, pull, recreate. Read the version's
+  a running `coordd` or a running mount; restart `coordd` yourself, and unmount and mount again. Docker: bump the tag, pull, recreate. Read the version's
   upgrade notes first (v0.2.4: the hashed `agents.json` in §2, and the cluster upgrade order).
+  **Back up before every upgrade**: stop `coordd` and copy the whole `-data` folder, or run
+  `coordd admin dump` with the binary you are upgrading FROM. A new version may convert stored
+  data in place on its first start (the server-database edition logs "converting … in place"
+  when it does); that conversion keeps no copy of the old format, and an older binary cannot
+  read the converted data, so the backup is your way back.
 - **Restart:** stop with SIGINT/SIGTERM (drains connections, flushes logs — "stopped
   cleanly"). On start everything is replayed; event `Seq`, manifest version, leases,
   and CRDT docs all resume.
@@ -599,16 +760,19 @@ certificate. Env vars (`ACP_SERVER`, `ACP_TOKEN`, `ACP_PIN`/`ACP_CERT`, `ACP_AGE
 | `400 malformed hash` on commit | a `changes[].hash` is not 64 lowercase hex. Clients must send `hex(sha256(plaintext))`; the daemon refuses any other shape before the commit is replicated |
 | `400 X-ACP-Agent too long` | the agent id exceeds 256 bytes. Use a short stable id — it is retained as a map key and written into durable records |
 | `400 lease resource too long` | a lease `resource` exceeds 1024 bytes. The name is a durable map key, persisted and echoed into audit events, so it is bounded like any other client value |
-| `document limit reached` on a CRDT push | the space hit `-max-docs` (default 10000, per doc type). Existing documents keep working; raise the flag if the workload legitimately needs more. **In cluster mode it MUST be identical on every node** — it is checked inside the replicated apply |
+| `document limit reached` on a CRDT push | the space hit `-max-docs` (default 10000, per doc type). Existing documents keep working; raise the flag (or set a `max_docs` quota on the space) if the workload legitimately needs more. In cluster mode the leader's value travels with each document write (v0.2.6), so set it alike on every node, since any node can lead |
 | `403` on `PUT/GET /v1/admin/quota` with a `space` parameter | the token is **space-scoped** and named a space outside its allowlist. Use an unscoped admin token for cross-tenant operations |
 | daemon down | restart it — state is durable. A single node is one point of failure; for failover run the 3-node cluster (§2c, beta) and keep off-machine backups either way |
 | `acp invite`: "can't create per-agent invites" (`409 identity_mode_shared`) | the daemon is in shared-token mode (an older folder, or `-shared-token`/`-token`): stop it, `-mkagent <you> -role admin`, start it without `-token`, point your profile at the new token (§2) |
 | "where is the admin token?" on a new server | `<data>/owner.token` (Docker: `docker compose exec -T acp cat /data/owner.token`); start-up prints its path |
 | `acp invite` / `acp join`: "certificate does not cover …" | the address isn't in the cert's SANs: invite by an address it covers, or re-make the cert with `-hosts` (every joined agent must then re-pin) |
 | client: "the daemon's certificate isn't trusted" | set `pin=sha256:…` (start-up line) or `cert=` in the profile, or join with an invite |
+| `admin dump` / `migrate-store` / a cluster snapshot: "space(s) on disk could not be opened … MISSING from the snapshot" | a workspace's stored state failed to open on this node. Nothing was written. Repair it as the message says (or move its folder out of `spaces/` to leave it out on purpose), then run the command again |
+| log: `OPERATOR NOTE … history record vN set aside to …/history/torn/…` | start-up found a version record newer than the workspace's current version (a crash or power cut during a save). Nothing was deleted. If a client was told that save succeeded, the file lists every path and content address it held (its files may still be on that client); otherwise remove it. A cluster node that applies the same save again removes its copy itself |
+| log: `OPERATOR NOTE filestore: … ended in a N-byte unfinished record … moved to …/.torn-…` | a crash or power cut interrupted a write to that log (never answered as saved). The workspace opened with everything that was saved; the file holds the unfinished bytes for you to look at, and can then be removed |
 | daemon exits `78` "OPERATOR ACTION REQUIRED" | a permanent config error named in the message (bad flag, damaged store, wrong data key); restarting will not help |
 | `coordd -rmagent`/`-mkagent`: "a coordd is running on …" | the server is running on that folder; an offline edit would be undone by it. Use the grants API (`POST`/`DELETE /v1/admin/grants`) or `acp invite`/`acp invites`, or stop the server first (§2) |
-| cluster: `503` "just elected leader and is still applying the log it inherited" | right after an election a new leader serves writes only once it has applied everything committed before its term (normally milliseconds); retry after `Retry-After` |
+| cluster: `503` "just elected leader and is still applying the log it inherited" | right after an election a new leader serves writes only once it has applied everything committed before its term (normally milliseconds); retry after `Retry-After`. From v0.2.6 the error carries `retry_safe: true` (nothing was done) and `acp`, the mount, `acp-mcp` and both SDKs send it again by themselves, up to 3 sends |
 | cluster: a new node never joins; its log says `refused this node's token (401)` | the join carries the node's own token; give it an unscoped admin login's token of the cluster (`-token`, or `<data>/token` before its first start) — §2c |
 | `DELETE /v1/admin/spaces` → `409 … events=N` | the space has activity history; since v0.2.5 that counts as content and the space is kept. If events are all it holds and you mean to discard them: add `&discard_events=N` (`acp admin spaces drop <name> --confirm <name> --discard-events N`) |
 

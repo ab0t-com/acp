@@ -31,8 +31,9 @@ Status of This Memo
 
 Copyright Notice
 
-   Copyright (c) 2026 ab0t.  This specification is licensed under the MIT
-   License, the same license as the reference implementation.
+   Copyright (c) 2026 ab0t.  This specification is licensed under the
+   Apache License, Version 2.0, the same license as the reference
+   implementation.
 
 
 Table of Contents
@@ -292,6 +293,35 @@ Table of Contents
    manifest on a version conflict) so a client can reconcile without an
    extra round trip.  Status codes are summarized in Appendix B.
 
+====== BEGIN RATIFIED AMENDMENT · id=acp1-6.3-retry-safe · proposed 2026-11-02 · RATIFIED (2026-11-06, owner) ======
+
+   6.3.1.  When a 503 May Be Sent Again
+
+   A 503 can mean two different things.  Sometimes the authority refused
+   the request before acting on it.  Sometimes it does not know the
+   outcome: a replicated write that did not commit in time can still
+   commit afterwards, and sending it again would apply it twice.
+
+   The error body gains an optional member:
+
+      { "error": "...", "retry_safe": true }
+
+   "retry_safe": true is a promise that the authority did not act on this
+   request and will not act on it later.  An authority MUST NOT send it
+   when the request may yet take effect, and MUST send it only with 503.
+   The member is optional: its absence promises nothing either way, and
+   an older authority never sends it.
+
+   A client MAY then resend the request as it is, after the Retry-After
+   delay.  Without the member, a client MAY resend automatically only a
+   request that is safe by itself: GET, HEAD, or a write carrying an
+   Idempotency-Key (Section 6.4).  Any other write MUST NOT be resent
+   automatically.  A client SHOULD bound its automatic retries.  A 503
+   with no Retry-After (for example code "space_unavailable") needs an
+   operator, and SHOULD NOT be retried automatically.
+
+====== END RATIFIED AMENDMENT · id=acp1-6.3-retry-safe ======
+
    6.4.  Idempotency
 
    When a client supplies Idempotency-Key on a supported write, the
@@ -299,6 +329,32 @@ Table of Contents
    and MUST NOT apply the write more than once.  A replayed response
    SHOULD carry the header "X-ACP-Idempotent-Replay: true".  Keys MAY be
    evicted after a bounded retention.
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-6.4-idem-key-binds-request · proposed 2026-11-02 · RATIFIED (2026-11-02, owner) ======
+
+   6.4.1.  A Key Binds Its Request
+
+   A key stands for one request.  The authority MUST record a fingerprint
+   of the request with the key's result.  A later use of the key with a
+   different request MUST NOT replay and MUST NOT write: the authority
+   answers 422 with code "idempotency_key_reused" and keeps the original
+   result under the key, so a true retry of the original still replays.
+   "Repeat" in Section 6.4 means this: same key, same request.
+
+   The fingerprint covers what the client sent as the server understands
+   it, before any server-assigned field, so whitespace, member order and
+   members the server ignores do not change it.  It is recorded and
+   compared in the replicated apply, so every replica reaches the same
+   verdict (Section 17).  A key recorded by an authority that kept no
+   fingerprint is not judged: it replays, as it did.
+
+   Rationale: replaying the first result for a different request answered
+   200 for a write that was never stored.
+
+   Conformance: TestIdemKeyReuseWithDifferentBodyIs422,
+   TestDeterministicApplyIncludesIdemFingerprint.
+
+====== END RATIFIED AMENDMENT · id=acp1-6.4-idem-key-binds-request ======
 
 7.  Spaces (Multi-Tenancy)
 
@@ -315,6 +371,47 @@ Table of Contents
    Client-side state (e.g., a working copy's sync base) SHOULD be
    namespaced by (authority, space, agent) so one client may safely use
    many spaces and authorities without collision.
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-7-reads-never-create · proposed 2026-11-02 · RATIFIED (2026-11-06, owner) ======
+   This amendment replaces the sentence "A space is created on first
+   use" above.  It tightens it: a space that used to appear on any
+   request now appears only on a write.
+
+   7.1.  How a space comes to exist.  A space is created by the first
+   write that stores something in it: an event, a message, a lease, a
+   blob, a commit, or a document op; or by an admin setting its mode or
+   its quota, or creating an invite for it.  The space "default" always
+   exists.
+
+   A request that does not store anything MUST NOT create a space.
+   That covers every GET and HEAD, the read-shaped POSTs
+   (POST /v1/blobs/has, a blob capability mint), a heartbeat, and a
+   write that acts on something that must already be there (a lease
+   renew or release, an acknowledgement, a delete, a restore, a
+   checkpoint, an admin compaction or collection).  Such a request
+   leaves no state behind and MUST NOT count against any limit on the
+   number of spaces.
+
+   7.2.  The answer.  Such a request naming a space that does not exist
+   gets 404 with code "space_not_found", after the checks that come
+   before it: a malformed name is 400, and a space outside the token's
+   space scope is 403 whether it exists or not, so that a scoped token
+   learns nothing about other names.  A space the operator removed is
+   a space that does not exist.  GET /v1/whoami answers as usual,
+   because identity does not depend on a space.
+
+   7.3.  Clusters.  A space exists from its first committed write, and
+   a follower may not have applied it yet, so a follower MUST NOT
+   answer space_not_found on its own: it asks the leader, as it does
+   for a write.
+
+   7.4.  Clients.  A client about to write to a space that may be new
+   reads first as usual and treats space_not_found as an empty space
+   at manifest version 0 in cas mode, then writes.  A client that is
+   only reading reports it: a mistyped name must not look like an
+   empty workspace.  A write to a mistyped name still creates it; a
+   client MAY ask its user first.
+====== END RATIFIED AMENDMENT · id=acp1-7-reads-never-create ======
 
 8.  Event Log
 
@@ -361,6 +458,253 @@ Table of Contents
    Compaction MUST NOT affect derived state (leases, manifest, etc.),
    which is independently durable.
 
+====== BEGIN RATIFIED AMENDMENT · id=acp1-8.5-retention-by-kind · proposed 2026-11-02 · RATIFIED (2026-11-02, owner) ======
+
+   8.5.1.  Retention Counted by Kind
+
+   An authority that bounds the event log by a count of N events SHOULD
+   count two kinds of event separately, so that a burst of one cannot
+   evict the other:
+
+      audit         records the authority writes as a by-product of a
+                    state change (file.*, fs.*, crdt.*, crdtjson.*,
+                    lease.*, checkpoint.*, manifest.*, bulk.*, history.*,
+                    admin.*, blob.*, invite.*, member.*, agent.*)
+      conversation  everything else: chat.sent and every action a
+                    client chooses
+
+   Compaction stays a single prefix cut: the retained events remain
+   contiguous, and base seq, resume and gap detection are unchanged.  The
+   cut is the latest one that leaves the newest N events of each kind in
+   the retained tail, or all that kind has.  A kind with no retained event
+   holds nothing back.
+
+   An authority applying this rule MUST bound it: the events that count
+   are the newest ceiling events, for a ceiling it chooses at or above N,
+   so that a rare kind cannot pin the log (the reference daemon uses 4N).
+   A kind with events only beyond that bound holds nothing back.  An
+   authority enforcing a quota on retained events (EXT-7 max_events) MUST
+   NOT let this rule hold room the quota needs: the reference daemon caps
+   the tail at half the space quota, and applies no floor to a space with
+   a per-label event quota.
+
+   The decision MUST be a function of replicated state.  The authority
+   chooses the first seq to keep and records it in the replicated
+   command, so that every replica drops the identical prefix however many
+   events landed in between (Section 17).
+
+   Rationale: one commit of many files writes one audit event per file.
+   With a single count it evicted the conversation that came before it.
+
+   Conformance: TestEventRetentionBulkCommitKeepsTheConversation,
+   TestDeterministicApplyIncludesEventCompactFromSeq.
+
+====== END RATIFIED AMENDMENT · id=acp1-8.5-retention-by-kind ======
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-8.6-log-identity · proposed 2026-11-05 · RATIFIED (2026-11-05, owner) ======
+
+   8.6.  Log Identity
+
+   Seq numbers alone cannot tell a client that a space's history was
+   replaced.  A server restored from a copy of its data starts again at
+   an earlier head and then hands out seqs the client has already seen,
+   for different events; a cluster node that is merely behind also shows
+   a lower head.  The log identity tells the two apart.
+
+   The authority gives each space's event log an identity of two parts,
+   written "<space part>.<epoch>":
+
+      space part  fixed for one life of the space's log.  It is derived
+                  deterministically from the replicated command that
+                  creates the log and the space name, so every replica
+                  derives the same value, and it is carried in
+                  snapshots.  A space that is removed and created again
+                  gets a new one.  A log from before this section has
+                  none: the authority derives it from the space name, or
+                  reports no identity.
+
+      epoch       random, chosen anew at every start of a single-node
+                  authority and, in a cluster, by each leader once it
+                  is ready after taking office.  It is replicated (a
+                  command the leader proposes) and carried in snapshots;
+                  a follower never chooses one.
+
+   Every restore of an authority's data involves a start, so a restored
+   history always shows a new identity.  A plain restart, and a change
+   of leader, also show a new identity: the rule errs toward re-reading,
+   never toward taking a restored history for the old one.
+
+   A client compares the identity with the one it last saw:
+
+   o  The same identity and a lower head: a node behind the others.  The
+      client keeps its position and waits.
+
+   o  A new identity: the history may have been restored or rebuilt.  A
+      client that keeps derived state drops what it holds from the log,
+      re-reads, and resumes at the new head.  A client that hands events
+      to an application MUST NOT skip or replay events silently: it
+      signals a resync carrying its old position and the new head, and
+      by default re-reads.
+
+   o  No identity: unknown (an authority without this section).  The
+      client behaves as before.
+
+====== END RATIFIED AMENDMENT · id=acp1-8.6-log-identity ======
+
+====== BEGIN UNSIGNED AMENDMENT · id=acp1-8.6.1-log-identity-transport · proposed 2026-11-05 · NOT normative until ratified ======
+
+   8.6.1.  Where the Log Identity Is Reported
+
+   An authority that implements Section 8.6 reports the identity:
+
+   o  in the X-ACP-Log-Id response header of GET /v1/events, and of the
+      stream of Section 8.4, where it is sent before any event (the
+      stream's body stays one event per line);
+
+   o  as "log_id" in GET /v1/stats.
+
+   It is absent while the authority has no epoch (for example a node
+   that has not yet applied one, or a follower of a leader without this
+   section).
+
+   With the identity, GET /v1/events and its stream carry the
+   X-ACP-Log-Head response header: the log's head when the read began.
+   For the stream, it is the seq up to which the backlog is sent before
+   live events follow, so a client that sees a new identity can report
+   both its old position and the new head.
+
+====== END UNSIGNED AMENDMENT · id=acp1-8.6.1-log-identity-transport ======
+
+====== BEGIN UNSIGNED AMENDMENT · id=acp1-8.6.2-log-identity-vouched · proposed 2026-11-06 · NOT normative until ratified ======
+
+   8.6.2.  An Identity Is Shown Only When the Node Can Vouch for It
+
+   Restored data carries the epoch it had when it was copied.  A
+   cluster node that starts on it, and a node that has not yet applied
+   a newer leader's epoch, would otherwise show that epoch with a lower
+   head, which reads as a node behind the others, not as a restore.
+
+   Therefore an authority MUST NOT report an identity whose epoch it
+   cannot vouch for, and reports none instead (which a client treats
+   as unknown, Section 8.6):
+
+   o  A single-node authority reports only an epoch it chose since its
+      own start.
+
+   o  A cluster node reports only an epoch chosen in its current term,
+      and only once it has heard from that term's leader since it
+      started.  The epoch therefore carries the term it was chosen in,
+      in the replicated command and in snapshots.
+
+   A cluster leader MUST NOT accept writes until its own epoch has been
+   applied, and MUST retry choosing it until it is, for as long as it
+   leads.
+
+   (Added 2026-11-06.)  The identity is sent only when a stream opens,
+   so when a node's epoch changes it MUST end every open event stream
+   (Section 8.4).  A follower then reconnects and reads the new
+   identity; one whose stream opened while no identity was shown learns
+   it this way.  A node MUST keep its applied epoch across a restart,
+   including one after a crash.
+
+====== END UNSIGNED AMENDMENT · id=acp1-8.6.2-log-identity-vouched ======
+
+====== BEGIN UNSIGNED AMENDMENT · id=acp1-8.6.3-log-identity-client · proposed 2026-11-06 · NOT normative until ratified ======
+
+   8.6.3.  Following a Log by Its Identity (client rules)
+
+   Updates: Section 8.6.  Two statements there do not hold as written.
+   A restored history does not always show a new identity at once: a
+   cluster node shows none until it can vouch for its epoch (Section
+   8.6.2).  And "no identity" means "behave as before" only for a client
+   that has never been shown one.  This section gives the client rules
+   that close both gaps.  It changes nothing an authority sends.
+
+   Terms.  A follower (an event consumer, or a client that keeps state
+   derived from the log) keeps:
+
+      position   the last seq it delivered or applied; it reopens the
+                 stream at position + 1.
+      identity   none, or the identity it holds, taken as below.
+      mark       the seq of the last event it delivered on a stream that
+                 named the held identity, and a digest of that event (or
+                 the event read at its position when it took the
+                 identity).  Seq 0 counts as the same event everywhere.
+      behind     0, or the seq it had seen before an authority answered
+                 with a lower head.
+
+   An "event check" reads the one event at the mark's seq
+   (GET /v1/events?from=<seq>&limit=1) and compares it with the mark.
+
+   R1.  A follower holds an identity only once it is checked.  The first
+        identity it is ever shown is taken as it stands.  Any later,
+        different identity is taken only after an event check passes.
+
+   R2.  The same identity with a lower head is a node that is behind.
+        A stream waits at position + 1, with no gap and nothing
+        replayed.  A client that serves derived state keeps what it has
+        and MUST NOT serve it as current: it refuses reads until
+        "behind" clears (R8).
+
+   R3.  No identity, while the follower holds one, means "unknown".  It
+        MUST NOT be read as "behave as before": nothing is decided and
+        nothing is replayed, and a client that serves derived state
+        refuses reads while the stream names no identity.
+
+   R4.  A new identity: the follower runs the event check before it
+        hands over any event from that stream.
+        -  The same event: the same history (a restart, or a new
+           leader).  It takes the new identity and goes on from
+           position + 1, skipping nothing.
+        -  A different event, or no event at the mark's seq (except as
+           in R5): a restore.  The follower takes the new
+           identity and MUST NOT go on silently: an event consumer is
+           told (a resync carrying its old position and the new head) or
+           stops; a client that keeps derived state drops it and reads
+           everything again.
+
+   R5.  An event check decides nothing, and the new identity is not
+        taken, when it fails (a network error, a 5xx, a time limit),
+        when its answer names no identity or an identity other than the
+        one being checked, or when its answer holds no event at the
+        mark's seq and its head is below both the mark's seq and the
+        head the stream opened with.  That last answer came from a node
+        behind the one the stream reached (as through a balancer that
+        sends each request to any node).  An answer with no event there
+        and a head at or past the head the stream opened with shows a
+        shorter log: a restore (R4).  When the check decides nothing,
+        the stream does not go on; the next open checks again.
+
+   R6.  The mark moves only on events from a stream that names the held
+        identity.  Events delivered on a stream that names none leave an
+        unverified tail behind the mark.
+
+   R7.  A restore (R4) clears "behind".
+
+   R8.  "Behind" clears only on proof that the same log is back where it
+        was: an event at or past the behind seq on a stream that names
+        the held identity, an open that names it with a head at or past
+        that seq, an event check that passes with such a head, or a
+        restore.  It never clears on a stream that names no identity, or
+        on a new identity not yet checked.
+
+   R9.  The "from" of a gap reported to an event consumer is the first
+        seq that may differ: position + 1, or the mark's seq + 1 when
+        there is an unverified tail.
+
+   R10. After a stream that was healthy ends (an authority ends every
+        stream when its epoch changes, Section 8.6.2), the follower
+        reconnects after a random wait (jitter), so that every client of
+        a node does not return at the same instant; after failures it
+        backs off.  Two identities that alternate MUST NOT make a client
+        loop without waiting.
+
+   R11. Against an authority that never names an identity, the follower
+        keeps the rule from before Section 8.6: a lower head is told as
+        "behind", and nothing more can be known.
+
+====== END UNSIGNED AMENDMENT · id=acp1-8.6.3-log-identity-client ======
+
 9.  Mailbox
 
    The mailbox provides durable, directed messages between agents within
@@ -374,6 +718,20 @@ Table of Contents
    "inform" and "priority" to "normal", persist the message, and return
    it.  "to" is REQUIRED; a missing "to" MUST yield 400.  Sending SHOULD
    also append a "chat.sent" event.  Idempotency-Key is honored.
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-9.1-chat-sent-no-subject · proposed 2026-11-02 · RATIFIED (2026-11-06, owner) ======
+   This amendment tightens Section 9.1.  The event log is readable by
+   everyone in the space, and a message is readable only by its two
+   parties (Section 9.4), so the "chat.sent" event of a direct message
+   says that a message was sent and not what it is about.
+
+   The event's actor is the sender and its entity the recipient.  Its
+   context MUST NOT carry the message's subject or body.  It carries
+   the message's "id" as "msg" and its "type" as "type".
+
+   An event already in the log keeps the context it was written with.
+   Rebuilding state from a replicated log MUST reproduce it as written.
+====== END RATIFIED AMENDMENT · id=acp1-9.1-chat-sent-no-subject ======
 
    9.2.  Inbox
 
@@ -483,6 +841,34 @@ Table of Contents
    non-canonical, contains a "." or ".." segment, or contains a
    backslash.  This prevents a malicious or buggy client from causing any
    peer's materialization to escape its workspace directory.
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-11.4-file-folder-collision · proposed 2026-11-02 · RATIFIED (2026-11-02, owner) ======
+
+   11.4.1.  A Path Is a File or a Folder
+
+   A manifest MUST NOT come to hold one path as both a file and a folder:
+   "a" beside "a/b" has no form on any filesystem, so every later
+   materialization of that manifest fails.  The authority MUST refuse a
+   commit with 400 when a path the commit creates would be a prefix
+   folder of another entry, or would have another entry as a prefix
+   folder.  The check judges the manifest the commit would produce, after
+   its deletes, so replacing a file with a folder in one commit is legal.
+
+   Only created paths are judged, so a manifest that already holds such a
+   pair stays repairable: a commit that does not create a colliding path
+   MUST NOT be refused for it.  A restore of a retained version (EXT-33)
+   is not judged either: it returns to a state the space really held.
+
+   The refusal is a function of the commit and the manifest, so every
+   replica reaches it (Section 17).
+
+   Rationale: the commit used to succeed, and the damage showed up later,
+   on every peer, as a failed pull.
+
+   Conformance: TestCommitRefusesFileDirPrefixCollision,
+   TestDeterministicApplyIncludesPathCollision.
+
+====== END RATIFIED AMENDMENT · id=acp1-11.4-file-folder-collision ======
 
 12. Collaborative Documents (CRDT)
 
@@ -602,6 +988,93 @@ Table of Contents
    snapshot before pushing again, so it can never reference a collected
    element.
 
+====== BEGIN RATIFIED AMENDMENT · id=acp1-12.5-doc-delete-trash · proposed 2026-11-01 · RATIFIED (2026-11-02, owner) ======
+
+   12.5.1.  Deleting a Document; the Document Trash
+
+   An authority that offers document deletion (DELETE /v1/crdt/doc?doc=
+   <name>, and the structured-document twin DELETE /v1/crdt/json/doc of
+   EXT-5) MUST answer 404 (code "doc_not_found") when the name holds no
+   document; it MUST NOT report a deletion that did not happen.
+
+   A deletion MUST keep the deleted instance recoverable for the space's
+   history retention window (EXT-33 history_ttl_sec; a space with that
+   window set to 0 keeps nothing, and a delete there erases as before).
+   The authority keeps the instance's operation log as a TRASH entry,
+   identified by (name, generation), where generation is the deleted
+   instance's generation.  A 200 answer carries the entry:
+   {doc, deleted: true, trash: {doc, gen, deleted_at, expires_at, ops}}.
+
+      GET  /v1/crdt/trash             (reader) the retained entries in
+                                      the caller's read scope, oldest
+                                      first: {trash: [entry]}
+      POST /v1/crdt/trash/restore     (writer) {doc, gen}: the entry's
+                                      operations become a NEW instance
+                                      of the name; 409 "doc_exists"
+                                      while a document holds the name,
+                                      404 "trash_not_found" otherwise
+      (and the /v1/crdt/json/... twins for structured documents)
+
+   A restored document is a new generation of its name: a client still
+   holding the deleted instance is fenced exactly as after a delete and
+   re-fetches.  Trash entries never count toward the document quota.  The
+   authority MAY bound the number of entries per space (the reference
+   daemon keeps 1000 per document kind, dropping the oldest first) and
+   MUST drop an entry once the retention window has passed.  Every
+   decision above (what is kept, its name, its expiry, a restore's
+   verdict) MUST be a function of replicated state and the command's
+   leader-assigned time (Section 17), so every replica holds the same
+   trash.  Document names under the prefix ".acp-trash/" are reserved
+   for the authority's own bookkeeping: a request naming one is refused
+   with 400 (code "reserved_doc_name") and lists never show them.
+
+   Rationale: a delete was the one change to a document that no client
+   could undo, and it answered "deleted" even for a name that never
+   existed, hiding a mistyped name.
+
+   Conformance: TestDocDeleteAnswers404AndKeepsATrash,
+   TestDeterministicApplyIncludesDocTrashCommands.
+
+====== END RATIFIED AMENDMENT · id=acp1-12.5-doc-delete-trash ======
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-12.5-compaction-undo-window · proposed 2026-11-01 · RATIFIED (2026-11-06, owner) ======
+
+   12.5.2.  The Text-Document Undo Window
+
+   Compaction collects tombstones, which used to remove every way back
+   to deleted text.  Before a compaction that would drop operations from
+   a text document, the authority MUST keep the document's operation log
+   as a RETAINED VERSION, identified by the document's name and the
+   epoch it had before the compaction, for the space's history retention
+   window (EXT-33 history_ttl_sec).  A space with that window set to 0
+   keeps no versions.  A compaction that drops nothing keeps nothing.
+   Operations carry no timestamp, so the window applies to whole
+   versions, not to individual operations.
+
+      GET /v1/crdt/versions?doc=<name>
+          (reader) {doc, versions: [{doc, epoch, compacted_at,
+          expires_at, ops}]}, oldest first
+      GET /v1/crdt/versions?doc=<name>&epoch=<e>[&at=<n>]
+          (reader) {doc, epoch, at, ops, text}: the text after the first
+          <n> operations of that version (default: all); 404
+          "version_not_found"
+
+   A document outside the caller's read scope answers exactly as one
+   with no versions.  Restoring is an ordinary edit: read the old text
+   and write it back.  The authority MAY bound the versions it keeps
+   (the reference daemon keeps the newest 16 per document and 1000 per
+   space, so a very busy document's window can be shorter than the
+   retention window) and MUST drop a version once the window has passed.
+   Versions never count toward the document quota and are never
+   themselves compacted.  What is kept, its name and its expiry MUST be
+   a function of replicated state and the command's leader-assigned time
+   (Section 17).  Structured documents (EXT-5) are not covered.
+
+   Conformance: TestCompactionKeepsAnUndoWindow,
+   TestDeterministicApplyIncludesCompactionVersions.
+
+====== END RATIFIED AMENDMENT · id=acp1-12.5-compaction-undo-window ======
+
    12.6.  Client Sync Procedure (Informative)
 
    To merge local edits with remote ones without reverting peers, a
@@ -631,6 +1104,19 @@ Table of Contents
    POST /v1/agents/beat {harness?, host?, status?} records the caller as
    live and returns {id, last_seen, space, ...}.  GET /v1/agents lists
    agents seen in the space.  Presence MAY be node-local in a cluster.
+
+====== BEGIN RATIFIED AMENDMENT · id=acp1-13-member-query · proposed 2026-11-02
+       RATIFIED (2026-11-02, owner) ======
+
+   GET /v1/agents lists presence: who has been seen lately.  It does
+   not say who belongs.  GET /v1/agents/member?name=<agent> answers that
+   for the caller's space: {name, member}, where member is true for a
+   live login that may use the space or an open invite naming it.  It
+   is read-only and creates nothing.  A client uses it to tell a typing
+   mistake from someone who simply has not been seen yet; a client
+   talking to a server without this route keeps its presence check.
+
+====== END RATIFIED AMENDMENT · id=acp1-13-member-query ======
 
    Collision detection: if X-ACP-Session is supplied and the same agent
    id beats with a different session within a short window, the authority

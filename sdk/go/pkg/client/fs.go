@@ -26,6 +26,7 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -51,6 +52,15 @@ func (e *APIError) Code() string {
 // the mode (FSMode) and use the other surface; never retry the same call.
 func (e *APIError) WrongFSMode() bool {
 	return e.Status == http.StatusConflict && e.Code() == "wrong_fs_mode"
+}
+
+// FolderNotEmpty reports a 409 folder_not_empty: a delete with IfEmpty met a path
+// that is not an empty folder at that op's place in the batch (it gained something,
+// it is a file now, or it is gone). No op of the batch was applied. Re-read the tree
+// before deciding; never resend blindly. The message names the path or only its leaf
+// name, so branch on this and never on the text.
+func (e *APIError) FolderNotEmpty() bool {
+	return e.Status == http.StatusConflict && e.Code() == "folder_not_empty"
 }
 
 // FSModeConfirmRequired reports a 428 fs_mode_confirm_required: the flip would
@@ -94,6 +104,13 @@ func (c *Client) requireCrdtfs() error {
 	return nil
 }
 
+// ErrNoFSMode: the daemon answered and does not advertise the fsmode capability — it
+// predates realtime mode, so every space on it is CAS. This is the ONLY failure of
+// FSMode that says what the mode is: any other error (a dropped connection, a 5xx, a
+// refused token) says nothing, and a caller choosing a surface from it must stop, not
+// assume CAS.
+var ErrNoFSMode = errors.New("daemon lacks fsmode capability (older coordd) — every space is CAS; upgrade the daemon to use realtime mode")
+
 // requireFsmode gates the mode read/flip on the ext-31 capability.
 func (c *Client) requireFsmode() error {
 	ok, err := c.hasCapability("fsmode")
@@ -101,7 +118,7 @@ func (c *Client) requireFsmode() error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("daemon lacks fsmode capability (older coordd) — every space is CAS; upgrade the daemon to use realtime mode")
+		return ErrNoFSMode
 	}
 	return nil
 }
@@ -121,6 +138,20 @@ func (c *Client) FSMode() (string, error) {
 		return wire.FSModeCAS, nil
 	}
 	return out.FSMode, nil
+}
+
+// FSModeForWrite is FSMode for a caller about to write: a space that does not exist
+// yet counts as CAS, which is what it will be when the write creates it. This is the
+// one other failure that says what the mode is, and only to a writer: a reader
+// reports it (SpaceNotFound). If an admin makes the name realtime meanwhile, the
+// commit answers 409 wrong_fs_mode, so nothing lands on the wrong surface. ErrNoFSMode
+// and every other failure come back as from FSMode.
+func (c *Client) FSModeForWrite() (string, error) {
+	m, err := c.FSMode()
+	if IsSpaceNotFound(err) {
+		return wire.FSModeCAS, nil
+	}
+	return m, err
 }
 
 // SetFSMode flips the space's mode (ADMIN role; ext-31 §4.3). mode is
@@ -185,7 +216,9 @@ func (c *Client) FSTree() ([]wire.FSNode, error) {
 // stat fault on create. Check the result's Outstamped: those ops had no effect.
 //
 // No idempotency key in v1: a retry after a commit timeout can double a
-// create/rename (HZ-ACPDB-29) — re-read the tree before retrying.
+// create/rename (HZ-ACPDB-29) — re-read the tree before retrying. A 503 marked
+// retry_safe did nothing and is sent again here (see send); one without the
+// mark is that timeout and comes back to the caller.
 func (c *Client) FSOps(ops []wire.FSOp) (wire.FSOpsResult, error) {
 	var out wire.FSOpsResult
 	if err := c.requireCrdtfs(); err != nil {

@@ -70,8 +70,9 @@ Status of This Memo
 
 Copyright Notice
 
-   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
-   license as the reference implementation and the base specification.
+   Copyright (c) 2026 ab0t.  Licensed under the Apache License, Version
+   2.0, the same license as the reference implementation and the base
+   specification.
 
 
 Table of Contents
@@ -349,6 +350,57 @@ Table of Contents
       interpreted entirely by the client that dereferences the URI.  Its
       per-type grammar is deferred with the types themselves (Section 6).
 
+      ====== BEGIN AMENDMENT · id=ext32-3.4-query-clarifications ·
+      RATIFIED (2026-11-06, owner) ======
+
+      This clarification settles two points the text above leaves open,
+      so that every resolver refuses exactly the same inputs.  It
+      tightens; it relaxes nothing.  Conformance vectors (the shared
+      resolver vector table): query/semicolon-not-a-separator,
+      link/semicolon-query, sec/raw-token-key/<name> (one per name in
+      (b)), sec/raw-token-uppercase, sec/raw-token-encoded-key,
+      sec/raw-token-no-value, sec/raw-token-before-pin-check,
+      sec/raw-token-kelvin-key, sec/raw-token-long-s-key,
+      sec/dotted-capital-i-key-not-folded,
+      sec/token-lookalike-key-ignored, disc-addr/raw-token-kelvin,
+      link/token-key, link/token-key-kelvin.
+
+      (a) THE ";" OCTET.  Query parameters are separated by "&" ONLY; a
+          ";" is never a separator.
+          o  A resolver that builds a shareable ACP URI from a minted
+             capability URL (the signed EXT-3 blob link of Section 3.6
+             (2)) MUST REFUSE that URL as a malformed capability when a
+             ";" appears anywhere in its query.  A daemon never emits one
+             in a link it mints, and a reader that split on it would see
+             parameters the signer never saw.
+          o  In an ACP URI's own query a ";" is an ordinary octet of the
+             key or value it appears in: "v=1;foo=2" is ONE "v" pin whose
+             value is not a manifest version, and is refused as such.
+
+      (b) CREDENTIAL KEYS.  The ironclad rule (Section 3.6) is also
+          enforced on query keys by NAME.  A resolver MUST REFUSE an ACP
+          URI (a discovery address included) and a minted capability URL
+          it is given when a key of its query, after percent-decoding,
+          equals one of these names under Unicode SIMPLE case folding
+          (the C and S mappings of the Unicode case-folding table; not
+          the full or Turkic mappings), with or without a value:
+
+             token  access_token  bearer  authorization  auth
+             password  passwd  secret  api_key  apikey
+             acp_token  x-acp-token
+
+          So "TOKEN", "to<U+212A>en" (U+212A KELVIN SIGN folds to "k") and
+          "pa<U+017F><U+017F>word" (U+017F LATIN SMALL LETTER LONG S
+          folds to "s") are refused like "token" and "password", while
+          "author<U+0130>zation" is an unknown key (U+0130 has no simple
+          fold to "i").  In an ACP URI the check runs as soon as the
+          query is split and decoded, before any reserved key ("v", "cp",
+          the capability) is read.  A key that merely resembles a name
+          ("tokens", "my_token") is an ordinary unknown key: ignored and
+          never sent (above).  A refusal MUST NOT echo the value.
+
+      ====== END AMENDMENT · id=ext32-3.4-query-clarifications ======
+
    3.5.  Resolution to the acp/1 wire (deterministic).
 
       The resolver is a PURE, client-side mapping from an ACP URI to a
@@ -518,6 +570,84 @@ Table of Contents
 
       Equality: two ACP URIs denote the same resource IFF their
       canonical forms (fragment excluded) are byte-equal.
+
+      ====== BEGIN AMENDMENT · id=ext32-3.7-wellformed-text ·
+      RATIFIED (2026-11-06, owner) ======
+
+      This clarification settles a point the text above leaves open, so
+      that every resolver refuses exactly the same inputs.  It tightens;
+      it relaxes nothing.  Conformance vectors (the shared resolver
+      vector table): every vector whose id begins "wellformed/", among
+      them wellformed/lone-high-in-path, wellformed/lone-low-in-path,
+      wellformed/reversed-pair-in-path, wellformed/lone-high-in-space,
+      wellformed/lone-in-query-key, wellformed/lone-in-fragment,
+      wellformed/format-lone-high-in-path, wellformed/link-lone-in-path,
+      wellformed/link-lone-in-minted-k,
+      wellformed/utf8-stray-continuation-in-path,
+      wellformed/utf8-overlong-in-path, wellformed/traversal-before-lone,
+      wellformed/format-bad-host-before-lone,
+      wellformed/disc-doc-lone-in-body, and the accepted
+      wellformed/max-code-point, wellformed/replacement-char-is-text,
+      wellformed/emoji-pair; with the earlier pct/lone-continuation,
+      pct/overlong-utf8 and pct/utf16-surrogate.
+
+      (a) AN ACP URI NAMES TEXT.  Its space, path segments, query keys
+          and values, and fragment are Unicode text, carried as UTF-8
+          (percent-encoded as the canonical form above requires).  Input
+          that is NOT well-formed text names nothing: a byte sequence
+          that is not valid UTF-8 (a stray continuation byte, an overlong
+          or truncated sequence, the UTF-8-style encoding of a surrogate
+          code point) or, in a runtime whose strings are UTF-16, a LONE
+          surrogate code unit (one half of a pair).
+          o  A resolver MUST REFUSE such input wherever it reads or builds
+             an ACP URI: when parsing one (raw or percent-encoded), when
+             building one from parts (host, space, path), when building a
+             shareable link from a minted capability URL (its signed
+             parameters and the path it names), and when comparing or
+             dereferencing a URI value it did not parse itself.  The
+             refusal is the one a malformed percent-escape gets (e.g.
+             "%C3"), so a bad sequence is refused identically whether it
+             arrives raw or escaped.  An interface with no way to report
+             a refusal (a pure rendering of such a value to a string)
+             MUST emit a string that every resolver refuses.
+          o  A resolver MUST NOT repair such input.  In particular it MUST
+             NOT substitute U+FFFD REPLACEMENT CHARACTER (as a lossy
+             encoder or decoder does): "%EF%BF%BD" is the name of a
+             different, real file, so the substitution would silently
+             address, share or overwrite that file instead.
+          o  Refusals keep the order of the grammar: a URI that an earlier
+             step already refuses (a malformed host, a ".." that escapes
+             the space root) is refused for that reason, exactly as if
+             the later segment were well-formed.
+          o  Well-formed text is unaffected: every Unicode scalar value,
+             U+10FFFF and a literal U+FFFD in a name included, is ordinary
+             text and stays addressable.
+
+      (b) A discovery document (Section 3.8) whose body is not
+          well-formed text -- including a body handed to a resolver as a
+          UTF-16 string that holds a lone surrogate -- is malformed and
+          is refused as such, never read with replacement characters.
+
+      ====== END AMENDMENT · id=ext32-3.7-wellformed-text ======
+
+      ====== BEGIN AMENDMENT · id=ext32-3.7-url-ip-literal ·
+      RATIFIED (2026-11-06, owner) ======
+
+      This clarification settles a point the text above leaves open, so
+      that a resolver's answer never depends on the URL library or the
+      toolchain that built it.  It tightens; it relaxes nothing.
+
+      Wherever a resolver reads an https URL (a minted capability URL,
+      a discovery endpoint, a profile server), a "[" or "]" in the
+      authority is legal only as ONE leading pair around a zone-free
+      IPv6 address.  A resolver MUST apply this rule itself and MUST NOT
+      rely on its URL library to enforce it.  Anything else (an IPv4
+      address in brackets, a malformed IPv6 address, a zone, a stray
+      bracket) is refused as malformed.
+
+      Conformance vectors: every vector whose id begins "url/".
+
+      ====== END AMENDMENT · id=ext32-3.7-url-ip-literal ======
 
    3.8.  Daemon side -- read-only discovery only (.well-known/acp).
 

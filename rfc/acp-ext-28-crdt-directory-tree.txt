@@ -91,8 +91,9 @@ Status of This Memo
 
 Copyright Notice
 
-   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
-   license as the reference implementation and the base specification.
+   Copyright (c) 2026 ab0t.  Licensed under the Apache License, Version
+   2.0, the same license as the reference implementation and the base
+   specification.
 
 
 Table of Contents
@@ -705,6 +706,49 @@ Table of Contents
       surfaced through the virtual-FS facade" is what EXT-31's realtime
       mode presents to an agent as ordinary readFile/writeFile.
 
+      ====== BEGIN AMENDMENT · id=ext28-4.5-create-blob-must-exist ·
+      RATIFIED (2026-11-02, owner) ======
+
+      This amendment tightens Section 4.5; it relaxes nothing.  The
+      text above says a file's blob is uploaded BEFORE the placement op
+      but did not say what the authority does when it was not, so an
+      implementation could acknowledge a file whose bytes it does not
+      hold.
+
+      (a) A "create" op of POST /v1/fs/ops that carries a "blob" MUST
+          name a well-formed content hash (64 lowercase hex, ACP/1
+          Section 11) of a blob the space stores.  Otherwise the
+          authority MUST refuse the WHOLE batch with no state change:
+          400 with code "bad_blob_hash" for a malformed hash, 400 with
+          code "blob_not_uploaded" for a hash it does not store.  The
+          client uploads the bytes (POST /v1/blobs) and retries.  This
+          is the same rule ACP/1 Section 11 already applies to a commit
+          that names a blob that was never uploaded.
+
+      (b) The check is made where the op is APPLIED, against replicated
+          state (Section 4.8; ACP/1 Section 17): blob uploads and
+          garbage collection are themselves ordered, so a collection
+          ordered between the leader's check and the apply refuses the
+          batch identically on every replica.  It is never a check of
+          one node's disk only.
+
+      (c) No oracle (EXT-27).  For a read-scoped token, a hash it did
+          not upload and cannot read through a path in its scope (the
+          manifest, retained history, or a live file of this tree) MUST
+          be refused exactly as a hash that is not stored: the same
+          status, code and text.
+
+      (d) Mixed versions (Section 8.3).  Applying (b) changes what a
+          node does with a replicated "fs.ops" command, so it rides the
+          implementation's replicated-command version: a node that does
+          not apply this rule MUST NOT apply a command stamped at the
+          version that requires it.  Upgrade every node first.
+
+      Conformance: TestFSCreateRefusesUnuploadedBlob,
+      TestFSCreateRacingGCIsRefusedInApply.
+
+      ====== END AMENDMENT · id=ext28-4.5-create-blob-must-exist ======
+
    4.6.  Data model and data-model delta.
 
       DATA MODEL (realtime space):
@@ -1010,6 +1054,65 @@ Table of Contents
          Whether the batch guard is REQUIRED in v1 or deferred is an owner
          question (Section 12); the recoverability guarantee above stands
          either way.
+
+      ====== BEGIN AMENDMENT · id=ext28-5.7-folder-delete-counts-files ·
+      RATIFIED (2026-11-02, owner) ======
+
+      This amendment fixes what the batch measurement above COUNTS.  It
+      tightens; it relaxes nothing.  (It is the realtime half of the
+      EXT-34 measurement; EXT-34's CAS measurement already counts
+      paths, so a folder removed through a commit counts every file in
+      it.)
+
+      (a) A DELETE op whose target is a FOLDER counts as the number of
+          FILE nodes live under that folder in the batch's own working
+          view (after the batch's earlier ops), not as one.  A delete of
+          a file, or of a folder holding no files, counts as one.
+
+      (b) The batch's total is compared with the space's bulk threshold
+          exactly as before; a refusal reports that total, and the batch
+          changes nothing.
+
+      (c) Rationale: one op trashing a folder of thousands of files was
+          counted as a single delete, so the disposition wall never
+          reached the most concentrated mass-delete a client can send.
+
+      Conformance: TestFSFolderDeleteCountsSubtreeForBulkGuard.
+
+      ====== END AMENDMENT · id=ext28-5.7-folder-delete-counts-files ======
+
+      ====== BEGIN AMENDMENT · id=ext28-5.7.1-delete-if-empty ·
+      RATIFIED (2026-11-06, owner) ======
+
+      5.7.1.  Deleting a folder only if it is empty.
+
+      A delete op in POST /v1/fs/ops MAY carry "if_empty": true.  The op
+      then applies only if its path is a live folder holding no live
+      node, judged at the op's place in the replicated log, after the
+      earlier ops of its batch.  Trashed nodes do not count.  If it is
+      anything else, the authority MUST refuse the WHOLE batch with 409
+      (code "folder_not_empty"), with no state change, and the client
+      re-reads the tree and decides again.
+
+      A client SHOULD set it on every delete that means "remove this
+      empty folder": an rmdir, and the delete half of a rename over an
+      empty folder.  A check on the client's own view cannot do this: a
+      teammate's file can land between that view and the delete, and it
+      would then go to the trash inside the folder, with nothing
+      reported.  The check belongs where the order is decided.
+
+      "if_empty" on any other op is refused with 400.  The verdict MUST
+      be a function of the op stream and the tree (ACP/1 Section 17), so
+      every replica reaches it.  An authority that predates this
+      amendment ignores the member and deletes unconditionally, which is
+      what a delete did before; this is an addition, not a change to a
+      delete without it.
+
+      Conformance: TestFSDeleteIfEmptyOverHTTP,
+      TestFSDeleteIfEmptyRefusesAtTheApply,
+      TestApplyOpsIfEmptyRefusalChangesNothing.
+
+      ====== END AMENDMENT · id=ext28-5.7.1-delete-if-empty ======
 
    5.8.  EXT-18 (provenance).  The linear-history caveat (Abstract) is
       the reason realtime mode is opt-in: EXT-18's total-order audit

@@ -138,7 +138,7 @@ func ParseDiscoveryAddress(input string) (*DiscoveryAddress, error) {
 			if err != nil {
 				return nil, err
 			}
-			if credentialKeys[asciiLower(k)] {
+			if isCredentialKey(k) {
 				return nil, errf(CodeRawToken, "query key %q looks like a raw credential — a token must never ride in an acp:// URI (discovery is anonymous)", k)
 			}
 		}
@@ -264,7 +264,7 @@ func ParseDiscoveryDocument(body []byte, address DiscoveryAddress, presentedFing
 		return nil, malformed(`"endpoint" must be an origin (no query or fragment)`)
 	}
 	eu, err := url.Parse(*endpointRaw)
-	if err != nil || eu.Host == "" || !strings.Contains(*endpointRaw, "://") {
+	if err != nil || eu.Host == "" || !strings.Contains(*endpointRaw, "://") || !urlIPLiteralOK(*endpointRaw) {
 		return nil, malformed("\"endpoint\" %q is not a URL", *endpointRaw)
 	}
 	if eu.Scheme != "https" {

@@ -60,11 +60,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/ab0t-com/acp/sdk/go/pkg/client"
@@ -237,6 +239,20 @@ var (
 	linkKeys = []string{"h", "sp", "e", "k", "s"}
 )
 
+// isCredentialKey reports whether a query key names a raw credential. The
+// comparison is Unicode SIMPLE case folding (strings.EqualFold), so a spelling
+// that folds onto a credential name is refused too: besides the ASCII letters,
+// U+212A KELVIN SIGN folds to "k" and U+017F LONG S to "s" ("to\u212Aen" is
+// "token"). The TS twin implements the identical rule (shared vectors pin it).
+func isCredentialKey(k string) bool {
+	for c := range credentialKeys {
+		if strings.EqualFold(k, c) {
+			return true
+		}
+	}
+	return false
+}
+
 func isLinkKey(k string) bool {
 	for _, lk := range linkKeys {
 		if k == lk {
@@ -307,6 +323,27 @@ func pctDecode(s, what string) (string, error) {
 		return "", err
 	}
 	return dec, nil
+}
+
+// checkText refuses a *URI whose text is not well-formed — invalid UTF-8 in the
+// space, the path, or the signed link's k/sp (the text that becomes address
+// octets). D26 / clarification ext32-3.7-wellformed-text: an acp:// address
+// names TEXT; a sequence that is not UTF-8 is REFUSED with percent_encoding (the
+// code Parse and Format give the same octets), never encoded as U+FFFD, which
+// names a different file. Parse and Format never produce such a URI; this
+// guards the entry points that accept a *URI a caller built itself. (The TS
+// twin's check is the lone-UTF-16-surrogate rule — the same refusal.)
+func checkText(u *URI) error {
+	fields := []struct{ what, s string }{{"space", u.Space}, {"path", u.Path}}
+	if u.Capability != nil {
+		fields = append(fields, struct{ what, s string }{"capability \"k\"", u.Capability.K}, struct{ what, s string }{"capability \"sp\"", u.Capability.SP})
+	}
+	for _, f := range fields {
+		if !utf8.ValidString(f.s) {
+			return errf(CodePercentEncoding, "%s: not well-formed text (invalid UTF-8) — an acp:// address names UTF-8 text; refusing rather than encoding it as U+FFFD (another name)", f.what)
+		}
+	}
+	return nil
 }
 
 func assertNoControl(s, what string) error {
@@ -570,11 +607,11 @@ func parseAuthority(authority string) (string, int, error) {
 	port := DefaultPort
 	if portPart != nil {
 		if !portRE.MatchString(*portPart) {
-			return "", 0, errf(CodePort, "invalid port %q", *portPart)
+			return "", 0, errf(CodePort, "invalid port %q: a port runs from 1 to 65535. Check the address you were given", *portPart)
 		}
 		n, _ := strconv.Atoi(*portPart)
 		if n < 1 || n > 65535 {
-			return "", 0, errf(CodePort, "port %d out of range", n)
+			return "", 0, errf(CodePort, "port %d out of range: a port runs from 1 to 65535. Check the address you were given", n)
 		}
 		port = n
 	}
@@ -623,7 +660,7 @@ func parseQuery(rawQuery, space string, kind ResourceKind) (*int64, *Capability,
 	}
 	// The ironclad rule, defense-in-depth: a credential-shaped key is refused.
 	for _, k := range order {
-		if credentialKeys[asciiLower(k)] {
+		if isCredentialKey(k) {
 			return nil, nil, nil, errf(CodeRawToken, "query key %q looks like a raw credential — a token must never ride in an acp:// URI (use a profile or a signed capability link)", k)
 		}
 	}
@@ -699,7 +736,11 @@ func capabilityQuery(c *Capability) string {
 // Canonical returns the canonical string (§3.7): two URIs naming the same
 // resource canonicalize to byte-identical strings. The default port is omitted
 // (D3); the fragment is excluded (not part of identity); reserved query keys
-// sort ascending.
+// sort ascending. u is expected to come from Parse/Format. Canonical has no
+// error result, so a hand-built *URI whose text is not UTF-8 is rendered
+// byte-for-byte as %XX escapes — never U+FFFD — and that output is refused by
+// Parse (percent_encoding); SameResource, Lookup, ClientFor and ReadCapability
+// refuse such a URI outright (checkText).
 func Canonical(u *URI) string {
 	var sb strings.Builder
 	sb.WriteString("acp://")
@@ -767,6 +808,9 @@ func SameResource(a, b any) (bool, error) {
 func canonicalOf(v any) (string, error) {
 	switch x := v.(type) {
 	case *URI:
+		if err := checkText(x); err != nil {
+			return "", err
+		}
 		return Canonical(x), nil
 	case string:
 		return CanonicalString(x)
@@ -810,21 +854,74 @@ type ProfileStore interface {
 // returned in the same form Parse uses (lowercase; an IPv6 literal bracketed).
 func ProfileServerHostPort(server string) (string, int, error) {
 	u, err := url.Parse(server)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || !urlIPLiteralOK(server) {
 		return "", 0, errf(CodeNoProfile, "profile server %q is not a URL", server)
 	}
 	if u.Scheme != "https" {
 		return "", 0, errf(CodeNoProfile, "profile server %q must be https (acp:// implies TLS)", server)
 	}
+	host, port, herr := httpsHostPort(u)
+	if herr != nil {
+		return "", 0, errf(CodeNoProfile, "profile server %q: %s", server, herr.Msg)
+	}
+	return host, port, nil
+}
+
+// urlIPLiteralOK is this package's own rule for a bracket in an https URL's
+// authority (a minted URL, a discovery endpoint, a profile server): a "[" or "]"
+// is only legal as one leading pair around an IPv6 address with no zone. It is
+// stated here, not left to net/url, because net/url's answer depends on the Go
+// release (1.23 and 1.25.0 accept "[0:1]" and "[1::2::3]"; 1.25.12 refuses them)
+// and a resolver must not read an address differently per toolchain. The TS
+// twin's splitRawURL applies the identical rule; shared vectors url/ip-literal-*.
+func urlIPLiteralOK(raw string) bool {
+	i := strings.Index(raw, "://")
+	if i < 0 {
+		return true // no authority: url.Parse and the callers' host checks decide
+	}
+	a := raw[i+3:]
+	if j := strings.IndexAny(a, "/?#"); j >= 0 {
+		a = a[:j]
+	}
+	if at := strings.LastIndex(a, "@"); at >= 0 {
+		a = a[at+1:]
+	}
+	if !strings.ContainsAny(a, "[]") {
+		return true
+	}
+	end := strings.LastIndex(a, "]")
+	if strings.LastIndex(a, "[") != 0 || end < 0 {
+		return false
+	}
+	addr, err := netip.ParseAddr(a[1:end])
+	return err == nil && addr.Is6() && addr.Zone() == ""
+}
+
+// httpsHostPort is the authority of an already-parsed https URL in the form
+// Parse uses — lowercase host (ASCII fold), an IPv6 literal bracketed, the
+// https default 443 — held to the SAME host grammar as an acp:// authority and
+// to a real port (1..65535). It refuses userinfo: an https URL that feeds an
+// address (a profile's server, a minted link) never carries a credential in its
+// authority (§3.6). Returns a refusal message (the caller picks the code).
+func httpsHostPort(u *url.URL) (string, int, *Error) {
+	if u.User != nil {
+		return "", 0, &Error{Msg: "userinfo is forbidden in the authority (a credential never rides in a URL)"}
+	}
 	host := asciiLower(u.Hostname())
 	if strings.Contains(host, ":") {
+		if !strings.HasPrefix(u.Host, "[") { // only brackets make a colon part of a host
+			return "", 0, &Error{Msg: fmt.Sprintf("invalid host %q", u.Host)}
+		}
 		host = "[" + host + "]"
+	}
+	if !hostRE.MatchString(host) {
+		return "", 0, &Error{Msg: fmt.Sprintf("invalid host %q", u.Hostname())}
 	}
 	port := 443
 	if p := u.Port(); p != "" {
 		n, err := strconv.Atoi(p)
-		if err != nil {
-			return "", 0, errf(CodeNoProfile, "profile server %q is not a URL", server)
+		if err != nil || n < 1 || n > 65535 {
+			return "", 0, &Error{Msg: fmt.Sprintf("invalid port %q", p)}
 		}
 		port = n
 	}
@@ -933,7 +1030,9 @@ type Resolved struct {
 // Resolve maps a parsed URI to its acp/1 requests (§3.5). Pure: no I/O. A
 // port-less URI resolves to the default port (D3). A signed file link (D1)
 // resolves to the shipped tokenless capability fetch
-// `GET /v1/cap/blob/<h>?e=&k=&s=&sp=`.
+// `GET /v1/cap/blob/<h>?e=&k=&s=&sp=`. Like Canonical it has no error result:
+// a hand-built *URI whose text is not UTF-8 is refused by Lookup/ClientFor/
+// ReadCapability, the entry points that act on it.
 func Resolve(u *URI) *Resolved {
 	r := &Resolved{
 		URI:           u,
@@ -985,6 +1084,9 @@ func ResolveString(s string) (*Resolved, error) {
 // refused (it needs no profile); a missing profile, or one lacking a token or
 // agent, is a no_profile refusal (never a silently unauthenticated result).
 func Lookup(u *URI, profiles ProfileStore) (*Resolved, *Profile, error) {
+	if err := checkText(u); err != nil {
+		return nil, nil, err
+	}
 	if u.Capability != nil {
 		return nil, nil, errf(CodeCapabilityUnsupportedResource, "a signed link authorizes itself — read it with ReadCapability; it does not use a profile")
 	}
@@ -1030,6 +1132,9 @@ type ReadOptions struct {
 // surface as *client.APIError with the daemon's status (a leaked link EXPIRES;
 // a tampered signature is refused). The caller closes the returned body.
 func ReadCapability(u *URI, opts ReadOptions) (io.ReadCloser, error) {
+	if err := checkText(u); err != nil {
+		return nil, err
+	}
 	if u.Capability == nil {
 		return nil, errf(CodeCapabilityMalformed, "not a signed link: it carries no h/sp/e/k/s — resolve it through a profile instead")
 	}
@@ -1044,6 +1149,14 @@ func ReadCapability(u *URI, opts ReadOptions) (io.ReadCloser, error) {
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err // its text holds the whole URL, and the signature in it is the credential
+		}
+		if end := time.Unix(u.Capability.E, 0); time.Now().After(end) {
+			// No trust means no answer from the server, but the link says this much itself.
+			return nil, fmt.Errorf("%w. This link also says it expired on %s, so ask for a new one", err, end.UTC().Format(time.RFC3339))
+		}
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
@@ -1056,9 +1169,41 @@ func ReadCapability(u *URI, opts ReadOptions) (io.ReadCloser, error) {
 		if json.Unmarshal(body, &e) == nil && e.Error != "" {
 			msg = e.Error
 		}
-		return nil, &client.APIError{Status: resp.StatusCode, Message: msg, Raw: body}
+		return nil, &client.APIError{Status: resp.StatusCode, Message: linkRefusal(u, resp.StatusCode, msg), Raw: body}
 	}
-	return resp.Body, nil
+	return client.VerifyBlob(u.Capability.H, resp.Body), nil // reading to the end checks the bytes against h
+}
+
+// plainPathRE is a path that can stand in a command as it is.
+var plainPathRE = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+
+// linkRefusal adds the one thing the reader of a refused link can do: a link can't be
+// mended, only made again by someone who holds the file (B3-NEXT). It reads both server
+// styles (R-C22): an older server's bare "capability url expired", and one from v0.2.6
+// that adds a generic next step in parentheses, "... (ask for a new one)". The date goes
+// right after "expired", and the link's own next step replaces the generic one.
+func linkRefusal(u *URI, status int, msg string) string {
+	switch status {
+	case http.StatusGone, http.StatusForbidden, http.StatusNotFound:
+	default:
+		return msg
+	}
+	if i := strings.LastIndex(msg, " ("); i > 0 && strings.HasSuffix(msg, ")") {
+		msg = msg[:i] // the server's generic hint: the one below is the link's
+	}
+	if status == http.StatusGone {
+		on := " on " + time.Unix(u.Capability.E, 0).UTC().Format(time.RFC3339)
+		if i := strings.Index(msg, "expired"); i >= 0 {
+			msg = msg[:i+len("expired")] + on + msg[i+len("expired"):]
+		} else {
+			msg += on
+		}
+	}
+	path := "<file>"
+	if plainPathRE.MatchString(u.Path) {
+		path = u.Path
+	}
+	return msg + ": ask whoever sent it for a new one (they run: acp share " + path + ")"
 }
 
 // LinkFromBlobURL turns a minted blob-capability URL (the daemon's
@@ -1067,7 +1212,7 @@ func ReadCapability(u *URI, opts ReadOptions) (io.ReadCloser, error) {
 // (D1). The result is canonical.
 func LinkFromBlobURL(blobURL, path string) (string, error) {
 	u, err := url.Parse(blobURL)
-	if err != nil {
+	if err != nil || !urlIPLiteralOK(blobURL) {
 		return "", errf(CodeCapabilityMalformed, "not a URL: %q", blobURL)
 	}
 	m := capPathRE.FindStringSubmatch(u.EscapedPath())
@@ -1086,7 +1231,7 @@ func LinkFromBlobURL(blobURL, path string) (string, error) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if credentialKeys[asciiLower(k)] {
+		if isCredentialKey(k) {
 			return "", errf(CodeRawToken, "blob-capability URL carries a credential-shaped key %q — refusing to build a link from it", k)
 		}
 	}
@@ -1113,17 +1258,16 @@ func LinkFromBlobURL(blobURL, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	host := u.Hostname()
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
-	}
-	port := 443
-	if p := u.Port(); p != "" {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			return "", errf(CodeCapabilityMalformed, "not a URL: %q", blobURL)
+	// The decoded params become URI octets: a value that is not UTF-8 can never
+	// name anything, so refuse it here, before it is spliced into the link.
+	for _, v := range []string{sp, e, k, s} {
+		if !utf8.ValidString(v) {
+			return "", errf(CodePercentEncoding, "blob-capability URL: a parameter is not valid UTF-8 once decoded")
 		}
-		port = n
+	}
+	host, port, herr := httpsHostPort(u)
+	if herr != nil {
+		return "", errf(CodeCapabilityMalformed, "blob-capability URL: %s", herr.Msg)
 	}
 	link, err := Format(Parts{Host: host, Port: port, Space: sp, Path: path, Kind: KindFile})
 	if err != nil {

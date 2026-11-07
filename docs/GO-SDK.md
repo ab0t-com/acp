@@ -71,10 +71,25 @@ if errors.As(err, &apiErr) {
     switch {
     case apiErr.Locked():    // 423 – held by someone else
     case apiErr.Conflict():  // 409 – version/lease conflict; reconcile & retry
-    case apiErr.OverQuota(): // 507 – a storage quota is full
+    case apiErr.OverQuota(): // 507 – a storage quota is full (retrying won't help; 429 is the transient one)
+    case apiErr.GrantExpired():  // 401 – this login reached its end; only a new login helps
+    case apiErr.SpaceNotFound(): // 404 – no workspace of that name (nothing has written to it yet,
+                                 //       or the name is wrong); Error() is the server's sentence
+    case apiErr.FolderNotEmpty(): // 409 – a delete with wire.FSOp.IfEmpty met more than an empty
+                                  //       folder; nothing applied, re-read the tree
     }
 }
 ```
+
+- **A workspace nothing has written to yet** answers `SpaceNotFound` to a reader. About to
+  write? `ManifestForWrite`, `FSModeForWrite` and `PullCRDTOpsForWrite` treat it as empty, and
+  your first write creates it.
+- **No one-shot call waits for ever.** A call with no response headers within 60 s, or whose
+  body stops for 30 s, ends with a `*client.TimeLimitError` (a write may still have been
+  applied: read before sending it again). Streams are not bound. `c.SetTimeLimits(headers,
+  stall)` changes both; 0 turns one off.
+- **A redirect to another host or port is refused**, on every call but the live awareness
+  stream, which follows a cluster follower's redirect to its leader.
 
 ## Core operations
 
@@ -100,7 +115,7 @@ c.ReleaseLease("build:main", lease.Token)
 
 // Shared filesystem (content-addressed blobs + CAS-versioned manifest):
 hash, size, _ := c.PutBlob(strings.NewReader("hello"))
-m, _ := c.Manifest()
+m, _ := c.ManifestForWrite() // a workspace nothing has written to yet is empty at version 0
 c.Commit(wire.CommitRequest{
     BaseVersion: m.Version, Actor: "builder-1",
     Changes: []wire.Change{{Path: "docs/readme.md", Hash: hash, Size: size}},
@@ -111,6 +126,52 @@ rc, _ := c.GetBlob(hash); defer rc.Close()
 c.Beat("claude-code", "host-1", "working")
 c.SetAwareness(map[string]any{"cursor": []int{12, 40}}, 30, "session-1")
 ```
+
+## Following events in a long-running program
+
+`FollowForever` reconnects and resumes by itself until its context ends; `Subscribe` runs many
+subscribers, each with its own filter, starting point (nil `From` = from now on) and `OnResync`,
+over one connection.
+
+```go
+err := c.FollowForever(last+1, handle, &client.FollowForeverOptions{
+    Context:      ctx,
+    Filter:       &client.EventFilter{Channels: []string{"team"}},
+    OnResync:     func(g client.StreamGap) error { return reloadSnapshot() }, // events you missed are gone
+    LogID:        lastLogID, // the log `last` belongs to ("" = none kept)
+    LastEvent:    &client.EventMark{Seq: last, Hash: lastHash}, // lastHash = client.EventHash(e) of the event at `last`
+    OnStreamOpen: func(o client.StreamOpen) { lastLogID = o.LogID }, // keep it with your position
+})
+
+stop := c.Subscribe(handle, client.SubscribeOptions{
+    Filter: &client.EventFilter{Actions: []string{"chat.*"}},
+})
+defer stop()
+```
+
+**A restored server is never taken for the same history.** From v0.2.6 the server names its
+event log (`X-ACP-Log-Id`), and the name changes at every server start and with every new
+cluster leader. On a new name the follow checks the event at its position (the last one
+delivered, or `LastEvent`): the same event means the same history (a restart, a leader change),
+and the follow goes on with no gap. Another event, or none, is a restore: `OnResync` gets a
+`client.GapRestored` gap (`"restored"`) with your old position (`From`), both names
+(`PreviousLogID`, `LogID`) and the new head (`Head`), and delivery goes on at the new head —
+re-read what you derive from the events. Without `OnResync`, `FollowForever` stops with a
+`*client.LogChangedError` (a subscriber gets it through `OnError`): re-read, then follow again
+from `err.Gap.ResumeAt` with `LogID: err.Gap.LogID`. The same name with a lower head is a
+cluster node that is behind: no gap, the stream waits for it. A check answered by a node that
+names no log, or another one, decides nothing and is asked again (`EventAt` callers can see a
+`*client.LogUnconfirmedError`).
+
+- `LogPosition(ctx)` gives the head and its log name from one answer — the place to start a
+  follower "from now" (`head+1`, with `LogID` set). `EventAt(ctx, seq)` reads one event and the
+  log that answered.
+- `client.EventHash` is the same hash as the TypeScript SDK's `eventHash`.
+- Against a server older than v0.2.6 (no log name) the earlier rule stays: a head below your
+  position is a `GapBehind`.
+- A login that reached its end stops `FollowForever` with that refusal; `Subscribe` tells each
+  subscriber once through `OnError` and stops. A missing workspace does not stop them: a
+  follower can start before the first write.
 
 ## Live co-editing (CRDT)
 
@@ -135,6 +196,31 @@ Structured (JSON): read the converged value, mutate via a local `crdtjson.Doc`.
 raw, _, epoch, _ := c.CRDTJSONDoc("board") // json.RawMessage
 c.PushCRDTJSONOps("board", []crdtjson.Op{{T: crdtjson.OpSet, Key: "status"}}, epoch, true)
 ```
+
+### Deleted documents and earlier text
+
+From v0.2.6, deleted documents and earlier text stay reachable for the workspace's history time:
+
+```go
+entry, _ := c.DeleteDoc("notes.txt")        // nil entry: this workspace keeps no trash
+trash, _ := c.DocTrash()                    // what can come back
+c.RestoreDoc("notes.txt", trash[0].Gen)     // refused while a live doc holds the name
+versions, _ := c.DocVersions("notes.txt")   // kept from before each compaction, oldest first
+old, _ := c.DocVersionAt("notes.txt", versions[0].Epoch, 0) // old.Text; 0 = the whole version
+```
+
+Structured documents have the twins `DeleteJSONDoc`, `JSONDocTrash` and `RestoreJSONDoc`. A server
+older than v0.2.6 answers that it does not keep deleted documents.
+
+## More packages
+
+- `pkg/acpuri` parses and resolves `acp://` addresses, with the same rules as the TypeScript SDK:
+  see [ACP-ADDRESSES.md](ACP-ADDRESSES.md).
+- `pkg/acpignore` is the `.acpignore` matcher: `acpignore.Load(root)`, then `m.Ignored(path)`.
+  Code that syncs a folder needs more than the matcher: Section 7 of
+  [the ignore-file extension](../rfc/acp-ext-43-ignore-file.txt) lists what a client must do with
+  the answer (an ignored path is never a deletion).
+- `pkg/merge`: `merge.Union(shared, local)` joins two texts with no common ancestor; both stay whole.
 
 ## Which primitive for what
 

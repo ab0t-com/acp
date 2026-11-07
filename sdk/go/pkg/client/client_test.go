@@ -15,6 +15,7 @@ import (
 	"github.com/ab0t-com/acp/sdk/go/internal/crdt"
 	"github.com/ab0t-com/acp/sdk/go/internal/crdtjson"
 	"github.com/ab0t-com/acp/sdk/go/internal/wire"
+	"github.com/ab0t-com/acp/sdk/go/pkg/client/clienttest"
 )
 
 // fakeServer records the last request's headers and serves canned responses, so
@@ -1036,4 +1037,56 @@ func errorsAs(err error, target **APIError) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+// BlobNotUploaded must recognise both ways the daemon says it, and nothing else:
+// a caller retries on it, so a false match loops.
+func TestBlobNotUploadedBothForms(t *testing.T) {
+	h := strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name string
+		e    APIError
+		want bool
+	}{
+		{"fs.ops code", APIError{Status: 400, Raw: []byte(`{"code":"blob_not_uploaded"}`)}, true},
+		{"commit text", APIError{Status: 400, Message: `blob ` + h + ` for "docs/a b.txt" not uploaded`}, true},
+		{"commit text, name with a quote", APIError{Status: 400, Message: `blob ` + h + ` for "x\" not uploaded" not uploaded`}, true},
+		{"another 400", APIError{Status: 400, Message: "need resource"}, false},
+		{"a path that says it", APIError{Status: 400, Message: `invalid path "blob x for \"y\" not uploaded"`}, false},
+		{"not a 400", APIError{Status: 409, Message: `blob ` + h + ` for "a" not uploaded`}, false},
+	} {
+		if got := tc.e.BlobNotUploaded(); got != tc.want {
+			t.Errorf("%s: got %v", tc.name, got)
+		}
+	}
+}
+
+// A 200 with a body nobody can read is no upload: a hash of "" was taken for a stored blob.
+func TestPutBlobRefusesAnAnswerItCantRead(t *testing.T) {
+	for name, body := range map[string]string{"garbled": "<html>", "empty": "", "no hash": `{"size":3}`} {
+		t.Run(name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) }))
+			defer ts.Close()
+			if h, _, err := newTestClient(t, ts.URL).PutBlob(strings.NewReader("abc")); err == nil {
+				t.Fatalf("hash %q, no error", h)
+			}
+		})
+	}
+}
+
+// A caller that gives up on a call can't cancel it: the bound is what ends it.
+func TestBoundResponseHeadersEndsASilentCall(t *testing.T) {
+	ts := clienttest.Stall(t, false)
+	c := newTestClient(t, ts.URL)
+	c.BoundResponseHeaders(50 * time.Millisecond)
+	done := make(chan error, 1)
+	go func() { _, err := c.Manifest(); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("no answer, and no error")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the call was still going")
+	}
 }

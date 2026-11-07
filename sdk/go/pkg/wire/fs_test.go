@@ -37,6 +37,17 @@ func TestFSOpWireShape(t *testing.T) {
 	if got, want := string(b), `{"op":"restore","to":"docs/x.md","node":"7-alice"}`; got != want {
 		t.Fatalf("FSOp restore shape drifted: got %s want %s", got, want)
 	}
+	// if_empty: the member the daemon reads (ext-28 §5.7.1), and absent unless asked, so an
+	// op without it stays byte-identical to what every older daemon has always read.
+	b, _ = json.Marshal(wire.FSOp{Op: "delete", Path: "a", IfEmpty: true})
+	if got, want := string(b), `{"op":"delete","path":"a","if_empty":true}`; got != want {
+		t.Fatalf("FSOp if_empty shape drifted: got %s want %s", got, want)
+	}
+	b, _ = json.Marshal(wire.FSOp{Op: "delete", Path: "a"})
+	if got, want := string(b), `{"op":"delete","path":"a"}`; got != want {
+		t.Fatalf("a plain delete must carry no if_empty: got %s want %s", got, want)
+	}
+	b, _ = json.Marshal(wire.FSOp{Op: "restore", Node: "7-alice", To: "docs/x.md"})
 	var m map[string]any
 	json.Unmarshal(b, &m)
 	for _, k := range []string{"path", "blob", "doc"} {

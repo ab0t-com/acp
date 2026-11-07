@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Team workspace</title>
+  <style>
+    :root { color-scheme: light dark; --line: #8884; }
+    body { font: 15px/1.45 system-ui, sans-serif; margin: 0 auto; max-width: 1100px; padding: 16px; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    h2 { font-size: 15px; margin: 0 0 8px; }
+    section { border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+    textarea { width: 100%; min-height: 160px; box-sizing: border-box; font: 14px/1.4 ui-monospace, monospace; }
+    input { box-sizing: border-box; }
+    ul { padding-left: 18px; margin: 6px 0; }
+    .status { font-size: 13px; opacity: .8; }
+    .unsaved { color: #c60; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <h1>Team workspace <span id="who" class="status"></span> <span id="saved" class="status"></span></h1>
+
+  <section id="login">
+    <h2>Join with your invite</h2>
+    <p class="status">Paste the invite code you were sent (it starts with <code>acpj1_</code>). It works once.</p>
+    <form id="login-form">
+      <input id="invite" placeholder="acpj1_…" size="60" autocomplete="off" required>
+      <input id="name" placeholder="your name (if the invite lets you choose)" size="30">
+      <button>Join</button>
+    </form>
+    <p id="login-error" class="status unsaved"></p>
+  </section>
+
+  <div id="app" class="grid" hidden>
+    <section>
+      <h2>Notes (live, everyone types here)</h2>
+      <textarea id="notes" spellcheck="false"></textarea>
+    </section>
+    <section>
+      <h2>Board</h2>
+      <form id="board-form"><input id="board-new" placeholder="add a task" size="30"> <button>Add</button></form>
+      <ul id="board"></ul>
+    </section>
+    <section>
+      <h2>Chat</h2>
+      <ul id="chat"></ul>
+      <form id="chat-form"><input id="chat-text" placeholder="say something" size="34"> <button>Send</button></form>
+    </section>
+    <section>
+      <h2>Mail</h2>
+      <ul id="inbox"></ul>
+      <form id="mail-form">
+        <input id="mail-to" placeholder="to" size="10"> <input id="mail-subject" placeholder="subject" size="22">
+        <button>Send</button>
+      </form>
+    </section>
+    <section>
+      <h2>Files (<code>files/</code>)</h2>
+      <ul id="files"></ul>
+      <form id="file-form">
+        <input id="file-name" placeholder="name.txt" size="14"> <input id="file-text" placeholder="contents" size="20">
+        <button>Save</button>
+      </form>
+      <p id="file-status" class="status"></p>
+    </section>
+    <section>
+      <h2>Here now</h2>
+      <ul id="presence"></ul>
+    </section>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

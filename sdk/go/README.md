@@ -88,6 +88,10 @@ if errors.As(err, &apiErr) {
                              //       lease / current state — reconcile, retry)
     case apiErr.Locked():    // 423 – a WRITE gated by another holder's lease
                              //       (e.g. a commit to a leased file:<path>)
+    case apiErr.SpaceNotFound(): // 404 – no workspace of that name yet. About to
+                             //       write: ManifestForWrite treats it as empty
+                             //       and your write creates it. Only reading:
+                             //       report it (Error() is the server's sentence).
     case apiErr.OverQuota(): // 507 – a persistent storage quota; do NOT
                              //       blind-retry (429 is the transient one)
     default:                 // apiErr.Status has the raw code
@@ -106,7 +110,9 @@ version, so concurrent writers can't silently clobber each other.
 hash, size, err := c.PutBlob(strings.NewReader("hello world"))
 
 // 2) Read the current manifest and commit a change against its version (CAS).
-m, err := c.Manifest()
+//    ManifestForWrite: a space nothing has written to yet is empty at version 0,
+//    and this commit creates it. (Manifest, for a reader, reports it instead.)
+m, err := c.ManifestForWrite()
 m2, err := c.Commit(wire.CommitRequest{
     BaseVersion: m.Version,
     Actor:       "builder-1",
@@ -192,6 +198,13 @@ err = c.ReleaseLease("build:main", lease.Token)      // release when done
 leases, err := c.ListLeases()
 ```
 
+## Time limits
+
+No one-shot call waits for ever: a call with no response headers within 60 s of the request being sent, or whose body
+stops for 30 s, ends with a `*client.TimeLimitError` (a write may still have been applied: read before sending it
+again). Streams (`Follow`, `FollowAwareness`, `Subscribe`) are not bound. Change both with
+`c.SetTimeLimits(headers, stall)`; 0 turns one off.
+
 ## CRDT — live co-editing (the supporting feature)
 
 Many editors converge on one document with no locks and no lost updates. You keep
@@ -266,7 +279,7 @@ func main() {
     hash, size, err := c.PutBlob(strings.NewReader("# Readme\n"))
     if err != nil { log.Fatal(err) }
 
-    m, err := c.Manifest()
+    m, err := c.ManifestForWrite()
     if err != nil { log.Fatal(err) }
 
     if _, err := c.Commit(wire.CommitRequest{

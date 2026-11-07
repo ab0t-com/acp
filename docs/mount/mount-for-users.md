@@ -31,9 +31,12 @@ acp mount acp://coord.example:8443/team/ /mnt/team
 #   -> mounted acp://coord.example:8443/team/ at /mnt/team (read-write, CAS mode, manifest v42) — Ctrl-C to unmount
 ```
 
-`acp mount` resolves your profile (like every other `acp` command) and hands the
-connection to the mount. **The address never carries your token** — the credential
-comes from your environment.
+`acp mount` picks the profile whose server is the address's host and port (like
+every other `acp` command given an `acp://` address) and hands the connection to the
+mount. **The address never carries your token**, and your token only ever goes to the
+host it belongs to: if no profile is set up for that host, `acp mount` stops and says
+how to add one. (Running `acp-mount` directly with `ACP_TOKEN`, also set
+`ACP_SERVER` to the same host, or pass `--token` on the command line.)
 
 Now, in another shell, just use files:
 
@@ -68,6 +71,11 @@ acp umount /mnt/team
 > Prefer to keep working in the same shell? Add `--daemon` to background the mount:
 > `acp mount --daemon acp://coord.example:8443/team/ /mnt/team` returns immediately,
 > prints the mount's pid and a log path, and keeps running until you `acp umount` it.
+> A mount point reached through a symlinked folder is fine. If the background mount
+> does not report itself within 15 s, it is asked to stop (it saves what it buffered
+> first, and keeps anything it could not save beside the mount) and the log is shown;
+> it is never killed. On macOS `--daemon` is not available in this release: run the
+> mount in the foreground, or under launchd.
 
 ---
 
@@ -81,9 +89,9 @@ ones. In practice:
 - **Editing bytes** (`echo >`, `>>`, an editor save) lands a moment after you
   `close` the file (a short coalescing window, ~100 ms by default). Calling
   `fsync` (or `sync`) lands it **immediately**.
-- **Pure metadata moves** — `mv` (rename) and `rm` (delete) — carry no bytes, so
-  they ride along on the **next** commit. If you want a move or delete to land
-  *right now*, run `sync` after it.
+- **Moves and deletes** (`mv`, `rm`, `rmdir`, `mkdir`) land the same way, a moment
+  after the last one. A burst of them, like `rm` over a folder, is one commit.
+  If you want one to land *right now*, run `sync` after it.
 
 You almost never have to think about this. It matters only when you want a change
 to be visible to others *this instant* — then `sync`.
@@ -111,6 +119,12 @@ ls dataset/ | wc -l                    # still 24 — nothing was deleted
 A whole-directory **rename** is *not* a delete (the files simply move), so moving a
 big tree is never mistaken for wiping it.
 
+The same protection covers a live text document: saving one that removes almost
+all of it (more than 90 % of a document of 256+ characters — what an editor that
+crashed after emptying the file would send) is refused with `Operation not
+permitted` and kept unsent, because a text document has no undo. Save the file
+again with its text and that save goes through instead.
+
 When you genuinely mean it, mount with `--allow-bulk` and the mass change goes
 through on purpose:
 
@@ -133,6 +147,48 @@ version lands **right beside it** as a sibling you can just open:
 notes.md                                 # the version that won
 notes.md.conflict-bob-20260919T120000Z-a1b2c3   # the version that "lost" — kept intact
 ```
+
+On a live (realtime) space the sibling is simply `notes.md.conflict` (then
+`notes.md.conflict.2`, and so on, if that name is taken). The same applies when an
+editor saves through a temporary file and renames it over `notes.md` just as a
+teammate writes it: theirs keeps the name and yours becomes `notes.md.conflict`.
+If the same version of yours conflicts again, the existing sidecar is reused rather
+than copied.
+
+On a live space, if `notes.md` is a shared live text file, a save never overwrites it,
+in place or through a temp file and a rename. What changed since you read the file is
+written INTO the shared document, and whatever teammates typed meanwhile stays. The
+mount can't tell which program read a file, so it keeps your last few reads and your
+last landed save, compares your save with one of them, and deletes only text that all
+of them held: a read by another program (an indexer, `git status`, `grep`) never turns
+your next autosave into a delete of what a teammate wrote since. So a teammate's line
+that your save only leaves out stays, and the mount's log says so. To delete it, read
+the file, save once with the line kept, then save again without it (or use
+`acp crdt sync`; a mount started with `--allow-bulk` always compares with your newest
+read, but it also turns off the bulk-delete guards, so use it for that job only). If you
+save without having read the file through this mount, your text is added and nothing is
+deleted: a line you changed is there in both forms, and the mount's log says so. Tidy
+that up by reading the file and saving again. If a teammate deletes the document while
+your save is on its way, `fsync` fails with `EIO` and nothing is lost: the file still
+shows your save, and the next `fsync` or write-back puts your whole text into whatever
+document is at that name now, in front of anything a teammate started there. If the
+document was restored from the trash by then, your save lands on it as an ordinary
+edit. If it goes after a save of yours landed and you have not read the file since,
+your next save starts it again, or joins what a teammate started there, as a save with
+no read does.
+
+Editors that move the original away (vim, by default on many systems: `mv live.md
+live.md~`, write a new `live.md`, delete the backup) keep co-editing on a live document
+this mount has shown you (you read it, or saved it): a text file written at the name
+within 2 seconds of the move that keeps at least half of the lines you saw goes into
+the document, and the old text stays as a plain file at the backup name, unless you
+removed it. Anything else is a new file, exactly the bytes written, and the move stands
+(the document is at the backup name, or in the trash, restorable, once the backup is
+deleted): a file that keeps less than half, one that is not text, or a save to a
+document this mount never showed (a script's `mv report.md report.old; gen > report.md`). In vim, `set backupcopy=yes` avoids the
+move altogether. A file that is not text (it holds a NUL byte, or is not valid UTF-8)
+still replaces the document as a plain file; the document goes to the trash with its
+text, so you can restore it.
 
 Both versions are on disk. Nobody is blocked, nothing is lost — you (or a later
 pass) open the `.conflict-…` file and reconcile at your leisure. Every conflict is
@@ -244,16 +300,48 @@ daemon, your token, and the space mode **before** it touches the mountpoint, so 
 bad connection fails cleanly at the command — never as a hung, half-mounted folder.
 Check `ACP_SERVER`, `ACP_TOKEN`, and `ACP_CERT` (or your profile).
 
+**Reads fail with an I/O error for a while, and the log says the server's event log is behind, or not yet
+known.** The mount saw the server's log go back (a cluster node catching up, or a server restored to an earlier
+point), or the server stopped saying which log it serves (a cluster election), or named a new one that is being
+checked. Rather than show you files the server may no longer have, reads wait until it is clear; then they work
+again, or, after a restore, the mount reads everything again. Your saves are not affected.
+
 **"stale mount (transport endpoint is not connected)."** A previous mount was
 hard-killed and left a wedged folder. The mount usually clears this itself on the
 next start; if not, run `acp umount /mnt/team` and remount. For a folder that is
 *truly* stuck (even `acp umount` hangs), the mount's own `--help` and status output
 print the last-resort kernel-abort recipe.
 
-**A write "succeeded" but the file isn't in the space yet.** A metadata move or
-delete rides the next commit, and a byte edit commits a fraction of a second after
-you close the file. Run `sync` to force it now, and read `.acp/status` to see
-anything still pending.
+**"served by a live acp-mount" / "the mount lock folder … is not this user's own".** One
+mount point has one lock, in `/tmp/acp-mount-<uid>/`, keyed by its parent folder and its name
+as that folder holds it: a second start at the same folder, by any path that reaches that name
+(a link, `..`, another case or Unicode spelling the folder takes for it) or from any session, is
+refused while the first runs, so it can never abort a live mount. On macOS names are compared
+case- and Unicode-folded, so two folders whose names differ only in case (on a case-sensitive
+volume) share one lock: the second start is refused, nothing is lost. On Linux, under a parent
+you can enter but not list, on a case-insensitive disk, two spellings of one name take two
+locks: start the mount by one spelling. If the folder was made by someone else (or its mode changed), the start says so:
+remove it, then start again. The lock holds as long as that folder and its files stay, so:
+- a `/tmp` cleaner that deletes files it does not know is held (macOS `periodic` clean-tmps,
+  an old tmpwatch; current systemd-tmpfiles leaves locked files alone) can let a second start
+  in: keep `/tmp/acp-mount-*` out of its list;
+- `sudo acp-mount` runs as root, with root's own lock folder: mount as the user you unmount
+  as;
+- a service with systemd `PrivateTmp=yes` has its own `/tmp` and its own mounts.
+
+Where `/tmp` can't be used (a read-only root, no `/tmp`), the mount can't take its lock and
+does not start; there is no override, because a lock place the environment picks is what
+let two starts take two locks. Give the host a writable `/tmp`.
+
+**The mount went away with writes unsaved.** It keeps their bytes in
+`<mount point>.unsaved-<time>-<pid>/` beside the mount point (or, if that folder can't take
+them, in `/tmp/acp-mount-<uid>/`, which a restart may clear), and the exit line names it.
+Mount again and copy them back in.
+
+**A write "succeeded" but the file isn't in the space yet.** A move, a delete or a
+byte edit commits a fraction of a second after the last change. If it is still not
+there, the commit was refused or the server is out of reach. Run `sync` to see the
+error, and read `.acp/status` to see anything still pending.
 
 **A file has a `.conflict-…` sibling you didn't create.** That is the no-silent-loss
 guarantee working: someone else wrote the same file at the same time, and your

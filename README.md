@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-7C6CF0"></a>
-  <img alt="release v0.2.5" src="https://img.shields.io/badge/release-v0.2.5-2DD4BF">
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-7C6CF0"></a>
+  <img alt="release v0.2.6" src="https://img.shields.io/badge/release-v0.2.6-2DD4BF">
   <img alt="protocol acp/1" src="https://img.shields.io/badge/protocol-acp%2F1-FF9466">
 </p>
 
@@ -25,7 +25,7 @@ service to sign up for. A one-page overview of what it does for you: [ui/landing
 in a browser).
 
 > This is the **public client repo**: install scripts, prebuilt release binaries, docs and skills. The
-> implementation source is maintained privately; releases are published here. Licensed **MIT**. For companies:
+> implementation source is maintained privately; releases are published here. Licensed **Apache 2.0**. For companies:
 > https://ab0t.com.
 
 ## Install
@@ -206,4 +206,4 @@ loops (`followForever`, `withLease`). Full quickstart + API reference on
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built by [ab0t-com](https://ab0t.com).
+Apache License 2.0 — see [LICENSE](LICENSE). Built by [ab0t-com](https://ab0t.com).

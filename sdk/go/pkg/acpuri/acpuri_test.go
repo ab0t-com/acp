@@ -13,7 +13,9 @@
 package acpuri
 
 import (
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -789,6 +791,67 @@ func TestFormatRoundTrip(t *testing.T) {
 	for _, bad := range []Parts{{Host: "h.example", Space: "te am"}, {Host: "h.example", Space: "team", Path: "../x"}, {Host: "h.example", Space: "team", Path: "a//b"}, {Host: "h.example", Space: "team", Path: "a\\b"}, {Host: "bad host", Space: "team"}} {
 		if _, err := Format(bad); CodeOf(err) == "" {
 			t.Fatalf("%+v: want refusal, got %v", bad, err)
+		}
+	}
+}
+
+// ReadCapability checks the bytes against the link's h: a corrupt body ends in a
+// *client.BlobIntegrityError, a good one reads through.
+func TestReadCapabilityVerifiesBytesAgainstH(t *testing.T) {
+	body := []byte("the shared bytes")
+	sum := sha256.Sum256(body)
+	good := hex.EncodeToString(sum[:])
+	var serve []byte
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(serve) }))
+	t.Cleanup(ts.Close)
+	uri := "acp://" + hostPortOf(t, ts.URL) + "/team/docs/x.md?h=" + good + "&sp=team&e=1782000300&k=k2&s=" + sig
+	read := func() ([]byte, error) {
+		rc, err := ReadCapability(mustParse(t, uri), ReadOptions{HTTPClient: ts.Client()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rc.Close()
+		return io.ReadAll(rc)
+	}
+	serve = body
+	if got, err := read(); err != nil || string(got) != string(body) {
+		t.Fatalf("a good body: %q %v", got, err)
+	}
+	serve = []byte("the shared byte") // cut short
+	if _, err := read(); !client.IsBlobIntegrityError(err) {
+		t.Fatalf("a corrupt body must end in a BlobIntegrityError: %v", err)
+	}
+}
+
+// B2-EXPIRED: a failed fetch must not print the link: the signature in it is the
+// credential, and an error ends up in logs. And a link past its date says so even when
+// the server could not be asked.
+func TestReadCapabilityErrorHoldsNoSignature(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	addr := hostPortOf(t, ts.URL)
+	hc := ts.Client()
+	ts.Close() // nothing listens now
+	h := strings.Repeat("0", 64)
+	for _, c := range []struct {
+		e       string
+		expired bool
+	}{{"1000000000", true}, {"4102444800", false}} {
+		_, err := ReadCapability(mustParse(t, "acp://"+addr+"/team/x?h="+h+"&sp=team&e="+c.e+"&k=k2&s="+sig), ReadOptions{HTTPClient: hc})
+		if err == nil || strings.Contains(err.Error(), sig) {
+			t.Fatalf("the signature must not be printed: %v", err)
+		}
+		if strings.Contains(err.Error(), "expired") != c.expired {
+			t.Fatalf("e=%s: %v", c.e, err)
+		}
+	}
+}
+
+// B3-NEXT: a port that can't be says what to do, in the words every tool shows.
+func TestPortRefusalSaysWhatToDoNext(t *testing.T) {
+	for _, in := range []string{"acp://h.example:84433/team/x", "acp://h.example:0/team/x", "acp://h.example:8x/team/x"} {
+		_, err := Parse(in)
+		if err == nil || !strings.Contains(err.Error(), "1 to 65535") || !strings.Contains(err.Error(), "Check the address") {
+			t.Fatalf("%s: %v", in, err)
 		}
 	}
 }

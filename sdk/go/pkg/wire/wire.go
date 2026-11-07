@@ -38,6 +38,11 @@ const (
 	HeaderSpace = wire.HeaderSpace
 	// HeaderSession is a random per-client-process id (collision detection).
 	HeaderSession = wire.HeaderSession
+	// HeaderLogID is the space's log id ("<space part>.<epoch>") on GET /v1/events and its
+	// follow stream (D55): a new id means a restart, a leader change or a restore.
+	HeaderLogID = wire.HeaderLogID
+	// HeaderLogHead is the log's head when the events read began.
+	HeaderLogHead = wire.HeaderLogHead
 	// DefaultSpace is used when no space is selected.
 	DefaultSpace = wire.DefaultSpace
 	// UnlabeledPattern is the reserved channel-filter pattern matching ONLY
@@ -134,6 +139,14 @@ type FSNode struct {
 	Doc    string `json:"doc,omitempty"`
 }
 
+// DocTrashEntry is one deleted live document that can still be restored
+// (GET /v1/crdt/trash and its structured twin).
+type DocTrashEntry = wire.DocTrashEntry
+
+// DocVersionEntry is one retained pre-compaction version of a text document
+// (GET /v1/crdt/versions).
+type DocVersionEntry = wire.DocVersionEntry
+
 // FSTrashEntry is one recoverable trashed root of GET /v1/fs/trash: its node id
 // (the restore handle) and its immutable pre-trash Origin path.
 //
@@ -165,13 +178,22 @@ type FSTrashEntry struct {
 // accepted for both. delete/mkdir/create/rename/move need the writer role and
 // the path in the token's write scope; a batch whose DELETE count reaches the
 // space's bulk minimum is refused 403 bulk_denied unless the grant allows bulk.
+//
+// IfEmpty (on a delete only; any other op is refused 400) deletes the path only
+// while it is a live folder with nothing live in it at this op's place in the
+// batch: the daemon judges it when it applies the batch, which closes the window
+// a client's own check of the tree leaves open. A refusal is 409 folder_not_empty
+// (client.APIError.FolderNotEmpty) with no op of the batch applied: re-read the
+// tree, never resend blindly. A daemon older than v0.2.6 ignores the member and
+// deletes, so a client needs no branch for one.
 type FSOp struct {
-	Op   string `json:"op"`
-	Path string `json:"path,omitempty"`
-	To   string `json:"to,omitempty"`
-	Node string `json:"node,omitempty"`
-	Blob string `json:"blob,omitempty"`
-	Doc  string `json:"doc,omitempty"`
+	Op      string `json:"op"`
+	Path    string `json:"path,omitempty"`
+	To      string `json:"to,omitempty"`
+	Node    string `json:"node,omitempty"`
+	Blob    string `json:"blob,omitempty"`
+	Doc     string `json:"doc,omitempty"`
+	IfEmpty bool   `json:"if_empty,omitempty"`
 }
 
 // FSOpsResult is the 200 body of POST /v1/fs/ops. Applied is the number of ops

@@ -3,6 +3,7 @@
 You and your teammates share one workspace. ACP gives you a handful of tools for talking and
 keeping track; it doesn't make you use them in any particular way. This page shows which tool fits
 which job, with the exact command, and the habits teams have found useful. Use what fits your team.
+In a terminal, `acp help team` is the same menu on one screen: co-edit, claim, see, agree, finish.
 
 Every message and every event already carries **when** and **who**. The one thing you add is the
 **topic**: a subject on a message, an entity and a note on an event.
@@ -11,14 +12,14 @@ Every message and every event already carries **when** and **who**. The one thin
 
 | You want to… | Use | Command |
 |---|---|---|
-| **Ask** one teammate something | a direct message | `acp send` · `acp inbox --wait` · `acp reply` |
+| **Ask** one teammate or a few | a direct message (`--to a,b,c` sends to each) | `acp send` · `acp inbox --wait` · `acp reply` |
 | **Announce** something to everyone | a post on a channel | `acp log --channel team --action status.done --note "…"` |
 | **Reach** someone in particular | the same post, addressed | add `--to <agent>`; they read `acp events --for-me` |
 | **Decide** something for good | a decision file | `decisions/0007-use-jsonl-for-progress.md` |
 | **Remember** what the team knows | one short notes file | `TEAM.md` (one screen at most) |
 | **Keep a running record** | an append-only file | `JOURNAL.md` (one line per entry) or `log/progress-<you>.jsonl` |
 | **Claim** a piece of work | a lease | `acp lease acquire parser` |
-| **See who is on what** | presence, awareness, leases | `acp who` · `acp awareness get` · `acp lease list` |
+| **See who is on what** | presence, awareness, leases | `acp who` (each agent and what it holds) · `acp awareness get` |
 | **Catch up** after a break | the catch-up digest | `acp catchup` · `acp events --story --since 2h` · `acp history` |
 | **Wait** for something to happen | a wait on the event log | `acp events --wait --kind claims --not-actor me` |
 | **Notice** new messages | a one-line summary | `acp inbox --brief` (in a hook or status line) |
@@ -56,11 +57,12 @@ Read the whole conversation, opening message first:
 acp thread <id>            # the id from the inbox; JSON, oldest first
 ```
 
-- `acp inbox --wait` returns at once if a message is already waiting, and exits with code 124 if
+- `acp inbox --wait` returns at once if a message is already waiting, so mark what you have dealt with (`acp read <id>`
+  or `acp reply`) before you wait again. It exits with code 124 if
   nothing arrives in time, so a script can tell "nothing yet" from an error.
 - Messages are private: you see only the messages you sent or received, in a thread too. Everyone
-  in the workspace can see *that* a message was sent, who sent it to whom, and its **subject**,
-  because each send is recorded in the shared activity log. Don't put secrets in the subject.
+  in the workspace can see *that* a message was sent and who sent it to whom, because each send
+  is recorded in the shared activity log. The subject and the body stay between the two of you.
 - `--type` says what kind of message it is: `request`, `inform` (the default), `propose`,
   `response`, `handoff`.
 
@@ -286,18 +288,33 @@ acp lease release parser
 - Everyone sees claims: `acp lease list`, and `lease.acquired` / `lease.released` events.
 - A lease ends by itself when its time runs out, so a crashed agent never blocks the team for
   long. Renew long jobs with `acp lease renew parser`.
-- A lease named `file:<path>` (for example `file:TEAM.md`) also stops other agents from pushing
-  that file until you release it. Other names (`parser`, `decisions`) are just agreed labels.
+- A lease named `file:<path>` (for example `file:TEAM.md`) also stops other agents from pushing,
+  putting or removing that file until you release it. Other names (`parser`, `decisions`) are just
+  agreed labels, and so is any lease in a realtime workspace: everyone sees it, nobody is stopped.
+
+When you run into a teammate, the tool says who and what next:
+
+- **A file someone has claimed.** The refusal names the holder and when the claim ends, then gives
+  the commands to ask them, to wait until it ends, and to see every claim. `acp lease acquire` of
+  something held does the same (`HELD:` on standard output as before; the words on standard error).
+- **A file two agents changed.** After the way out of this clash (`acp pull`), a stale push or put and
+  a pull conflict give the exact commands for that file to claim it, or co-edit it live, next time.
+
+Every command printed keeps your `--profile` and workspace, and quotes names, so you can run it as it
+stands. MCP tools answer the same way, naming tools (`acp_send`, `acp_wait_events`, `acp_lease`).
 
 ## See who is on what
 
 ```bash
-acp who                                              # who is around, and their status
+acp who                                              # who is around, their status, what each holds
 acp beat --status "parser"                           # say what you are on
 acp awareness set '{"doc":"src/parser.go","status":"editing"}'   # live, short-lived
 acp awareness get
-acp lease list                                       # who has claimed what
+acp lease list                                       # every claim, one per line
 ```
+
+`acp who` shows each claim on its holder's row, with the time left (`holds file:notes.md (10m left)`).
+Someone holding a claim is listed even if they haven't been seen lately. It never shows a fence token.
 
 Presence and awareness are "right now" only and aren't kept. Anything the team should still know
 tomorrow goes in `TEAM.md`.

@@ -1,0 +1,1222 @@
+ab0t                                                          A. Bot, Ed.
+Request for Comments: ACP/EXT-43                                     ab0t.com
+Updates: none (client conformance; no wire change)             November 2026
+Category: Extension (client conformance)                           ISSN: n/a
+
+
+                    ACP Extension 43: The Ignore File
+     -- ".acpignore": the Paths a Folder Sync Leaves Alone, and the
+            Rule That an Ignored Path Is Never a Deletion --
+
+
+Abstract
+
+   This document is an EXTENSION for the Agent Coordination Protocol,
+   Version 1 (ACP/1).  It specifies the IGNORE FILE: a text
+   file named ".acpignore" at the root of a synced folder.  It lists
+   patterns, in a strict subset of the familiar version-control ignore
+   syntax, for paths that a FOLDER-SYNC CLIENT (one that works out
+   adds, edits and deletions by comparing a local folder with a space's
+   manifest) leaves out of the sync.
+
+   The syntax is the smaller half of this memo.  The larger half is the
+   rule that makes an ignore file safe in a system whose push derives
+   deletions: ignoring is SUBTRACTION, never an action.  An ignored path
+   is outside the sync in both directions.  A push never uploads it and
+   never reads its absence as a deletion.  A pull never fetches,
+   overwrites, merges into or deletes it.  No override flag widens
+   that.  The memo works the rule through every lifecycle case: a
+   pattern added after a file was already shared, a pattern removed, a
+   rename into or out of an ignored path, conflict copies, and an ignore
+   file that itself arrives by pull.  It then gives named conformance
+   cases and matching vectors.
+
+   The authority does nothing.  It never reads the file.  To the
+   authority ".acpignore" is an ordinary path.  No endpoint, field,
+   event, error or capability is added, and the protocol version stays
+   "acp/1".
+
+
+Status of This Memo
+
+   RATIFIED 2026-11-02 by the protocol owner.  This is a client-
+   conformance extension: it binds folder-sync clients and adds nothing
+   to the wire.  First implemented in the reference client in v0.2.6.
+
+   The need came from a blind ease-of-use test of a release candidate
+   (October 2026).  An agent ran its tests in the synced folder.  The
+   test runner left generated files behind, and the agent stopped
+   pushing because it could not tell whether a push would share them.
+   It asked for "an ignore file for push (.acpignore) or default
+   ignores".  The decisions the owner took are recorded in Section 15.
+
+   WHAT THIS MEMO UPDATES: no normative text of ACP/1 or of any
+   extension.  It adds client-conformance rules for folder-sync clients
+   next to the client contract of EXT-34 Section 5, which it does not
+   change.  The base protocol version string remains "acp/1".
+   Distribution is unlimited.
+
+
+Table of Contents
+
+   1.  Intent -- the test run that should not be shared
+   2.  Conventions and Terminology
+   3.  Design Principles and Non-Goals
+   4.  The Ignore File
+   5.  Pattern Syntax and Matching
+   6.  Client Exclusions
+   7.  Sync Semantics -- the Safety Rules
+   8.  What the User Sees
+   9.  Explicit Operations, Other Clients, Mounts
+   10. The Authority
+   11. Compatibility
+   12. Data-Loss Safety Analysis
+   13. Security Considerations
+   14. Conformance
+   15. Decisions
+   16. Summary
+   Appendix A.  Matching Vectors
+   Appendix B.  Worked Example -- the test run
+   Author's Address
+
+
+1.  Intent -- the test run that should not be shared
+
+   An agent shares a working folder with "push" and "pull".  It runs
+   its tests in that folder, because that is where the code is.  The
+   test runner leaves generated files next to the sources (Python
+   leaves "__pycache__/"; build tools leave "build/", "dist/",
+   "node_modules/").  The next push shares them with every agent in the
+   space.  The other agents pull them and their own runs rewrite them,
+   so every agent's push carries churn that nobody wrote.  An agent
+   that notices this has two bad options: stop pushing, or remove the
+   files before every push.
+
+   Every file-sync tool answers this with an ignore file, and agents
+   already know the version-control ignore syntax.  ACP needs one with
+   one extra property.  An ACP push DERIVES deletions: a path that the
+   sync base records and that is missing from the local folder is
+   deleted on the server.  A filter that hides a path from the scan is
+   therefore exactly how a sync tool deletes data it never meant to
+   touch.  It reads "I did not look" as "I removed it".  The same holds
+   in the other direction: a pull that cannot see a local file
+   overwrites it as if it were absent.  So this memo specifies a
+   syntax, and it also specifies a set of safety rules (Section 7) that
+   a conforming client MUST follow before it may honor the file at all.
+
+
+2.  Conventions and Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in BCP 14 [RFC2119]
+   [RFC8174] when, and only when, they appear in all capitals.
+
+   This document uses the space, manifest, commit, path-validation and
+   client-state definitions of ACP/1 without restating them; "ACP/1
+   Section N" points into rfc/acp-1.txt, "EXT-N Section M" into the
+   corresponding extension memo.
+
+   FOLDER-SYNC CLIENT:  A client that reconciles a local directory tree
+      (the CHECKOUT) with a space's manifest by comparing three things
+      (the local tree, the manifest, and its SYNC BASE) and DERIVING
+      changes in either direction.  The reference command-line client's
+      "push" and "pull" are such a client.
+
+   SYNC ROOT:  The local directory a folder-sync command was pointed at.
+      Manifest path P corresponds to the local file SYNC-ROOT/P.
+
+   SCAN:  The folder-sync client's enumeration of local files under the
+      sync root.
+
+   SYNC BASE:  The client's durable per-path record of the content hash
+      each path had at the last successful sync (the "working copy's
+      sync base" of ACP/1 Section 7).  "Has a base record" means the
+      base names the path.
+
+   DERIVED CHANGE:  An add, edit or deletion that a folder-sync client
+      infers from a difference, as opposed to one a user or agent
+      requests by naming a path.
+
+   EXPLICIT OPERATION:  A request that names its paths: remove a shared
+      path, put one file, write one file through a tool, push one
+      document, upload one blob.
+
+   IGNORE FILE:  The file of Section 4.
+
+   PATTERN:  One non-comment line of the ignore file (Section 5).
+
+   IGNORED PATH:  A path the patterns select (Section 5.4).
+
+   CLIENT EXCLUSION:  A path a client leaves out of the sync by its own
+      fixed rule (Section 6).
+
+   OUTSIDE THE SYNC:  Ignored, or a client exclusion.
+
+   DIRECTORY (of a path):  Each proper leading run of a path's segments:
+      "a" and "a/b" are the directories of "a/b/c.txt".  The manifest
+      has no directory entries.  A directory of the manifest exists iff
+      some path lies under it.  Locally, a directory is a directory on
+      disk.
+
+   CONFLICT COPY:  A file a client writes next to a path to preserve the
+      other side's bytes when it cannot merge (for example the reference
+      client's "<path>.remote").
+
+
+3.  Design Principles and Non-Goals
+
+   3.1.  Ignoring is subtraction, never an action.
+
+      The ignore file only REMOVES paths from what a folder sync
+      compares.  It never causes an upload, a write, an overwrite or a
+      deletion, on either side.  An ignored path is outside the sync in
+      both directions: its local copy and its remote copy are both left
+      exactly as they are.  Every rule of Section 7 follows from this
+      one.  A reader who remembers nothing else should remember that an
+      ignored path is never a deletion, here or there.
+
+   3.2.  The file is the whole policy.
+
+      There are no hidden default patterns (Section 4.6).  What the file
+      says is what is ignored; an empty or absent file ignores nothing.
+      ACP is a framework, and a list of "junk" names compiled into a
+      client is a policy decision its users cannot see.  The exclusions
+      a client already has for its own state stay (Section 6).
+
+   3.3.  One answer in every client.
+
+      The file is shared in the space (Section 4.4), so every folder-
+      sync client that reads it MUST reach the same answer for every
+      path.  The syntax is therefore specified exactly (Section 5), with
+      vectors (Appendix A).  A line outside the syntax is an ERROR, not
+      a guess (Section 4.5).
+
+   3.4.  The authority is not involved.
+
+      Ignoring is a property of one checkout's comparison, and the
+      authority holds no checkout.  It never reads the file
+      (Section 10).
+
+   3.5.  Why this is an extension and not a client note.
+
+      Several clients may sync a folder: the reference command-line
+      client today, and SDK-based or editor-based clients later.  The
+      file is SHARED: it lives in the space and every agent's client
+      reads the same bytes.  Two clients that disagree on what
+      "build/" means would publish what their peers keep back.  Worse,
+      one of them could treat what the other ignores as deleted.  The
+      file name, the syntax and, above all, the deletion semantics are
+      therefore an interoperability and data-safety contract between
+      clients.  That is the role EXT-34 Section 5 plays for the
+      bulk-change guard.  Nothing travels on the wire, so there is no
+      capability string and no version change.
+
+   3.6.  Non-goals.
+
+      This memo does NOT define:
+
+      o  ignoring in a MOUNTED filesystem (EXT-37).  A mount presents the
+         space's own tree.  There is no local side where an ignored file
+         could live, so honoring the file there needs a local overlay
+         store, which is new machinery (Section 9.3);
+
+      o  nested ignore files (Section 4.1);
+
+      o  a second, per-checkout private ignore file.  A self-ignored
+         ignore file (Section 4.4) covers that need;
+
+      o  any verb that deletes ignored paths from the server ("clean").
+         That would be a pattern-driven bulk deletion, and this memo
+         adds no destructive surface;
+
+      o  character classes ("[abc]") or any other syntax outside
+         Section 5.  Such lines are errors in this version;
+
+      o  ignoring as an ACCESS CONTROL (Section 13.1);
+
+      o  any effect on explicit operations (Section 9.1);
+
+      o  any change to the reference client's existing exclusion of
+         dot-paths (Section 6), beyond the one exception for the ignore
+         file itself.
+
+
+4.  The Ignore File
+
+   4.1.  Name and location.
+
+      The ignore file is the regular file named exactly ".acpignore" in
+      the SYNC ROOT.  Only that file is policy.  A file of the same name
+      in any subdirectory is an ordinary file: a client MUST NOT
+      interpret it.
+
+      Rationale: one place to look.  Nested files would force a client
+      to walk the tree before it knows what to skip, and they bring
+      per-directory precedence rules.  If clients diverged on those
+      rules, the divergence would decide what gets published.  A single
+      root file with anchored patterns ("/src/gen/") expresses
+      everything nested files would.
+
+   4.2.  Format and limits.
+
+      The file is UTF-8 text.  A leading byte-order mark is ignored.
+      Lines end in LF; a CR immediately before the LF (or at the end of
+      the file) is removed.  The file MUST NOT exceed 65536 octets.
+
+      A line that BEGINS with seven "<", seven "=" or seven ">"
+      characters is a CONFLICT MARKER (the shape a line-level text
+      merge writes).  A file containing one is INVALID (Section 4.5).
+      An ignore file with unresolved markers would otherwise be read as
+      three patterns that match nothing, and the two versions of the
+      policy between the markers would silently both apply.
+
+   4.3.  When the file is read.
+
+      A folder-sync client reads the ignore file ONCE, from the local
+      sync root, at the start of each folder-sync command, before its
+      scan.  The rules it read govern the whole command, including any
+      internal retries.
+
+      A PULL uses the local ignore file as it was BEFORE the pull.  If
+      the pull updates the ignore file (Section 4.4), the new contents
+      govern from the next command.  Rationale: rules that changed
+      partway through one command could put the same path both inside
+      and outside the sync within that command.
+
+      If there is no ignore file, no path is ignored, and a conforming
+      client behaves exactly as a client without this extension.
+
+   4.4.  The file is shared.
+
+      The ignore file is an ordinary file of the space.  A folder-sync
+      client pushes and pulls it like any other path, so one agent's
+      rules reach every agent in the space, as a version-control ignore
+      file does for a team.  It is three-way merged, or conflict-copied,
+      like any text file.
+
+      A client whose own exclusion rule would hide the file (the
+      reference client excludes dot-paths, Section 6) MUST make an
+      exception for exactly the root ignore file.
+
+      To keep an ignore file private to one checkout, add the pattern
+      "/.acpignore" to it.  The file is then an ignored path of its own
+      checkout: it is never pushed, and pull never touches the local
+      copy (rule R5), even when the space holds a shared ignore file.
+      Its rules still govern the checkout, because Section 4.3 reads
+      the LOCAL file.
+
+      When a pull changes the local ignore file, the client SHOULD say
+      so and say that the new rules apply from the next command
+      (Section 8.5).
+
+   4.5.  An invalid file stops the command.
+
+      A file that breaks Section 4.2 or Section 5 is INVALID.  On an
+      invalid file a folder-sync command MUST stop before its scan,
+      before any network write and before any local write.  It MUST
+      name the file, the first offending line number and the reason.
+      A client MUST NOT skip the bad line and continue, and MUST NOT
+      fall back to "no ignore file".
+
+      Rationale: a skipped line means the client ignores LESS than the
+      author intended, so a push would publish what the author meant to
+      keep back.  A best-effort reading would also differ between
+      clients.  Stopping costs a local edit.  If the bad line came from
+      a peer, the peer's correction merges with the local one on the
+      next pull.
+
+      For the same reason, something other than a regular file at that
+      name (a directory, a symbolic link), or a file that cannot be
+      read, stops the command as an invalid file does: it is not read
+      as "no ignore file".
+
+   4.6.  No built-in patterns.
+
+      A client MUST NOT ignore any path its ignore file does not select,
+      apart from its client exclusions (Section 6).
+
+      A client MAY print a TIP when a push shares paths under a
+      directory name that is commonly generated (for example
+      "__pycache__" or "node_modules").  The tip names the line that
+      would keep them local.  It MUST NOT change what is pushed, and
+      the list of names it watches for is not part of this
+      specification.
+
+
+5.  Pattern Syntax and Matching
+
+   The syntax is a strict subset of the version-control ignore syntax
+   ("gitignore").  Every line this memo accepts is intended to mean, for
+   the sync root, what the same line means in a .gitignore at the top
+   of a work tree.  Lines outside the subset are errors (Section 4.5),
+   never reinterpreted.  Where this text and gitignore differ, this
+   text governs.
+
+   5.1.  Lines.
+
+      Each line is processed in this order:
+
+      1.  A blank line (empty, or only spaces), or a line whose first
+          character is "#", is not a pattern.
+
+      2.  Trailing space characters (U+0020) are removed, unless the
+          last one is escaped with a backslash ("\ ").  Leading spaces
+          are significant.
+
+      3.  A leading "!" makes the pattern a NEGATION and is removed.
+
+      4.  A backslash makes the next character literal: "\#" and "\!"
+          start a pattern with "#" or "!", "\*" is a literal "*".  A
+          backslash as the last character of a line is INVALID.
+
+      5.  One trailing unescaped "/" makes the pattern DIRECTORY-ONLY
+          and is removed.
+
+      6.  If what remains is empty, the line is INVALID ("/", "!",
+          "!/").
+
+      7.  If what remains contains an unescaped "/", the pattern is
+          ANCHORED and one leading "/" is removed.  Otherwise it is
+          UNANCHORED.
+
+      8.  The remainder is split on "/" into SEGMENTS.  An empty
+          segment ("a//b"), a segment "." or "..", or an unescaped "["
+          anywhere, makes the line INVALID.
+
+   5.2.  Wildcards.
+
+      Within a segment, "*" matches any run of characters, possibly
+      empty, that contains no "/".  "?" matches exactly one character
+      other than "/".  Every other character, including an escaped one,
+      matches only itself.
+
+      In an ANCHORED pattern, a segment that is exactly "**" matches
+      whole segments:
+
+      o  a leading "**" ("**/foo") or a middle "**" ("a/**/b") matches
+         ZERO or more segments;
+
+      o  a trailing "**" ("foo/**") matches ONE or more segments, so
+         "foo/**" selects everything inside "foo" but not "foo" itself.
+
+      A "**" that is not a whole segment ("a**b"), or that appears in an
+      unanchored pattern, means the same as "*".
+
+   5.3.  Candidates.
+
+      For a path P with segments s1 ... sn, the CANDIDATES are its
+      directories "s1", "s1/s2", ... up to the first n-1 segments, which
+      are DIRECTORY candidates, and P itself, the FILE candidate.  When
+      the scan meets a local directory, that directory is a directory
+      candidate.
+
+      A pattern MATCHES a candidate C when:
+
+      o  the pattern is directory-only and C is a file candidate: never;
+
+      o  the pattern is UNANCHORED: its single segment matches C's LAST
+         segment;
+
+      o  the pattern is ANCHORED: its segment list matches C's whole
+         segment list, with "**" as in Section 5.2.
+
+   5.4.  Selection -- last match wins, and an ignored directory is
+         final.
+
+      A candidate is SELECTED when the last pattern in the file that
+      matches it is not a negation.  If no pattern matches, or the last
+      match is a negation, it is not selected.
+
+      A path P is IGNORED iff ANY of its directory candidates is
+      selected, or its file candidate is selected.
+
+      So a later negation cannot re-include a path under a selected
+      directory: with "build/" then "!build/keep.txt", the path
+      "build/keep.txt" stays ignored.  This is the gitignore rule.  It
+      is adopted because it lets a client skip an ignored directory
+      without walking it (a "node_modules/" of a hundred thousand
+      files), and the answer is still the same as a file-by-file
+      evaluation.
+
+   5.5.  Case, encoding, platform.
+
+      Comparison is byte-for-byte and CASE-SENSITIVE on every platform,
+      with no Unicode normalization.  The paths compared are in the
+      canonical relative form of manifest paths (ACP/1 Section 11.4):
+      "/"-separated, no leading "/".  A client on a platform with
+      another separator converts the scan's paths to that form first.
+      On a case-insensitive file system the spelling the scan reports
+      is the spelling matched.  A tracked path that the scan left out
+      under another spelling of an ignored directory was not looked
+      at, so its absence is not a deletion (R2) and it is not absent
+      (R7).
+
+   5.6.  Cost.
+
+      A matcher MUST run in time bounded by a polynomial in the lengths
+      of the pattern and the path (for example O(pattern x path) with
+      the standard two-pointer or table method).  It MUST NOT use
+      backtracking that is exponential in the number of "*" or "**" in
+      a pattern.  Together with the size limit of Section 4.2, this
+      means a hostile shared file cannot stall a peer's push.
+
+
+6.  Client Exclusions
+
+   A folder-sync client already leaves some paths out by its own fixed
+   rule:
+
+   (a)  its own state and temporary files: the sync-base directory,
+        shadow copies, and the temporary files it writes while it
+        materializes content.  A client MUST exclude its temporary
+        files, so that a command that was interrupted can never push a
+        half-written copy as a shared file;
+
+   (b)  in the reference command-line client, every path with a segment
+        that begins with "." ("dot-paths").  This memo records that
+        existing behavior and does not change it, except that the root
+        ignore file is not excluded (Section 4.4).
+
+   A client exclusion obeys, on the push side, every rule an ignored
+   path obeys: it is never uploaded and never read as a deletion (R1,
+   R2, R3).  A negation pattern MUST NOT re-include a client
+   exclusion; client state is never shared.
+
+   Exclusions are not "ignored" for the counts of Section 8.  A path
+   that is both excluded and selected by a pattern is IGNORED: every
+   rule of Section 7 applies to it, on the pull side as well.
+
+   On the pull side, a client MAY still write excluded paths from the
+   manifest; the reference client writes dot-paths, so a pulled ".env"
+   arrives.  When it does, rule R7 applies: a local file the scan did
+   not read MUST NOT be overwritten blind.
+
+
+7.  Sync Semantics -- the Safety Rules
+
+   These rules are normative for every folder-sync client that honors
+   an ignore file.  A client that cannot meet them MUST NOT honor the
+   file.
+
+   7.1.  The rules.
+
+      PUSH
+
+      R1   NEVER SHARED.  A push MUST NOT upload or commit an ignored
+           local path: no add, no edit.
+
+      R2   NEVER A DELETION.  A push MUST NOT derive a deletion for an
+           ignored path.  This holds whether the path is missing
+           locally or present, and whether or not the sync base still
+           records it from before the pattern existed.  An ignored path
+           that the space holds stays on the server, untouched, until
+           an explicit operation removes it.
+
+      R3   GUARDS COUNT ONLY WHAT IS IN THE SYNC.  A client may refuse
+           a push whose derived deletions are large relative to the
+           checkout (an "emptied checkout" guard).  Such a guard MUST
+           leave paths outside the sync out of BOTH sides of that
+           comparison.  Ignoring therefore cannot trip such a guard and
+           cannot dilute it.
+
+      R4   UNSHARED EDITS ARE SAID OUT LOUD.  When the sync base
+           records a path that is now ignored, and the local content
+           differs from that record, the push SHOULD warn that the
+           change will not be shared.  A client meets this cheaply by
+           hashing only the base-recorded ignored paths, never a whole
+           ignored directory.
+
+      PULL
+
+      R5   NEVER TOUCHED LOCALLY.  A pull MUST NOT create, overwrite,
+           merge into or delete a local ignored path.  That holds when
+           the space holds a different version, when the space deleted
+           the path, and under any override flag.  The remote copy is
+           not fetched.
+
+      R6   NOT REMEMBERED.  When a push or pull completes and saves its
+           sync base, the saved base MUST NOT contain a record for an
+           ignored path (the FORGET rule, Section 7.2).
+
+      ALL PATHS
+
+      R7   NO BLIND OVERWRITE.  A client MUST NOT overwrite or remove a
+           local file whose current content it has not compared, by
+           hash, with its sync base and with the incoming version.  A
+           path the scan did not enumerate may still exist locally: it
+           may have been excluded, or under a root the scan could not
+           enter.  Such a path MUST be read and compared before it is
+           replaced, or left alone.  ("Not in my scan" never means
+           "absent".)
+
+      BOTH DIRECTIONS
+
+      R8   CONFLICT COPIES ARE PRESERVATION, NOT POLICY.  A client MUST
+           write a conflict copy it would otherwise write, even when
+           the copy's own name is ignored ("*.remote").  If a client
+           refuses to push while a conflict copy it wrote is still
+           unresolved, an ignore pattern MUST NOT silence that refusal.
+
+      R9   NO OVERRIDE WIDENS THE IGNORE.  No flag (force, force-
+           delete, allow-bulk-delete, bulk confirmation, reset-base or
+           any other) causes an ignored path to be uploaded, fetched,
+           overwritten or deleted.
+
+      R10  FIXED, VALID RULES.  The rules are read once per command
+           (Section 4.3).  An invalid file stops the command before any
+           effect (Section 4.5).
+
+   7.2.  The FORGET rule, and why not "freeze".
+
+      The sync base records only paths inside the sync.  The first
+      command that completes after a path becomes ignored drops its
+      record (R6).  Two things follow.
+
+      o  An ignored local file can be deleted freely (the usual "clean
+         the caches") and that is never read as a deletion LATER, even
+         after the pattern is removed.  The client keeps no record of
+         having had the file, and "I never had it" never derives a
+         deletion.
+
+      o  When a pattern is removed and both sides hold the path with
+         different content, the client sees a change on both sides with
+         no common base.  It treats that as a conflict: push refuses it
+         as a concurrent change, and pull keeps the local file and
+         writes the remote bytes as a conflict copy.  It never
+         overwrites either side.
+
+      The alternative is to FREEZE the record while the path is ignored
+      and resume from it afterwards.  That would let one rare case fast-
+      forward instead of producing a conflict copy.  It would also
+      re-arm deletion: a cache emptied while ignored would be deleted
+      from the server by the first push after a peer removed the
+      pattern from the shared file.  Freezing is rejected.
+
+      The exact guarantee: R2 and R5 hold unconditionally for as long as
+      a path is ignored.  After the pattern is removed, a deletion of
+      that path can be derived only from a base record written while
+      the path was inside the sync.  Such a record cannot survive any
+      command that completed while the path was ignored.
+
+   7.3.  Every lifecycle case.
+
+      (1)  THE SPACE HAS IT, THE CHECKOUT IGNORES IT, AND THE CHECKOUT
+           NEVER HAD IT.  Push does not delete it and reports it as
+           still shared (Section 8.2).  Pull does not fetch it and
+           counts it as ignored.
+
+      (2)  A PATTERN IS ADDED AFTER THE PATH WAS SHARED.  From the next
+           command on:
+           o  a local edit is not pushed, and R4 warns once;
+           o  deleting the local copy deletes nothing on the server
+              (R2);
+           o  remote edits and a remote deletion are not applied
+              locally (R5); the local copy stays exactly as it is;
+           o  the first command that completes forgets the base record
+              (R6).
+
+      (3)  A PATTERN IS REMOVED.  The path re-enters the sync with no
+           base record:
+           o  if only the checkout has it, push adds it;
+           o  if only the space has it, pull fetches it;
+           o  if both have it with the same content, it is recorded;
+           o  if both have it with different content, push refuses it
+              as a concurrent change, and pull keeps the local file and
+              writes a conflict copy.
+           Nothing is deleted on either side.
+
+      (4)  A LOCAL RENAME INTO AN IGNORED PATH ("a.txt" to
+           "build/a.txt", with "build/" ignored).  For the share, this
+           is the deletion of "a.txt".  "a.txt" is not ignored, so its
+           absence is a real local deletion.  It goes through every
+           existing guard: the stale-deletion check, the emptied-
+           checkout guard, and the authority's bulk-change guard
+           (EXT-34).  Its content stays in the space's retained history
+           (EXT-33) and in the local ignored copy.  The push reports it
+           as a deletion like any other.  Moving a whole directory into
+           an ignored path is a bulk deletion and is guarded as one.
+
+      (5)  A LOCAL RENAME OUT OF AN IGNORED PATH.  An add.
+
+      (6)  A REMOTE RENAME INTO AN IGNORED PATH (a peer moved "a.txt" to
+           "build/a.txt").  Pull applies the deletion of "a.txt" by the
+           ordinary rules: an unchanged local copy is removed, and a
+           locally modified one is kept and reported as a conflict.
+           Pull does not fetch "build/a.txt".  Nothing unique is lost:
+           the content is in the space at its new path.
+
+      (7)  THE IGNORE FILE ARRIVES OR CHANGES BY PULL.  It governs from
+           the next command (Section 4.3), and the pull says so
+           (Section 8.5).  By (2) and (3), no change to the rules ever
+           derives a deletion, on either side.
+
+      (8)  EVERYTHING IS IGNORED ("*" or "**").  Push uploads and
+           deletes nothing, and pull writes and deletes nothing.  Both
+           report the counts.  This is never "the checkout looks empty,
+           delete everything".
+
+      (9)  THE IGNORE FILE IS IN CONFLICT.  If it holds merge markers
+           it is invalid (Section 4.2), and every folder-sync command
+           stops until the markers are resolved.  If the conflict was
+           written as a conflict copy instead, the local file governs
+           and the copy is handled as in (10).
+
+      (10) A CONFLICT COPY MATCHES A PATTERN.  R8: it is written
+           anyway, and the open-conflict refusal still applies.
+
+      (11) AN EXPLICIT OPERATION REMOVES AN IGNORED PATH FROM THE
+           SPACE.  The server copy is gone, retained in history.  Pull
+           leaves the local copy (R5).
+
+
+8.  What the User Sees
+
+   The reference client MUST do the following.  Other folder-sync
+   clients SHOULD do the equivalent in their own idiom.  The counts are
+   cheap: no client has to walk into an ignored directory to produce
+   them.
+
+   8.1.  Push.  The summary line ends with the number of TOP-MOST
+         ignored entries the scan met.  An ignored directory counts
+         once and is shown with a trailing "/".  The client names up
+         to three of them:
+
+            pushed 2 change(s) -> manifest v7 (3 ignored: __pycache__/,
+              build/, notes.log)
+            nothing to push (manifest v7, 12 files; 1 ignored:
+              __pycache__/)
+
+   8.2.  Still shared.  When the manifest holds ignored paths, push
+         says so once, with a count, up to three names, and what to do
+         about them:
+
+            note: 2 ignored path(s) are still shared in the space
+              (__pycache__/a.cpython-312.pyc, ...); push never deletes
+              them -- remove them explicitly if they should go
+
+   8.3.  Unshared edits (R4):
+
+            warning: notes.log is ignored but changed since it was last
+              shared; the change was NOT pushed
+
+   8.4.  Pull.  The summary line ends with the number of manifest
+         entries that were not pulled because they are ignored, naming
+         up to three.
+
+   8.5.  The ignore file changed by pull:
+
+            note: .acpignore changed (+1 / -0 patterns); the new rules
+              apply from your next push or pull
+
+   8.6.  An invalid file:
+
+            .acpignore:4: character classes ("[...]") are not supported;
+              nothing was pushed
+
+   8.7.  Status and dry run.  A connection status report that does not
+         inspect a folder is unaffected.  A client that offers a dry
+         run of push or pull MUST evaluate the ignore file exactly as
+         the real command does and MUST report the same counts.  This
+         memo does not add a dry run.
+
+   8.8.  Help.  The help text of push and pull, and any list of safety
+         stops, SHOULD carry one line: "push never deletes an ignored
+         path; pull never touches one."
+
+
+9.  Explicit Operations, Other Clients, Mounts
+
+   9.1.  Explicit operations are not governed.  An operation that names
+         its paths does exactly what it names, whether or not a path is
+         ignored: removing a shared path, putting a file, writing a
+         file through a tool bridge, pushing one document, uploading a
+         blob.  A client MUST NOT refuse or filter an explicit operation
+         because of the ignore file.  An explicit remove is how an
+         ignored path leaves the space; a later pull leaves the local
+         copy (R5).
+
+   9.2.  Clients that do not sync a folder.  A virtual file system over
+         an SDK, a tool bridge with per-path read and write tools, and
+         SDK libraries derive no changes from a local folder.  They are
+         not governed by this memo.  An SDK MAY expose a matcher for
+         folder-sync code built on it.  If it does, the matcher MUST
+         implement Section 5 exactly and pass Appendix A.
+
+   9.3.  Mounted file systems (EXT-37) are out of scope.  Every file a
+         mount creates is a file in the space; there is no local side
+         for an ignored file to live on.  A later proposal could let a
+         mount REFUSE to create names that the space's ignore file
+         selects, the way a mount can refuse platform metadata litter.
+         That refusal changes program behavior (a test runner that
+         cannot write its cache) and needs its own review.  Until then,
+         users of a mount can stop generated files at the source (for
+         Python, PYTHONDONTWRITEBYTECODE=1 and the test runner's "no
+         cache" option).
+
+   9.4.  Realtime spaces (EXT-31).  Folder-sync push and pull are not
+         served on a realtime space, so this memo does not apply there.
+
+
+10.  The Authority
+
+   The authority MUST treat a path named ".acpignore", at any depth, as
+   an ordinary path.  It MUST NOT read, parse or apply the file.  It MUST
+   NOT filter a commit, a manifest, a history record, an event or a
+   bulk-change verdict by it.
+
+   ".acpignore" is a valid path under ACP/1 Section 11.4.  A segment may
+   begin with "."; only the segments "." and ".." are rejected.
+
+   No endpoint, request or response field, event, error code or
+   capability string is added.  The protocol version is unchanged.
+
+   The authority's bulk-change guard (EXT-34) sees only commits.
+   Ignoring only removes changes from a commit, so it cannot weaken the
+   guard, and the guard stays authoritative.  Ignored paths that the
+   space holds are ordinary entries: they are retained in history and
+   restorable (EXT-33).
+
+
+11.  Compatibility
+
+   o  Without an ignore file, a conforming client behaves exactly as
+      before.
+
+   o  A client that does not implement this memo shares ignored paths,
+      as it does today.  This costs nothing in data: conforming peers
+      never delete those paths (R2), they report them as still shared
+      (Section 8.2), and they never pull them (R5).  Any mix of old and
+      new clients loses nothing.  An older reference client pulls the
+      ignore file as an ordinary dot-path and never pushes it.
+
+   o  Forward syntax.  A later revision that adds syntax (for example
+      character classes) makes such a file INVALID to this revision.
+      An older client then stops (Section 4.5) rather than publishing
+      what the newer syntax meant to keep back.  This is deliberate:
+      failing closed is the safe direction.  A revision that adds
+      syntax SHOULD say so in its own compatibility section.
+
+
+12.  Data-Loss Safety Analysis
+
+   The project checks every change that can write, delete, sync, merge
+   or reclaim file data against ten classes of data-loss hazard.  For
+   each class: can an ignore file cause it, and what stops it?
+
+   A.  BLAST RADIUS (one action, many casualties; bulk, directory and
+       glob deletes; truncating overwrites; whole-manifest replaces).
+       Ignore patterns ARE globs, so this is the class to fear: a glob
+       that could reach a deletion.  Under 3.1 and R2 a pattern only
+       removes paths from consideration, and no rule anywhere turns a
+       pattern into a deletion.  "*" is a no-op push (7.3 (8)).  No
+       "clean ignored files" verb is added (3.6).  A directory moved
+       into an ignored path is an ordinary guarded deletion
+       (7.3 (4)).  Commits stay diffs.  Cases IG-2, IG-3, IG-11.
+
+   B.  STALE OR PARTIAL VIEW (acting on a truncated manifest; stale base
+       overwriting newer; silent last-writer-wins; emptiness read as
+       delete-all).  The ignore file adds no new manifest-driven
+       deletion.  Unignoring with no base is a conflict, not an
+       overwrite (7.2).  An all-ignoring file is not emptiness
+       (7.3 (8)).  R3 keeps the emptied-checkout guard honest.  Cases
+       IG-3, IG-4, IG-9.
+
+   C.  RECONCILIATION (delete versus never-had; deletes propagating both
+       ways; rename seen as delete plus add; a resolution that drops a
+       side; an override that skips the safety).
+       o  The forget rule turns "while ignored" into "never had",
+          which is the safe direction (7.2).
+       o  R2 and R5 stop deletes propagating in either direction.
+       o  Renames into and out of ignored paths are specified
+          (7.3 (4)-(6)).
+       o  Conflict copies always survive (R8).
+       o  No override widens the ignore (R9).
+       Cases IG-2, IG-6, IG-8, IG-11, IG-12, IG-13, IG-14.
+
+   D.  INTERRUPTION (torn commits, torn writes, ack before durable,
+       interrupted multi-step flows, retry doubling).
+       o  The rules are read once per command, so a retry inside one
+          command cannot change them (R10).
+       o  The base is saved as before: written whole, then swapped
+          into place.
+       o  A client's temporary files are exclusions, so an
+          interrupted materialization is never pushed (Section 6 (a)).
+       o  A torn or truncated ignore file can only ignore less than
+          intended.  It never deletes anything, and its conflict-
+          marker form is refused (4.2).
+       Cases IG-16, IG-19.
+
+   E.  CONCURRENCY (check-then-act races, compare-and-swap bypass,
+       mixed versions, failover, GC racing a commit).  The authority is
+       not involved (Section 10), and every commit still goes through
+       compare-and-swap.  A peer that edits the shared file during my
+       command does not affect that command (4.3).  Mixed client
+       versions lose nothing (Section 11).  Cases IG-10, IG-25.
+
+   F.  RETENTION AND RECLAMATION.  Unchanged.  Ignored paths in the
+       space are referenced, retained and restorable like any others.
+
+   G.  AUTHORIZATION-ADJACENT BLAST RADIUS.  The ignore file grants and
+       denies nothing.  A writer who edits the shared file can make
+       peers stop receiving a path, which is visible in their counts.
+       The writer can also make peers start sharing local files the
+       file was keeping back (an exposure, not a loss; Section 13.1).
+       Neither can delete anything.
+
+   H.  RECOVERY.  Nothing is destroyed, so nothing needs recovering.
+       Removing an ignored path from the space is an explicit,
+       ordinary, restorable deletion (9.1).
+
+   I.  HUMAN ERROR AND UX (no confirmation on bulk destructive, escaping
+       the sync root, destructive defaults, an empty argument meaning
+       "all").  An empty file and an empty line ignore NOTHING, and a
+       lone "/" or "!" is invalid (5.1), so emptiness never means "all".
+       Patterns match canonical relative paths only, and "." and ".."
+       segments are invalid, so a pattern cannot name anything outside
+       the root.  The ignore file never causes a write, so it cannot
+       write outside the root.  The default is no ignoring.  Every
+       ignored count is shown (Section 8).  Cases IG-15, IG-20, IG-23.
+
+   J.  SILENT CORRUPTION.  Ignored content is never read for transfer,
+       transformed or merged.  A merge-marked ignore file is refused
+       (4.2).  No manifest entry is dropped, because ignored does not
+       mean removed.  Case IG-16.
+
+   One class is not new but is inherited, and R7 exists for it: an
+   enumeration that skips a category, followed by a diff that treats
+   the skipped category as absent.  On the push side that derives
+   deletions; on the pull side it overwrites local files blind.  An
+   ignore file is a new skip filter, so a conforming client MUST
+   guard both sides (R2, R5, R7).  Case IG-22.
+
+
+13.  Security Considerations
+
+   13.1.  Not an access control.  Any writer in the space can edit the
+          shared ignore file.  If a writer REMOVES a pattern, a peer's
+          next push shares the local files that pattern was keeping
+          back.  Do not rely on a shared ignore file to keep material
+          private.  Keep private material outside the sync root.  An
+          agent that must protect local paths by pattern SHOULD use a
+          self-ignored ignore file (Section 4.4): its rules are then its
+          own, and no peer can edit them.
+
+   13.2.  Hostile file.  A writer can push an ignore file that is huge,
+          pathological or invalid.  The size limit (4.2) and the
+          polynomial matcher (5.6) bound the cost of matching.  An
+          invalid file stops a peer's folder sync, with the line named,
+          until the peer fixes it.  That is a nuisance no greater than
+          the ones a writer can already cause, and it never causes data
+          loss.
+
+   13.3.  Hiding a path.  A writer can add a pattern so that peers stop
+          receiving updates to a path.  Pull reports the ignored count
+          and names the paths (8.4), and reports changes to the ignore
+          file (8.5), so this cannot happen silently.
+
+   13.4.  No escape.  Patterns are matched against canonical relative
+          paths and never resolved on the local file system, so they
+          cannot refer to anything outside the sync root.  The ignore
+          file causes no writes at all.
+
+
+14.  Conformance
+
+   Each case below is a behavior an implementation MUST exhibit.  The
+   names are for cross-reference and are not an implementation's test
+   names.  "Unchanged" means byte-identical: the manifest version and
+   entries for the space, and file names, bytes and sync base for the
+   checkout.  Every case MUST run against an isolated authority and
+   temporary checkouts.
+
+   IG-1   NEVER SHARED.  Ignored local files of every kind (a file
+          pattern, a directory pattern, an anchored pattern, a "**"
+          pattern) are absent from the commit, and their blobs are not
+          uploaded.
+
+   IG-2   NEVER A DELETION.  The space holds P, the checkout pulled P,
+          then a pattern selecting P is added and the local P is
+          deleted.  Push leaves the space unchanged.  A second push
+          leaves it unchanged too.
+
+   IG-3   EVERYTHING IGNORED IS A NO-OP.  With a populated sync base,
+          an ignore file of "*" (and separately "**"): push commits
+          nothing and trips no guard; pull writes and deletes nothing;
+          both report the counts.
+
+   IG-4   GUARDS COUNT ONLY THE SYNC.  The checkout tracks 100 paths and
+          ignores 90 of them.  The other 10 are deleted locally.  The
+          emptied-checkout guard trips, and nothing is committed without
+          the explicit bulk-deletion flag.
+
+   IG-5   PULL NEVER OVERWRITES.  An ignored local P was edited locally,
+          and the space holds a different P.  After pull, and after
+          pull with the force flag, the local P is unchanged.
+
+   IG-6   PULL NEVER DELETES.  The space deletes an ignored P and the
+          manifest version moves.  Pull leaves the local P unchanged.
+
+   IG-7   PULL NEVER FETCHES.  The space holds ignored paths the
+          checkout lacks.  Pull writes none of them, and its count
+          names them.
+
+   IG-8   UNIGNORE NEVER DELETES.  P is shared and pulled, then
+          ignored.  A command completes.  The local P is deleted, then
+          the pattern is removed.  Push derives no deletion of P.
+
+   IG-9   UNIGNORE NEVER OVERWRITES.  P is ignored, and the local and
+          remote copies differ.  The pattern is removed.  Push refuses
+          P as a concurrent change.  Pull keeps the local bytes and
+          writes a conflict copy holding the remote bytes.
+
+   IG-10  RULES FIXED PER COMMAND.  A pull brings an ignore file that
+          newly ignores Q.  During that pull Q is handled under the old
+          rules.  The next push treats Q as ignored.
+
+   IG-11  RENAME INTO IGNORED IS A GUARDED DELETION.  Moving one
+          tracked file into an ignored directory pushes exactly one
+          deletion, and the content is restorable from history.
+          Moving a tracked directory of at least the guard threshold
+          trips the bulk guard.
+
+   IG-12  REMOTE RENAME INTO IGNORED KEEPS LOCAL EDITS.  A peer moves P
+          into an ignored path, and the local P has edits.  Pull keeps
+          the local P and reports a conflict.
+
+   IG-13  CONFLICT COPY SURVIVES A PATTERN.  With "*.remote" ignored, a
+          two-sided change still produces the conflict copy, and push
+          still refuses while it is unresolved.
+
+   IG-14  NO OVERRIDE WIDENS.  IG-1, IG-2, IG-5 and IG-6 hold under
+          every override flag the client has, on its own and in
+          combination.
+
+   IG-15  INVALID FILE STOPS EVERYTHING.  For each invalid form in
+          Appendix A, push and pull fail before any effect: the space
+          and the checkout are unchanged, and the error names the file
+          and the line.
+
+   IG-16  MERGE MARKERS INVALIDATE.  An ignore file holding merge
+          markers is IG-15.
+
+   IG-17  THE FILE IS SHARED.  The root ignore file is pushed even when
+          the client excludes dot-paths.  It is pulled by a peer and
+          three-way merged on concurrent edits.  An ".acpignore" in a
+          subdirectory has no effect.
+
+   IG-18  SELF-IGNORED STAYS LOCAL.  With "/.acpignore" in it, the file
+          is never pushed, and pull never replaces it even when the
+          space holds one.
+
+   IG-19  EXCLUSIONS CANNOT BE NEGATED.  A negation that names the
+          client's state directory or the names of its temporary files
+          does not cause them to be pushed.  A temporary file left by an
+          interrupted pull is not pushed.
+
+   IG-20  NO FILE, NO CHANGE.  Without an ignore file, every push and
+          pull produces the same commits, local files and output as a
+          client without this extension.
+
+   IG-21  EXPLICIT REMOVE WORKS.  An explicit remove of an ignored
+          shared path deletes it in the space.  The next pull leaves
+          the local copy.
+
+   IG-22  NO BLIND OVERWRITE.  A local file the scan did not enumerate
+          (an excluded name the client still materializes, or any file
+          under a sync root the scan could not enter) is modified
+          locally and remotely.  Pull keeps the local bytes and
+          preserves the remote bytes as a conflict.
+
+   IG-23  MATCHING VECTORS.  Every vector of Appendix A gives the stated
+          result.
+
+   IG-24  POLYNOMIAL MATCHING.  The pattern "**/" repeated 200 times
+          then "x", against a path of 500 segments that does not end in
+          "x", is decided within a fixed small bound (one second on
+          commodity hardware).
+
+   IG-25  AUTHORITY INDIFFERENCE.  A commit of ".acpignore", and of
+          "a/.acpignore", is accepted as an ordinary path.  The
+          manifest, the history and the bulk verdict are the same as
+          for any other file of that size.
+
+
+15.  Decisions
+
+   The protocol owner decided the following on 2026-11-02.
+
+   D1.  Shape: a client-conformance extension with no wire change and no
+        capability.
+
+   D2.  Name and scope: ".acpignore", the sync root only, no nested
+        files.
+
+   D3.  Shared, as a version-control ignore file is (4.4), with the
+        self-ignore line for an agent that wants its rules private.
+
+   D4.  No built-in defaults (4.6, 3.2).  The tip is optional and
+        non-normative.
+
+   D5.  Syntax: the Section 5 subset, with negation, anchoring,
+        directory-only, "*", "?" and "**", and no character classes
+        (they are errors).
+
+   D6.  An invalid file stops push AND pull (4.5).
+
+   D7.  The base FORGETS ignored paths (7.2).
+
+   D8.  Mounts are out of scope for this memo (9.3).
+
+   D9.  A dry run and a "why is this path ignored" query are separate
+        client features; this memo only constrains them (8.7).
+
+
+16.  Summary
+
+   The reference client implements Sections 4 to 8 in its push and pull,
+   and the pattern matcher ships as a client-safe package that SDKs may
+   reuse.  The authority needs no change.  Mounts and a TypeScript
+   matcher wait until someone needs them.  The rules of Section 7 are
+   the point of the memo; the syntax is the familiar part.
+
+
+Appendix A.  Matching Vectors
+
+   Each block is an ignore file followed by paths and the expected
+   result: I = ignored, - = not ignored.  A path ending in "/" is a
+   directory candidate met by the scan; every other path is a file.
+
+   A.1   __pycache__/
+            I  __pycache__/a.pyc
+            I  src/__pycache__/m.cpython-312.pyc
+            -  __pycache__            (a FILE of that name)
+            -  src/__pycache__x/a.pyc
+
+   A.2   *.log
+         !keep.log
+            I  a.log
+            I  logs/b.log
+            -  keep.log
+            -  logs/keep.log
+            -  a.log.txt
+
+   A.3   build/
+         !build/keep.txt
+            I  build/x
+            I  build/keep.txt         (an ignored directory is final)
+
+   A.4   /build
+            I  build                  (a file)
+            I  build/x
+            -  src/build/x
+
+   A.5   doc/*.txt
+            I  doc/a.txt
+            -  doc/sub/a.txt
+            -  x/doc/a.txt            (anchored)
+
+   A.6   **/foo
+            I  foo
+            I  a/b/foo
+            I  a/foo/x
+            -  foox
+
+   A.7   a/**/b
+            I  a/b
+            I  a/x/b
+            I  a/x/y/b/z
+            -  ab
+            -  x/a/b
+
+   A.8   foo/**
+         !foo/keep
+            I  foo/x
+            -  foo/keep               (trailing "**": 1+ segments, so
+                                       "foo" itself is not selected)
+            I  foo/keep/y
+
+   A.9   *
+         !*.py
+            -  a.py
+            I  src/a.py               (the directory "src" is selected)
+            I  README
+
+   A.10  \#notes
+         \!bang
+         "trail\ "                    (the line is the text between the
+                                       quotes: backslash, then a space)
+            I  #notes
+            I  !bang
+            I  "trail "               (one trailing space, kept)
+
+   A.11  a?c
+            I  abc
+            -  ac
+            -  a/c
+
+   A.12  Build/
+            -  build/x                (case-sensitive)
+
+   A.13  (empty file, or only comments and blank lines)
+            -  anything
+
+   A.14  INVALID -- each line alone is an invalid file (IG-15):
+            [Dd]ebug/
+            /
+            !
+            a//b
+            ../x
+            ./x
+            x\
+            <<<<<<< local
+            =======
+            >>>>>>> remote
+            (any file larger than 65536 octets)
+
+
+Appendix B.  Worked Example -- the test run
+
+   Two agents share "./shared".  The first writes an ignore file and
+   pushes it with the code:
+
+      $ cat shared/.acpignore
+      # generated by test runs -- keep local
+      __pycache__/
+
+      $ acp push ./shared
+      pushed 3 change(s) -> manifest v4
+
+   The second agent pulls (the ignore file arrives) and runs the tests,
+   which create "shared/__pycache__/".  Its push:
+
+      $ acp push ./shared
+      nothing to push (manifest v4, 3 files; 1 ignored: __pycache__/)
+
+   Before the ignore file existed, an older client had pushed two
+   cache files.  A conforming push leaves them alone and says so:
+
+      note: 2 ignored path(s) are still shared in the space
+        (__pycache__/wordfreq.cpython-312.pyc, ...); push never deletes
+        them -- remove them explicitly if they should go
+
+   The agent removes them by name.  That is an explicit, retained,
+   restorable deletion:
+
+      $ acp rm __pycache__/wordfreq.cpython-312.pyc \
+               __pycache__/test_wordfreq.cpython-312.pyc
+      removed 2 path(s) -> manifest v5
+
+   Its next pull leaves the local "__pycache__/" exactly as it is (R5).
+   If it later deletes that directory to tidy up, nothing in the space
+   changes (R2), now or after anyone edits the ignore file (7.2).
+
+
+Author's Address
+
+   A. Bot (Editor)
+   ab0t.com
+
+   This extension accompanies the ACP/1 specification (rfc/acp-1.txt)
+   and the reference implementation distributed at
+   https://github.com/ab0t-com/acp .  Ratified 2026-11-02.

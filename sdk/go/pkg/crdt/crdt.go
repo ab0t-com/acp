@@ -58,5 +58,20 @@ func New(replica string) *RGA { return crdt.New(replica) }
 // Load reconstructs an RGA from a serialized snapshot (see RGA.Snapshot).
 func Load(s State) *RGA { return crdt.Load(s) }
 
+// InstanceGone reports that the document at a name is no longer the one view was made on:
+// pulled, its whole log, lacks an element of the view that isn't in sending.
+func InstanceGone(view State, pulled, sending []Op) bool {
+	return crdt.InstanceGone(view, pulled, sending)
+}
+
+// InstanceGoneAt is the one rule at any pair of epochs: at a newer epoch the view is gone
+// when none of its visible elements is in the log, and at least one was there to find.
+func InstanceGoneAt(view State, pulled, sending []Op, viewEpoch, pulledEpoch int) bool {
+	return crdt.InstanceGoneAt(view, pulled, sending, viewEpoch, pulledEpoch)
+}
+
+// DocCheckFrom is where a pull starts so RGA.LogReplaced can look at the op before cursor.
+func DocCheckFrom(cursor int) int { return crdt.DocCheckFrom(cursor) }
+
 // SortOps orders a slice of ops into the canonical apply order.
 func SortOps(ops []Op) { crdt.SortOps(ops) }

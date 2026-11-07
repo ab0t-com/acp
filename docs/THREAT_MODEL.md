@@ -111,6 +111,30 @@ consequences:
   resource names). Prefixes match whole path segments and must end in `/`
   (`-mkagent` refuses a bare `projects/42`), so `projects/42/` never admits `projects/420/…`.
 
+## Web pages (a backend on the page's site) — additional surface
+
+A browser adds something the agent model does not have: **an untrusted runtime the person uses** (any
+script on the page, any extension). ACP's answer today is that a page holds **no** ACP credential: a backend on
+the page's own site holds one ACP login per person and forwards for them ([BROWSER.md](BROWSER.md); tested
+example [`examples/guides/browser-backend/`](../examples/guides/browser-backend/)). coordd sends no cross-site
+(CORS) headers on any route that needs a login, so a page on another site cannot call it with a credential (only the
+three token-free documents, `/v1/healthz`, `/.well-known/acp` and `/openapi.json`, may be read from any site, with no
+credentials), and its presence WebSocket accepts same-host pages only.
+
+| Threat | Mitigation | Remaining |
+|--------|-----------|--------|
+| Injected script or an extension reads the credential | The page holds none: the backend keeps the person's ACP login; the browser has only an `HttpOnly` session cookie | While the page is open, injected code can act **as the person** through the backend |
+| Another site makes the browser call coordd or the backend | coordd: no CORS headers on any route that needs a login, a bearer token (no cookie) is required. Backend: `SameSite=Strict` cookie; writes from another site refused (`Origin`/`Sec-Fetch-Site`); login only as JSON | — |
+| Token leaks through a URL, logs or the referrer | No token in the page; an `acp://` address never carries one | — |
+| A backend that forwards for anyone (confused deputy) | The backend must know the person (its sign-in, or an invite redeemed through it) and use **that person's** login; it replaces `Authorization`, forces `X-ACP-Space`, drops `X-ACP-Agent` | A buggy backend is the security boundary: treat it like shared infrastructure |
+| The page reaches administration | The backend forwards an allowlist of routes; `/v1/admin/*` and the invite routes are never on it. Invite logins are never admins | — |
+| Shared-key server (identity is a header) | The backend refuses it (a probe name echoed back by `whoami` = shared key) | — |
+| A removed person keeps going | Removing the login makes coordd answer 401; the backend then drops all of that person's sessions | Nothing: every node closes the login's open streams as soon as the removal reaches it |
+| Seeing more than intended inside a workspace | One workspace per audience: everyone who can open the page may see that workspace's activity log, who messaged whom, and presence. A read scope narrows file reads only | Per-person filtering of the activity log within a workspace is not available |
+| Many tabs exhaust a budget | Each person has their own login and rate budget; one shared stream per page (`client.subscribe`) | A login may hold `-max-streams-per-login` streams (default 64) on each server |
+| Lost work in a closed tab | Nothing is reported saved until the server acknowledged it; pages warn before closing while changes are unsaved | Unsaved changes are lost if the person closes anyway |
+| Self-signed certificate warnings | Browsers see the site's own certificate (TLS at your edge); the backend verifies coordd's certificate itself | — |
+
 ## Known gaps (roadmap)
 - **Per-resource ACLs/roles** — addressed: roles admin/writer/reader +
   path-prefix write scopes and read scopes. Full per-path ACLs (per-path readers, grants
@@ -139,8 +163,9 @@ consequences:
   **invite** creates is limited to its one space; a grant minted with `-mkagent` needs `-spaces`
   to be. Treat spaces as an organisational boundary unless every token carries an allowlist.
 - **Mailbox metadata and event history are readable by every agent that can read the space** —
-  message subjects and the activity log are space-wide (a message body is only for its
-  recipient). A path-prefix or read scope does NOT change this. **For several tenants on one
+  the activity log is space-wide, including who messaged whom (a message's subject and body
+  are only for its sender and recipient; log entries from before v0.2.6 keep their subjects).
+  A path-prefix or read scope does NOT change this. **For several tenants on one
   daemon:** one space per tenant, and every tenant login limited to its space(s) (invites do
   this; `-mkagent` needs `-spaces`). An unscoped login can open any space.
 

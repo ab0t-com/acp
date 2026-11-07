@@ -82,7 +82,7 @@ acp status                                        # login: ok, owner as admin
 ## 4. Connect agents
 
 ```bash
-acp invite --name codexB [--space team] [--role reader] [--ttl 2h] [--uses N] [--mcp]
+acp invite --name codexB [--space team] [--role reader] [--ttl 2h] [--uses N] [--grant-ttl 90d] [--mcp]
 acp invites                         # status + who joined
 acp invites revoke <id>             # cancel an unused invite
 acp invites remove-member <id>      # remove the agent an invite let in
@@ -93,6 +93,9 @@ fingerprint in the code before sending anything secret, gets its own token, save
 works. An invite works once, expires (24 h default, 7 days max), and makes a writer or reader in one workspace,
 never an admin. A space-scoped admin can invite only into its own workspaces. `--mcp` prints the variant for an
 MCP-only agent (`claude mcp add acp -- env ACP_PROFILE=<name> acp-mcp`).
+
+For a name that already has a login, the same command adds the workspace to that login (same role, no new token, only
+its own login can use the invite; run `acp join` where it lives, then `acp --space <workspace> …`).
 
 - An invite to `localhost`/`127.0.0.1` works only on this machine. For another machine:
   `ACP_SERVER=https://<reachable name>:8443 acp invite --name …`.
@@ -129,10 +132,10 @@ shell history; the CLI warns).
 
 ## 6. Workspaces, quotas, history, bulk guard
 
-- **Workspaces (spaces)** are the isolation boundary. Any request naming one creates it. `acp spaces` lists the
+- **Workspaces (spaces)** are the isolation boundary. Its first write creates one; a read never does (`404 space_not_found`). `acp spaces` lists the
   ones your login may use (persisted, survives restart). `acp admin spaces` lists all with what each holds.
   `acp admin spaces drop <name> --confirm <name>` removes an **empty** one (refused if it holds anything — since
-  v0.2.5 events count too, so a workspace's history is never erased; a workspace that was only read stays removable).
+  v0.2.5 events count too, so a workspace's history is never erased; one that holds nothing stays removable).
   A workspace not used since the server started is listed as unknown (`open:false`, no `empty`), not as empty; the
   drop checks it for real. `-max-spaces` (1000 per node) and `-max-spaces-per-grant` (16 new workspaces per non-admin
   login) bound creation; the per-login count is kept in memory per server process and per node (a restart resets it),
@@ -187,7 +190,7 @@ version. An old node applies them differently, or stops.
   snapshot the disk, copy it off the machine, on a schedule. Restore = stop, put it back, start.
 - **Restart:** SIGINT/SIGTERM drains and flushes; on start everything replays. Exit `78` means a permanent config
   problem (don't auto-retry): systemd `RestartPreventExitStatus=78`.
-- **Upgrade:** `acp update [--check] [--version vX.Y.Z]` swaps `acp`/`coordd`/`acp-mcp` after verifying checksums.
+- **Upgrade:** `acp update [--check] [--version vX.Y.Z]` swaps `acp`/`coordd`/`acp-mcp`/`acp-mount` (those already installed beside `acp`) after verifying checksums.
   It does **not** restart a running coordd, so restart it yourself. Docker: bump the pinned tag,
   `docker compose pull && docker compose up -d`. Read the release's upgrade notes first.
 - **MCP harnesses:** `acp-mcp` *is* the MCP server; register it against a saved profile:

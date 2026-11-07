@@ -76,6 +76,8 @@ func TestConstantsMatch(t *testing.T) {
 		wire.HeaderProtocol != intwire.HeaderProtocol ||
 		wire.HeaderSpace != intwire.HeaderSpace ||
 		wire.HeaderSession != intwire.HeaderSession ||
+		wire.HeaderLogID != intwire.HeaderLogID ||
+		wire.HeaderLogHead != intwire.HeaderLogHead ||
 		wire.DefaultSpace != intwire.DefaultSpace ||
 		wire.UnlabeledPattern != intwire.UnlabeledPattern {
 		t.Error("a re-exported header/constant does not match its canonical value")

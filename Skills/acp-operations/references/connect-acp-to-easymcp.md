@@ -26,37 +26,33 @@ registering through easymcp keeps ACP consistent with everything else and gives 
    cd /home/ubuntu/tools/shared_filesystem/acp
    go build -o /home/ubuntu/.local/bin/acp-mcp ./cmd/acp-mcp   # any stable path is fine
    ```
-3. This agent's connection env: `ACP_SERVER`, `ACP_TOKEN`, `ACP_CERT`, `ACP_AGENT`
-   (in per-agent mode the token IS the identity; mint one with `coordd -mkagent`).
+3. A login for this agent, saved as a profile. The easy way: `acp invite --name <agent>` on a machine with an admin
+   profile, then `acp join <code>` here. The profile holds the server, the token and the certificate, and the token
+   IS the identity. (`coordd -mkagent` also makes a login, but only with the server stopped.)
 
 ## Register the instance (local process, stdio)
 
-`acp-mcp` is a local-process stdio MCP server; pass its env via `--env`:
+`acp-mcp` is a local-process stdio MCP server. Point it at the saved profile, so no token lands in easymcp's config:
 
 ```bash
 easymcp instance add acp \
   --kind local_process \
   --transport stdio \
   --command /home/ubuntu/.local/bin/acp-mcp \
-  --env ACP_SERVER=https://<coordd-host>:8443 \
-  --env ACP_TOKEN=<this-agent-token> \
-  --env ACP_CERT=/path/to/cert.pem \
-  --env ACP_AGENT=claudeA \
+  --env ACP_PROFILE=claudeA \
   --description "ACP shared-filesystem + comms bridge"
 ```
 
 Notes:
-- `acp-mcp` takes **no command-line args** — everything is env, so no `--arg` needed.
-- **Per agent identity:** each agent needs its own `ACP_AGENT` (and its own token in
-  per-agent mode). Either register a separate instance per identity (e.g. `acp-claudeA`,
-  `acp-codexB`) or set the right env on each machine.
-- **Per space / per service:** to put an agent in a specific isolated space (or to wire
-  it to several independent ACP services at once), add `--env ACP_SPACE=<space>` and
-  register one instance per (server, space, agent), e.g. `acp-projX`, `acp-projY`. Each
-  is its own process with its own env → fully isolated, no client-side clash.
-- **Secrets:** `--env ACP_TOKEN=…` stores the token in easymcp's instance config —
-  protect that config like any secret. (The `--token-env-var` / auth-mode flags target
-  `remote_http` instances; for a local stdio process, env is the straightforward path.)
+- `acp-mcp` is configured through its environment, so no `--arg` is needed.
+- **Per agent identity:** each agent needs its own login, so its own profile. Either register a separate instance per
+  identity (e.g. `acp-claudeA`, `acp-codexB`) or set the right `ACP_PROFILE` on each machine.
+- **Per space / per service:** to put an agent in a specific workspace (or to wire it to several independent ACP
+  services at once), add `--env ACP_URI=acp://<host>/<space>/` and register one instance per (server, space, agent),
+  e.g. `acp-projX`, `acp-projY`. Each is its own process with its own env → fully isolated, no client-side clash.
+- **Secrets:** with `ACP_PROFILE` the token stays in `~/.acp`. If you have no profile on that machine, `ACP_SERVER`,
+  `ACP_TOKEN`, `ACP_CERT` and `ACP_AGENT` work too, but `--env ACP_TOKEN=…` stores the token in easymcp's instance
+  config: protect that config like any secret. (The `--token-env-var` / auth-mode flags target `remote_http` instances.)
 
 ## Verify, then install into the agent
 

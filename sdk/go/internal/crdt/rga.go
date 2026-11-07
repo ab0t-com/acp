@@ -17,7 +17,10 @@
 // convergence + transitivity tests.
 package crdt
 
-import "sort"
+import (
+	"sort"
+	"sync/atomic"
+)
 
 // ID is a unique, totally-ordered identifier for one element.
 type ID struct {
@@ -80,9 +83,10 @@ type elem struct {
 type RGA struct {
 	replica string
 	clock   uint64
-	els     []elem
-	have    map[ID]bool // applied op ids (idempotency)
-	pending []Op        // ops whose causal predecessor isn't present yet
+	els     seq          // the elements in document order (seq.go: O(log n) per place)
+	nodes   map[ID]*node // each element by id; the first one when a loaded state repeats an id
+	zeroDel bool         // a delete of the zero id was applied (it is known, like any applied op)
+	pending []Op         // ops whose causal predecessor isn't present yet
 
 	// live is the number of NON-deleted elements, maintained incrementally so
 	// LiveCount() is O(1). It exists so the daemon's compaction predicate never
@@ -109,7 +113,7 @@ func (r *RGA) PendingLen() int { return len(r.pending) }
 
 // New creates an empty document for the given replica id.
 func New(replica string) *RGA {
-	return &RGA{replica: replica, have: map[ID]bool{}}
+	return &RGA{replica: replica, nodes: map[ID]*node{}, els: seq{work: new(atomic.Uint64)}}
 }
 
 // observe keeps the local clock ahead of everything seen, so locally-minted IDs
@@ -120,27 +124,76 @@ func (r *RGA) observe(c uint64) {
 	}
 }
 
+// Observe moves the clock past c. A replica rebuilt from part of a log calls it for the
+// ops it left out, or the ids it mints next could repeat ids it minted there.
+func (r *RGA) Observe(c uint64) { r.observe(c) }
+
+// Clock is the replica's Lamport clock. A rebuild carries it over, so no id is minted twice.
+func (r *RGA) Clock() uint64 { return r.clock }
+
+// LogReplaced reports whether a document's log is no longer the one this replica was
+// synced from at cursor, at an unchanged epoch: the document was deleted and made again,
+// or a server was restored. ops is the log from cursor-1 (DocCheckFrom), total its length.
+// A shorter log says so outright; a longer one says so in the op this replica last took,
+// which it can't hold if that op belongs to another document, insert or delete: a delete's
+// id is its target's. An insert it does hold under other text says so too: a writer
+// starting a name over on a fixed replica id mints the same ids. Epoch alone can't tell.
+// A yes is only a reason to read the whole log: an op no replica can apply, left by a
+// writer on a stale view, reads the same, and InstanceGone settles it.
+func (r *RGA) LogReplaced(ops []Op, total, cursor int) bool {
+	if cursor == 0 {
+		return false
+	}
+	if total < cursor {
+		return true
+	}
+	if len(ops) == 0 {
+		return false
+	}
+	op := ops[0]
+	if !r.Knows(op.ID) {
+		return true
+	}
+	if op.Type != OpInsert {
+		return false
+	}
+	x := r.nodeOf(op.ID)
+	return x != nil && x.e.val != runeOf(op.Val)
+}
+
+// DocCheckFrom is where a pull starts so LogReplaced can look at the op before cursor.
+func DocCheckFrom(cursor int) int { return max(cursor-1, 0) }
+
 func (r *RGA) newID() ID {
 	r.clock++
 	return ID{Clock: r.clock, Replica: r.replica}
 }
 
+// indexOf is id's place: -1 for the zero id ("start"), -2 when not present. O(log n).
 func (r *RGA) indexOf(id ID) int {
 	if id.IsZero() {
 		return -1
 	}
-	for i := range r.els {
-		if r.els[i].id.Equal(id) {
-			return i
-		}
+	x := r.nodes[id]
+	if x == nil {
+		return -2 // not present
 	}
-	return -2 // not present
+	return r.els.pos(x)
+}
+
+// nodeOf is id's element, nil for the zero id or one not present (indexOf < 0).
+func (r *RGA) nodeOf(id ID) *node {
+	if id.IsZero() {
+		return nil
+	}
+	return r.nodes[id]
 }
 
 // Knows reports whether an op with this id has been applied (an inserted element, live or
 // deleted, or an applied delete). O(1). A delete still buffered for a missing target is
 // NOT known, which is what lets a server refuse a pre-squatted delete of a future id (D-3).
-func (r *RGA) Knows(id ID) bool { return r.have[id] }
+// An applied delete names an element that is present, or the zero id.
+func (r *RGA) Knows(id ID) bool { return r.nodes[id] != nil || (r.zeroDel && id.IsZero()) }
 
 // Apply integrates a remote (or replayed) op. Returns true if applied, false if
 // buffered pending its predecessor. Idempotent.
@@ -149,26 +202,20 @@ func (r *RGA) Apply(op Op) bool {
 	switch op.Type {
 	case OpInsert:
 		// HAZARD: HZ-ACPDB-02 (S2, fixed 2026-10-29 at the coordd boundary — D-3) op.ID is client-supplied; coordd now binds an insert's replica to the caller -> HAZARDS.md#HZ-ACPDB-02
-		if r.have[op.ID] {
+		if r.Knows(op.ID) {
 			return true // already applied
 		}
-		if !op.OriginLeft.IsZero() && r.indexOf(op.OriginLeft) == -2 {
+		if !op.OriginLeft.IsZero() && r.nodes[op.OriginLeft] == nil {
 			r.buffer(op)
 			return false // origin not here yet
 		}
 		r.integrate(elem{id: op.ID, originLeft: op.OriginLeft, val: runeOf(op.Val)})
-		r.have[op.ID] = true
 	case OpDelete:
-		i := r.indexOf(op.ID)
-		if i == -2 {
+		if !op.ID.IsZero() && r.nodes[op.ID] == nil {
 			r.buffer(op)
 			return false // target not here yet
 		}
-		if i >= 0 && !r.els[i].deleted {
-			r.els[i].deleted = true
-			r.live-- // keep live == len(SnapshotOps()); re-deleting must not double-count
-		}
-		r.have[op.ID] = true
+		r.deleteLocked(op.ID)
 	}
 	r.drainPending()
 	return true
@@ -191,30 +238,25 @@ func (r *RGA) drainPending() {
 		pend := r.pending
 		r.pending = nil
 		for _, op := range pend {
-			ready := op.Type == OpDelete && r.indexOf(op.ID) >= -1 ||
-				op.Type == OpInsert && (op.OriginLeft.IsZero() || r.indexOf(op.OriginLeft) >= -1)
+			ready := op.Type == OpDelete && (op.ID.IsZero() || r.nodes[op.ID] != nil) ||
+				op.Type == OpInsert && (op.OriginLeft.IsZero() || r.nodes[op.OriginLeft] != nil)
 			if !ready {
 				keep = append(keep, op)
 				continue
 			}
 			// re-enter via a non-buffering fast path
 			if op.Type == OpInsert {
-				if r.have[op.ID] {
+				if r.Knows(op.ID) {
 					progress = true
 					continue
 				}
 				r.integrate(elem{id: op.ID, originLeft: op.OriginLeft, val: runeOf(op.Val)})
-				r.have[op.ID] = true
 			} else {
 				// The SAME guarded mutation as Apply's delete branch (and the TS engine's
 				// drainPending): tombstone once, live-- once. Pre-fix this branch set the
 				// flag without live--, so a delete that arrived before its target left
 				// LiveCount one too high (HZ-ACPDB-44, Docs investigation D3).
-				if i := r.indexOf(op.ID); i >= 0 && !r.els[i].deleted {
-					r.els[i].deleted = true
-					r.live--
-				}
-				r.have[op.ID] = true
+				r.deleteLocked(op.ID)
 			}
 			progress = true
 		}
@@ -225,14 +267,34 @@ func (r *RGA) drainPending() {
 	}
 }
 
+// deleteLocked applies a delete whose target is present (or is the zero id): tombstone
+// once, live-- once; the op is known from then on.
+func (r *RGA) deleteLocked(id ID) {
+	if x := r.nodeOf(id); x != nil && !x.e.deleted {
+		x.e.deleted = true
+		r.live-- // keep live == len(SnapshotOps()); re-deleting must not double-count
+	}
+	if id.IsZero() {
+		r.zeroDel = true
+	}
+}
+
 // integrate places a new element using the YATA rule: find the slot after the
 // element's left origin, then among already-present elements skip those that
-// should sort before us — comparing by origin position first, then by ID.
+// should sort before us — comparing by origin position first, then by ID. The
+// elements are walked in order from the slot (seq.next), each origin's place looked
+// up in O(log n): the same steps the slice scan took, in O(log n) each.
 func (r *RGA) integrate(e elem) {
 	left := r.indexOf(e.originLeft) // -1 means "start"
 	i := left + 1
-	for i < len(r.els) {
-		c := r.els[i]
+	var cn *node
+	if left == -1 {
+		cn = r.els.first()
+	} else {
+		cn = r.els.next(r.nodes[e.originLeft])
+	}
+	for ; cn != nil; cn = r.els.next(cn) {
+		c := cn.e
 		cLeft := r.indexOf(c.originLeft)
 		if cLeft < left {
 			break // c is anchored left of us -> insert before it
@@ -247,9 +309,10 @@ func (r *RGA) integrate(e elem) {
 		// cLeft > left: c is inside a sibling's subtree to our left -> skip
 		i++
 	}
-	r.els = append(r.els, elem{})
-	copy(r.els[i+1:], r.els[i:])
-	r.els[i] = e
+	x := r.els.insertAt(i, e)
+	if r.nodes[e.id] == nil {
+		r.nodes[e.id] = x
+	}
 	if !e.deleted {
 		r.live++
 	}
@@ -257,25 +320,30 @@ func (r *RGA) integrate(e elem) {
 
 // Text materializes the current visible document.
 func (r *RGA) Text() string {
-	out := make([]rune, 0, len(r.els))
-	for _, e := range r.els {
+	out := make([]rune, 0, r.live)
+	r.els.each(func(e *elem) {
 		if !e.deleted {
 			out = append(out, e.val)
 		}
-	}
+	})
 	return string(out)
 }
 
 // GenerateOps diffs the current document against newText, produces the minimal
 // insert/delete ops to transform it, APPLIES them locally, and returns them for
 // broadcast. This is the bridge that lets an agent just edit a file as text.
+//
+// All inserts come before all deletes. A large edit is sent in several requests, so the
+// order is what a reader sees meanwhile and what is left if the sender stops: extra
+// text for a moment, never a document with a hole in it (R-C0). An insert's anchor is
+// still there when it lands because nothing has been deleted yet.
 func (r *RGA) GenerateOps(newText string) []Op {
-	visible := make([]elem, 0, len(r.els))
-	for _, e := range r.els {
+	visible := make([]elem, 0, r.live)
+	r.els.each(func(e *elem) {
 		if !e.deleted {
-			visible = append(visible, e)
+			visible = append(visible, *e)
 		}
-	}
+	})
 	oldR := make([]rune, len(visible))
 	for i, e := range visible {
 		oldR[i] = e.val
@@ -284,6 +352,7 @@ func (r *RGA) GenerateOps(newText string) []Op {
 	steps := diff(oldR, newR)
 
 	var ops []Op
+	var gone []ID
 	leftID := Zero
 	oi := 0 // index into visible
 	for _, s := range steps {
@@ -292,9 +361,7 @@ func (r *RGA) GenerateOps(newText string) []Op {
 			leftID = visible[oi].id
 			oi++
 		case del:
-			id := visible[oi].id
-			ops = append(ops, Op{Type: OpDelete, ID: id})
-			r.Apply(Op{Type: OpDelete, ID: id})
+			gone = append(gone, visible[oi].id)
 			oi++
 		case ins:
 			id := r.newID()
@@ -304,7 +371,24 @@ func (r *RGA) GenerateOps(newText string) []Op {
 			leftID = id
 		}
 	}
+	for _, id := range gone {
+		op := Op{Type: OpDelete, ID: id}
+		ops = append(ops, op)
+		r.Apply(op)
+	}
 	return ops
+}
+
+// DeletesFor counts the characters GenerateOps(newText) would delete from the document,
+// without changing it.
+func (r *RGA) DeletesFor(newText string) int {
+	n := 0
+	for _, s := range diff([]rune(r.Text()), []rune(newText)) {
+		if s.kind == del {
+			n++
+		}
+	}
+	return n
 }
 
 // SnapshotOps returns the minimal op set that reproduces the current VISIBLE
@@ -318,15 +402,15 @@ func (r *RGA) GenerateOps(newText string) []Op {
 // can never emit an op whose OriginLeft was a GC'd element. crdtstore enforces
 // that barrier (Compact bumps the epoch; AppendOps rejects stale epochs).
 func (r *RGA) SnapshotOps() []Op {
-	ops := make([]Op, 0, len(r.els))
+	ops := make([]Op, 0, r.live)
 	prev := Zero
-	for _, e := range r.els {
+	r.els.each(func(e *elem) {
 		if e.deleted {
-			continue
+			return
 		}
 		ops = append(ops, Op{Type: OpInsert, ID: e.id, OriginLeft: prev, Val: string(e.val)})
 		prev = e.id
-	}
+	})
 	return ops
 }
 
@@ -347,17 +431,22 @@ type State struct {
 
 func (r *RGA) Snapshot() State {
 	s := State{Replica: r.replica, Clock: r.clock}
-	for _, e := range r.els {
+	r.els.each(func(e *elem) {
 		s.Els = append(s.Els, ElemWire{ID: e.id, OriginLeft: e.originLeft, Val: string(e.val), Deleted: e.deleted})
-	}
+	})
 	return s
 }
 
 func Load(s State) *RGA {
-	r := &RGA{replica: s.Replica, clock: s.Clock, have: map[ID]bool{}}
-	for _, ew := range s.Els {
-		r.els = append(r.els, elem{id: ew.ID, originLeft: ew.OriginLeft, val: runeOf(ew.Val), deleted: ew.Deleted})
-		r.have[ew.ID] = true
+	r := &RGA{replica: s.Replica, clock: s.Clock, nodes: make(map[ID]*node, len(s.Els)), els: seq{work: new(atomic.Uint64)}}
+	nodes := r.els.build(len(s.Els), func(i int) elem { // O(n): the tree these inserts at the end would make
+		ew := s.Els[i]
+		return elem{id: ew.ID, originLeft: ew.OriginLeft, val: runeOf(ew.Val), deleted: ew.Deleted}
+	})
+	for i, ew := range s.Els {
+		if r.nodes[ew.ID] == nil { // a repeated id resolves to its first copy
+			r.nodes[ew.ID] = &nodes[i]
+		}
 		if !ew.Deleted {
 			r.live++ // rebuild the incremental counter from the restored state
 		}
@@ -370,84 +459,6 @@ func runeOf(s string) rune {
 		return c
 	}
 	return 0
-}
-
-// --- minimal LCS diff over runes ---
-
-type kind int
-
-const (
-	keep kind = iota
-	del
-	ins
-)
-
-type step struct {
-	kind kind
-	r    rune // for ins
-}
-
-// maxDiffRunes caps the per-side length fed to the O(n*m) LCS matrix (CI-W2-6,
-// twin of internal/merge's T38 cap). GenerateOps runs this on the CLIENT to turn a
-// new text into ops; a ~50k×50k matrix is ~10GiB of ints, so a large paste/file
-// would OOM the caller. Above the cap we skip the LCS and emit a linear
-// delete-all + insert-all script — still a correct (just non-minimal) edit that
-// converges — bounding memory to O(n+m).
-const maxDiffRunes = 1 << 16
-
-// diff returns an edit script transforming old -> new using a classic LCS DP.
-// O(len(old)*len(new)) — fine for source files; above maxDiffRunes it falls back
-// to a linear replace-all to avoid the quadratic-memory DoS (CI-W2-6).
-func diff(old, new []rune) []step {
-	n, m := len(old), len(new)
-	if n > maxDiffRunes || m > maxDiffRunes {
-		steps := make([]step, 0, n+m)
-		for i := 0; i < n; i++ {
-			steps = append(steps, step{kind: del})
-		}
-		for j := 0; j < m; j++ {
-			steps = append(steps, step{kind: ins, r: new[j]})
-		}
-		return steps
-	}
-	// lcs[i][j] = length of LCS of old[i:], new[j:]
-	lcs := make([][]int, n+1)
-	for i := range lcs {
-		lcs[i] = make([]int, m+1)
-	}
-	for i := n - 1; i >= 0; i-- {
-		for j := m - 1; j >= 0; j-- {
-			if old[i] == new[j] {
-				lcs[i][j] = lcs[i+1][j+1] + 1
-			} else if lcs[i+1][j] >= lcs[i][j+1] {
-				lcs[i][j] = lcs[i+1][j]
-			} else {
-				lcs[i][j] = lcs[i][j+1]
-			}
-		}
-	}
-	var steps []step
-	i, j := 0, 0
-	for i < n && j < m {
-		if old[i] == new[j] {
-			steps = append(steps, step{kind: keep})
-			i++
-			j++
-		} else if lcs[i+1][j] >= lcs[i][j+1] {
-			steps = append(steps, step{kind: del})
-			i++
-		} else {
-			steps = append(steps, step{kind: ins, r: new[j]})
-			j++
-		}
-	}
-	for ; i < n; i++ {
-		steps = append(steps, step{kind: del})
-	}
-	for ; j < m; j++ {
-		steps = append(steps, step{kind: ins, r: new[j]})
-	}
-	return steps
 }
 
 // SortOps gives a deterministic order for storage/display (by clock, replica).

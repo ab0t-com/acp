@@ -6,4 +6,4 @@ Private source commit: 313e27a
 
 This public tree is generated from selected docs, client skills, install helpers, and
 release binaries. It does NOT contain private implementation source (cmd/, internal/).
-Public artifact license: MIT. Commercial: ENTERPRISE.md / https://ab0t.com.
+Public artifact license: Apache-2.0. Commercial: ENTERPRISE.md / https://ab0t.com.

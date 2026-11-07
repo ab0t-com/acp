@@ -120,8 +120,9 @@ Status of This Memo
 
 Copyright Notice
 
-   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
-   license as the reference implementation and the base specification.
+   Copyright (c) 2026 ab0t.  Licensed under the Apache License, Version
+   2.0, the same license as the reference implementation and the base
+   specification.
 
 
 Table of Contents
@@ -354,6 +355,45 @@ Table of Contents
           (plus the PROPOSED "read_prefix" of Section 4.8 and "sub_scope"
           of Section 6, each subject to its own status).
 ====== END RATIFIED AMENDMENT · id=ext7-4.1.1-spaces-field ======
+
+====== BEGIN RATIFIED AMENDMENT · id=ext7-4.1.2-grant-expiry · proposed 2026-11-02 · RATIFIED (2026-11-02, owner) ======
+
+   4.1.2.  expires_at -- a grant that ends.
+
+      A grant MAY carry "expires_at", an RFC 3339 time in UTC.  Absent
+      means the grant does not end.  Past that time the grant
+      authenticates nowhere: every request with its token MUST answer 401,
+      and the authority SHOULD use code "grant_expired" so a client gets a
+      new token instead of retrying.  The authority compares the time with
+      its own clock when it authenticates a request; this is not part of a
+      replicated apply.
+
+      A grant's end is fixed when it is minted, and is the same on every
+      node: it is replicated with the grant (Section 17 of ACP/1).  Minting
+      takes either "expires_at" or a relative "ttl_sec" that the authority
+      resolves to a time once, not both; a time in the past is refused with
+      400.  An invite (EXT-40) MAY carry "grant_ttl_sec": each grant it
+      makes ends that long after its redeem, and a retried redeem MUST NOT
+      extend it.
+
+      A stream opened by a grant MUST NOT outlive it.  When a grant ends,
+      and when it is revoked, the authority MUST close that grant's open
+      event and awareness streams and sockets.  In a cluster each node
+      closes its own.
+
+      The end MUST appear in GET /v1/whoami and in the grant listing, so a
+      client can renew in time.  An authority that stores grants durably
+      MUST store a grant carrying "expires_at" so that a version without
+      this field refuses the store (Section 4.7), rather than honouring
+      the token for ever.
+
+      This is an addition: a grant without "expires_at" behaves as before.
+
+      Conformance: TestGrantExpiresAtEndsTheLogin,
+      TestStreamEndsWhenItsGrantEnds, TestRevokedLoginLosesItsStreams,
+      TestGrantEndNeedsTheVersion7Envelope.
+
+====== END RATIFIED AMENDMENT · id=ext7-4.1.2-grant-expiry ======
 
    4.2.  path_prefix -- constraining WRITE resource names.
 
@@ -619,6 +659,41 @@ Table of Contents
       group fan-out cap (recipients per group send) and does not bound
       one-to-one mail.
 ====== END RATIFIED AMENDMENT · id=ext7-5.1-max-mail ======
+
+      ====== BEGIN AMENDMENT · id=ext7-5.1-quota-put-merges ·
+      RATIFIED (2026-11-02, owner) ======
+
+      This amendment settles how the OPTIONAL admin API above updates a
+      space's quota.  It applies to every field of the Quota object,
+      including the fields EXT-33 Section 4.3.1 and EXT-34 Section 4.3.1
+      add to it.  It tightens; it relaxes nothing.
+
+      (a) PUT /v1/admin/quota MERGES: each field present in the request
+          body replaces that field's stored value; a field NOT present
+          keeps its stored value.  An explicit value (including 0) is a
+          value; an explicit JSON null returns the field to its unset
+          state (unbounded, or the owning memo's default where that memo
+          gives one).
+
+      (b) "sub_scopes", when present, replaces the per-label map as a
+          whole; when absent the stored labels are kept.  A request with
+          "sub_scope" edits that one label only (Section 5.5).
+
+      (c) Every validation rule applies to the MERGED result (for
+          example EXT-34's min-not-above-hard rule), and the response
+          carries the resulting full Quota.
+
+      (d) Rationale: under replace-whole semantics a request that tuned
+          one limit silently reset the others -- notably the EXT-33
+          retention window and the EXT-34 bulk-change policy -- to their
+          defaults, shortening history or weakening the mass-delete
+          guard with no error.  "Absent" in the stored configuration keeps its
+          existing meaning; only an UPDATE no longer erases what it does
+          not name.
+
+      Conformance: TestQuotaPutOfOneFieldKeepsRetentionAndBulkPolicy.
+
+      ====== END AMENDMENT · id=ext7-5.1-quota-put-merges ======
 
    5.3.  Advertisement.
 

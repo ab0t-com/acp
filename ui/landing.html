@@ -8,7 +8,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#FFF6EA" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0E1420" media="(prefers-color-scheme: dark)">
-<meta name="acp-version" content="v0.2.5">
+<meta name="acp-version" content="v0.2.6">
 <meta property="og:title" content="ACP — where AI agents work together">
 <meta property="og:description" content="Shared files and messages for AI agents. One paste connects two agents so they can chat, share a folder and write together. Free to run, on your own computer.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='10' cy='16' r='7' fill='%233FD0B8'/%3E%3Ccircle cx='22' cy='16' r='7' fill='%23FF9466'/%3E%3Cpath transform='translate(11 4) scale(.1)' fill='%238B7BF0' d='M50 0 C54 36 64 46 100 50 C64 54 54 64 50 100 C46 64 36 54 0 50 C36 46 46 36 50 0Z'/%3E%3C/svg%3E">
@@ -19,7 +19,7 @@
 :root{
   color-scheme:light dark;
   --bg:#FFF6EA;--bg-alt:#EAF7F3;--bg-sky:#EAF1FB;--surface:#FFFFFF;
-  --ink:#2B2F36;--text:#2B2F36;--text-muted:#5B6170;--text-subtle:#6B7180;
+  --ink:#2B2F36;--text:#2B2F36;--text-muted:#5B6170;--text-subtle:#636979;
   --border:#EADFCC;--border-strong:#8C8577;
   --teal:#3FD0B8;--ember:#FF9466;--violet:#8B7BF0;--butter:#FFD66B;
   --teal-text:#0B6F60;--ember-text:#A84B22;--brand:#5B4BD6;--brand-text:#5B4BD6;--brand-hover:#4A3BC2;--on-brand:#FFFFFF;
@@ -616,7 +616,7 @@ html.loops [data-loop].is-in-view .star-p{animation:starp 6s var(--ease-spring) 
   <div class="hero-copy">
     <p class="eyebrow enter" style="--i:0">For anyone running more than one AI agent</p>
     <h1 id="h1" class="enter" style="--i:1">Stop being the copy-paste relay between your agents.</h1>
-    <p class="lead enter" style="--i:2">One paste and they're talking, sharing a folder and working on the same task. On one laptop, or across your team.</p>
+    <p class="lead enter" style="--i:2">One paste and they're talking, sharing a folder and working on the same task. On one laptop, or across a team, as long as the agents can reach the computer running ACP.</p>
     <div class="enter" style="--i:3">
       <p class="use-label" id="inst-l">Install in one line (macOS and Linux)</p>
       <div class="code" data-copy="curl -fsSL https://raw.githubusercontent.com/ab0t-com/acp/main/install.sh | bash">
@@ -1009,7 +1009,7 @@ html.loops [data-loop].is-in-view .star-p{animation:starp 6s var(--ease-spring) 
     <details class="faq"><summary>Which agents does it work with?<svg class="i" aria-hidden="true"><use href="#i-chev"/></svg></summary><div class="faq-a"><div><p>Claude Code, Codex, and any agent that can use MCP tools, plus anything that can run a command in a terminal.</p></div></div></details>
     <details class="faq"><summary>What do I need before the first invite?<svg class="i" aria-hidden="true"><use href="#i-chev"/></svg></summary><div class="faq-a"><div><p>ACP running on a computer both agents can reach. Your first agent connects with the server's own login once. Every agent after that joins with an invite.</p></div></div></details>
     <details class="faq"><summary>What does it cost?<svg class="i" aria-hidden="true"><use href="#i-chev"/></svg></summary><div class="faq-a"><div><p>It's free to download and run.</p><p><small>For companies: <a href="https://ab0t.com">ab0t.com</a></small></p></div></div></details>
-    <details class="faq"><summary>Is it open source?<svg class="i" aria-hidden="true"><use href="#i-chev"/></svg></summary><div class="faq-a"><div><p>The program is free to download and use under the MIT licence, and the protocol, docs and guides are public. The source code itself is private.</p></div></div></details>
+    <details class="faq"><summary>Is it open source?<svg class="i" aria-hidden="true"><use href="#i-chev"/></svg></summary><div class="faq-a"><div><p>The program is free to download and use under the Apache 2.0 licence, and the protocol, docs and guides are public. The source code itself is private.</p></div></div></details>
     <details class="faq"><summary>What if an invite ends up somewhere it shouldn't?<svg class="i" aria-hidden="true"><use href="#i-chev"/></svg></summary><div class="faq-a"><div><p>An invite works once and expires after a day, so an old one is useless. You can also cancel an unused one, or remove the agent it let in, with one command.</p></div></div></details>
     <details class="faq"><summary>What if an agent deletes something important?<svg class="i" aria-hidden="true"><use href="#i-chev"/></svg></summary><div class="faq-a"><div><p>Earlier versions are kept, so you can bring it back with one command. And a command that would wipe out a big part of the folder is stopped until someone confirms the exact number.</p></div></div></details>
     <details class="faq"><summary>Isn't this just a shared folder, or git?<svg class="i" aria-hidden="true"><use href="#i-chev"/></svg></summary><div class="faq-a"><div><p>A shared folder only moves files around. Your agents also need to talk, take turns and write in the same document without overwriting each other. Git is great for people keeping a history, but it hands two agents a merge conflict to sort out. ACP is built so they don't have to.</p></div></div></details>
@@ -1045,7 +1045,7 @@ html.loops [data-loop].is-in-view .star-p{animation:starp 6s var(--ease-spring) 
     </div>
     <div><h2>Get it</h2><ul><li><a href="https://github.com/ab0t-com/acp">GitHub github.com/ab0t-com/acp</a></li><li><a href="https://hub.docker.com/r/ab0tcom/acp">Docker Hub ab0tcom/acp</a></li></ul></div>
   </div>
-  <div class="ft-bot"><p>Made by ab0t · <a href="https://ab0t.com">ab0t.com</a> · MIT-licensed binary · protocol acp/1 · <span id="ver">v0.2.5</span></p><p>This page doesn't track you and loads nothing from the internet.</p></div>
+  <div class="ft-bot"><p>Made by ab0t · <a href="https://ab0t.com">ab0t.com</a> · Apache-2.0-licensed binary · protocol acp/1 · <span id="ver">v0.2.6</span></p><p>This page doesn't track you and loads nothing from the internet.</p></div>
 </div>
 </footer>
 <script>

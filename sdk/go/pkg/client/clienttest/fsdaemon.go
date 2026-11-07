@@ -69,6 +69,12 @@ type FSDaemon struct {
 	// Outstamp, when set, makes the next fs.ops answer carry an "outstamped"
 	// warning for every op (the daemon's R7 report of a no-effect op).
 	Outstamp bool
+	// BeforeOps, when set, runs once when the next fs.ops arrives, before it is judged:
+	// a teammate's change landing after the caller's tree read.
+	BeforeOps func()
+	// IgnoreIfEmpty makes the fake a daemon older than v0.2.6: its decoder drops the
+	// if_empty member and the delete runs.
+	IgnoreIfEmpty bool
 	// Calls counts requests per METHOD+path (query stripped), for "never
 	// retried" assertions.
 	Calls map[string]int
@@ -642,6 +648,13 @@ func (d *FSDaemon) handleOps(w http.ResponseWriter, r *http.Request, g Grant) {
 		return
 	}
 	d.mu.Lock()
+	before := d.BeforeOps
+	d.BeforeOps = nil
+	d.mu.Unlock()
+	if before != nil {
+		before()
+	}
+	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.Mode != "realtime" {
 		wrongMode(w)
@@ -685,6 +698,10 @@ func (d *FSDaemon) handleOps(w http.ResponseWriter, r *http.Request, g Grant) {
 	}
 	for _, o := range body.Ops {
 		o := o
+		if o.IfEmpty && o.Op != "delete" && !d.IgnoreIfEmpty {
+			writeErr(w, 400, "if_empty applies to delete only, not "+o.Op)
+			return
+		}
 		switch o.Op {
 		case "create", "mkdir":
 			pid, name, ok := resolveParent(o.Path)
@@ -729,11 +746,17 @@ func (d *FSDaemon) handleOps(w http.ResponseWriter, r *http.Request, g Grant) {
 			plan = append(plan, pending{func() { n.parent, n.name = pid, name }})
 		case "delete":
 			n, ok := idx[strings.Trim(o.Path, "/")]
+			origin := strings.Trim(o.Path, "/")
+			if o.IfEmpty && !d.IgnoreIfEmpty && (!ok || !n.folder || holdsAnything(idx, origin)) {
+				writeJSON(w, http.StatusConflict, wire.ErrorResponse{
+					Error: "not deleted: " + origin + " is not an empty folder (it may have just gained something); nothing in this batch was applied",
+					Code:  "folder_not_empty"})
+				return
+			}
 			if !ok {
 				writeErr(w, 400, "path not found: "+o.Path)
 				return
 			}
-			origin := strings.Trim(o.Path, "/")
 			for k := range idx {
 				if k == origin || strings.HasPrefix(k, origin+"/") {
 					delete(idx, k)
@@ -787,6 +810,16 @@ func (d *FSDaemon) handleOps(w http.ResponseWriter, r *http.Request, g Grant) {
 		p.apply()
 	}
 	writeJSON(w, 200, out)
+}
+
+// holdsAnything reports whether a live node sits under folder.
+func holdsAnything(idx map[string]*node, folder string) bool {
+	for k := range idx {
+		if strings.HasPrefix(k, folder+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // --- tiny helpers (no extra deps) -------------------------------------------

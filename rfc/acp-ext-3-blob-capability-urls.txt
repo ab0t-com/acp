@@ -95,6 +95,25 @@ Status of This Memo (owner amendment, 2026-07-12)
         this check MAY be evaluated against follower-local state
         (best-effort, may lag the leader).
 
+        ====== BEGIN AMENDMENT · id=ext3-mint-realtime-files ·
+        RATIFIED (2026-11-06, owner) ======
+
+        This amendment extends item 5 to a space in realtime mode
+        (EXT-31), which the item predates.  A CAS space is unchanged.
+
+        In a realtime space the live tree (EXT-28) is the space's
+        current files and the manifest is a frozen earlier state, so
+        "referenced by the space manifest" means there: held by at
+        least one LIVE file node of the tree.  A node in the trash, a
+        checkpoint, and an entry of the frozen manifest do not count: a
+        file deleted after the switch gets no new URL, and a URL minted
+        before the delete keeps working until it expires, as in a CAS
+        space.  The same 400 applies otherwise.  The EXT-27 read-scope
+        rule is unchanged and evaluates the tree as EXT-27 Section 5.2
+        (amendment ext27-5.2-realtime-tree) says.
+
+        ====== END AMENDMENT · id=ext3-mint-realtime-files ======
+
      6. TTL floor.  ttl_sec below 10 clamps UP to 10; default 300 when
         omitted; upper clamp -cap-max-ttl (default 900).
 
@@ -108,8 +127,9 @@ Status of This Memo (owner amendment, 2026-07-12)
 
 Copyright Notice
 
-   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
-   license as the reference implementation and the base specification.
+   Copyright (c) 2026 ab0t.  Licensed under the Apache License, Version
+   2.0, the same license as the reference implementation and the base
+   specification.
 
 
 Table of Contents

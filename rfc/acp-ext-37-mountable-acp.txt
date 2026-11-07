@@ -91,8 +91,9 @@ Status of This Memo
 
 Copyright Notice
 
-   Copyright (c) 2026 ab0t.  Licensed under the MIT License, the same
-   license as the reference implementation and the base specification.
+   Copyright (c) 2026 ab0t.  Licensed under the Apache License, Version
+   2.0, the same license as the reference implementation and the base
+   specification.
 
 
 Table of Contents
@@ -962,6 +963,54 @@ Table of Contents
          "mode": "realtime"}; a "v="-pinned URI refuses to mount a
          realtime region.
       o  fs.mode.changed -> Section 5.3.
+
+      ====== BEGIN AMENDMENT · id=ext37-8.4-safe-save · RATIFIED
+      (2026-11-06, owner) ======
+
+      This amendment changes the realtime "rename" row of Section 6.1
+      for ONE case -- a plain file renamed over a live text document --
+      and adds it to the realtime behaviour above.  Every other rename
+      is unchanged.  It tightens; it relaxes nothing.
+
+      Editors commonly save by writing the new content to a temporary
+      file and renaming it over the file being edited (a "safe save").
+      On a live document the ordinary rename-over would replace the
+      document's node with the temporary file's node: the document
+      would go to the trash and co-editing would end for everyone.
+
+      When, in the mount's overlay, the SOURCE of a rename is a FILE
+      whose content is not a live document (a blob-backed file, or a
+      buffered save) and the DESTINATION is a file whose content is a
+      live TEXT document (EXT-28 Section 4.5; ACP/1 Section 12), a
+      realtime mount:
+
+      o  MUST NOT replace, move or trash the destination's node;
+      o  MUST, when the source's bytes are TEXT -- valid UTF-8 that
+         contains no NUL octet -- apply the rename as a whole-file WRITE
+         of those bytes to the destination, exactly as a write of that
+         document is applied (the edit is derived against the
+         document's text as of the rename and sent as text-CRDT
+         operations, so edits made by others meanwhile converge), under
+         every safeguard the mount applies to such a write, FOLLOWED BY
+         an unlink of the source.  The document keeps its node id, its
+         name and its operation history (the replaced text is deleted by
+         operations, never discarded with the document);
+      o  MUST hold both the source's bytes and the document's base text
+         before buffering either effect: if either cannot be read the
+         rename fails (EIO) and changes nothing, so a rename is never
+         left half applied;
+      o  MUST, when the source's bytes are NOT text, perform the
+         ordinary rename-over: the document's node goes to the trash
+         with its content intact (recoverable, as for any delete above)
+         and the file keeps its exact bytes -- a text transform would
+         corrupt them.
+
+      A rename whose source is itself a live document is the ordinary
+      rename-over (the moved document keeps its node; the replaced one
+      goes to the trash).  A folder renamed over a file is ENOTDIR
+      (Section 6.2), as before.
+
+      ====== END AMENDMENT · id=ext37-8.4-safe-save ======
 
 
 9.  Safety Under the Mount

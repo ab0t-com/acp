@@ -15,6 +15,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
@@ -234,5 +236,37 @@ func TestSystemRootsAcceptATrustedDaemon(t *testing.T) {
 	os.WriteFile(empty, nil, 0o600)
 	if out, err := child(empty); err == nil {
 		t.Fatalf("with no trusted root the child must fail, or this test proves nothing:\n%s", out)
+	}
+}
+
+// B2-LINK: TLSConfig had no way to learn the host, so a pin was checked against "" and an
+// IP host always failed, naming an empty host. The host is an option now; without one a
+// pin fails closed and says why.
+func TestTLSConfigChecksThePinAgainstTheHostItIsGiven(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
+	t.Cleanup(ts.Close)
+	pin := fmt.Sprintf("sha256:%x", sha256.Sum256(ts.Certificate().Raw))
+	get := func(host string) error {
+		cfg, err := TLSConfig(TLSOptions{Pin: pin, Host: host})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hc := &http.Client{Transport: &http.Transport{TLSClientConfig: cfg}}
+		resp, err := hc.Get(ts.URL)
+		if err == nil {
+			resp.Body.Close()
+		}
+		return err
+	}
+	if err := get("127.0.0.1"); err != nil {
+		t.Fatalf("the certificate covers the IP dialed: %v", err)
+	}
+	err := get("")
+	if err == nil || strings.Contains(err.Error(), `""`) || !strings.Contains(err.Error(), "names no host") {
+		t.Fatalf("no host: fail closed, and never print an empty name: %v", err)
+	}
+	var ce *CertHostError
+	if err := get("not-covered.example"); !errors.As(err, &ce) || ce.Host != "not-covered.example" {
+		t.Fatalf("a host the certificate does not cover: %v", err)
 	}
 }

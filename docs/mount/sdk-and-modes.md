@@ -133,11 +133,41 @@ const vfs = mountVirtualFS({
   uri: "acp://coord.example:8443/team/",
   profiles,                    // exactly one of `profiles` or `client`
   conflict: "sidecar",         // "sidecar" (default) | "throw"
+  // allowBulk: true,           // realtime: let a save through that would empty a live text doc
+                                //   (default: refused with EPERM and kept pending, like --allow-bulk)
 });
 await vfs.writeFile("notes.md", new TextEncoder().encode("- ship it\n"));
 const report = await vfs.flush();          // the barrier: one commit
 for (const e of await vfs.readdir("")) { /* ... */ }
 ```
+
+**Editor safe saves on a live text doc (realtime).** Editors save by writing a temp
+file and renaming it over the file they edit. When the target is a live text doc,
+`vfs.rename(".notes.md.swp", "notes.md")` does not replace the doc with a plain file
+(that would end co-editing): it writes the temp file's text INTO the doc, as
+`writeFile("notes.md", text)` would — a CRDT merge against the text you last read, so
+what teammates typed meanwhile stays, under the same 90 % wipe guard (`allowBulk`) —
+and removes the temp file. A save of a doc this mount never read adds to it and deletes
+nothing, as on the Go mount (`flush()` lists it in `merged`; `allowBulk` replaces).
+The doc keeps its node, its name and its history. If the temp file or the doc's
+starting text cannot be read, `rename` rejects (`EIO` when the server cannot be
+reached) and nothing changes.
+Bytes that are not text (a NUL byte or invalid UTF-8) keep the ordinary rename-over:
+the doc goes to the trash with its text intact (recoverable with `restore()`) and the
+file lands byte-exact. A doc renamed over a doc also replaces it (the replaced doc
+goes to the trash); a folder over a doc is `ENOTDIR`.
+The native mount (`acp mount` / `acp-mount`, FUSE, NFS and WebDAV) follows the same
+rules for `mv .notes.md.swp notes.md` on a live space: the text goes into the doc
+(`--allow-bulk` is the wipe-guard override), a failed read leaves the rename undone
+(`EIO`), a full write buffer refuses it (`ENOSPC`) with nothing changed, and binary
+bytes keep the ordinary rename-over. Written in place into a live doc, bytes that are
+not text are refused with `EINVAL` there too: a whole-file save at once, and a file
+written piece by piece through an open handle at `fsync`/close (pieces that cut a
+character in half are fine; only the finished file is judged). The refused save stays
+pending and the doc keeps its text; writing the file again with text replaces it.
+Written IN PLACE (`writeFile("notes.md", bytes)`), bytes that are not text are refused
+with `EINVAL` naming the file, and nothing is buffered. Save them as a plain file under
+another name. A leading UTF-8 BOM is text and is kept byte-exact.
 
 Note the TS conflict vocabulary is `"sidecar" | "throw"` (the Go/native equivalent
 of `throw` is `--conflict=error` → `ESTALE`). It auto-detects the space's fs mode

@@ -12,16 +12,16 @@ import (
 // cap). GenerateOps runs an O(n*m) LCS matrix on the CLIENT; a large paste/file
 // (~50k×50k ≈ 10GiB of ints) OOMs the caller. Proves the diff has a size guard AND
 // that GenerateOps still produces a CORRECT edit script on normal input (guard) —
-// a source assertion for the cap (a 50k×50k detonation can't be run safely, RULE 3)
-// plus a live correctness check of the fallback-free path.
+// a source assertion for the bound (R-C0 replaced the matrix with a linear-space search,
+// and TestDiffWorstCaseStaysBounded runs the detonation for real) plus a live check.
 func TestVulnW2_CIW26_DiffSizeCapped(t *testing.T) {
-	src, err := os.ReadFile("rga.go")
+	src, err := os.ReadFile("diff.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), "maxDiffRunes") {
-		t.Fatalf("internal/crdt/diff() has no input-size guard before the O(n*m) LCS matrix (twin of T38): a large " +
-			"GenerateOps input OOMs the client. Cap it and fall back to a linear replace-all.")
+	if !strings.Contains(string(src), "maxDiffEdits") || !strings.Contains(string(src), "maxDiffWork") {
+		t.Fatalf("internal/crdt/diff() has no bound on its search (twin of T38): a large " +
+			"GenerateOps input OOMs or hangs the client.")
 	}
 	// GUARD: a normal edit still round-trips (the cap must not break correct diffs).
 	r := New("A")

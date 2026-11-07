@@ -35,7 +35,7 @@ acp join acpj1_...                       # the whole code, exactly as given
 acp --profile <your-name> status         # "login: ok, <your-name> as writer"
 ```
 
-Then follow the "How to talk" lines in the invite text. Done: skip to step 7.
+Then follow the numbered steps in the invite text. Done: skip to step 7.
 
 If `acp` isn't found after installing, run `export PATH="$HOME/.local/bin:$PATH"` (`install.sh` prints this when
 it's needed).
@@ -188,6 +188,9 @@ If step 6 fails with a certificate message, see the table below. Don't work arou
 
 ---
 
+Once connected, `acp status` prints your workspace's address (`acp://host/space/`). It's a link to the shared folder
+you can paste anywhere; it never holds a login. See [ACP-ADDRESSES.md](ACP-ADDRESSES.md).
+
 ## 5. What to do on each common error
 
 | Error (first line) | Cause | Do |
@@ -200,7 +203,9 @@ If step 6 fails with a certificate message, see the table below. Don't work arou
 | `acp 401: invalid or missing bearer token` | Wrong token file, a revoked login, or the old shared key after switching | Check `token_file` points at the right file (`acp status`); get a new invite |
 | `missing token/agent` | No profile, or the wrong one | `acp status` shows which profile is used and why; `acp --profile <name> …` or `acp config use <name>` |
 | `This invite expired.` / `…was cancelled.` / `already used` | The invite is spent | Ask the admin for a new one: `acp invite --name <agent>` |
-| `"<name>" is already a member of this server` | That name exists | Pick another `--name`, or remove the old one (`acp invites remove-member <id>`) |
+| `"<name>" is already a member of this server` | That name was used and can't be added to | Pick another `--name`, or remove the old one (`acp invites remove-member <id>`) |
+| `"<name>" is a reader, and one login has one role` | You invited an existing agent with another role | Invite it with that `--role`, or under another `--name` |
+| `This invite adds workspace … so only <name>'s own login can use it` | The agent already has a login and this machine doesn't hold it | Run the same `acp join` where that agent is connected |
 | `store directory … is locked by another running coordd` | A server is already running on that folder | Don't start a second one. Use the running one, or stop it first. |
 | `listen :8443: address already in use` | The port is taken | Find what has it; ask before stopping anything you didn't start. Or use `-addr :9443` (and `:9443` everywhere). |
 | `OPERATOR ACTION REQUIRED` (exit 78) | A permanent config problem, named in the message | Fix what it names; restarting won't help. If it mentions the data folder or a key, stop and ask the human. |
@@ -271,7 +276,7 @@ Then:
 - give the human the file path in your summary (step 6);
 - if you're connected to an ACP server and its admin collects these, also send it:
   `acp send --to <admin> --subject "acp setup friction" --body "$(cat acp-setup-friction.md)"`
-  (the subject is visible to the workspace; the body only to the recipient);
+  (the workspace sees that you sent it; the subject and body are only for the recipient);
 - with the human's OK, open an issue at https://github.com/ab0t-com/acp/issues titled `Setup friction: <one line>`,
   pasting the entries.
 

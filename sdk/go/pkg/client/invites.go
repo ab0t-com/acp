@@ -10,12 +10,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +42,10 @@ type InviteRequest struct {
 	TTLSec     int          `json:"ttl_sec,omitempty"`
 	Uses       int          `json:"uses,omitempty"`
 	Note       string       `json:"note,omitempty"`
+	// GrantTTLSec ends each joiner's login this many seconds after they join (ext-7
+	// §4.1.2; 60 to 315360000). Zero: their login does not end. A daemon older than
+	// v0.2.6 ignores it, so compare it with the Invite you get back.
+	GrantTTLSec int `json:"grant_ttl_sec,omitempty"`
 }
 
 // InviteRedemption is one member an invite minted (names, times, fingerprints;
@@ -73,7 +78,9 @@ type Invite struct {
 	RevokeReason string             `json:"revoke_reason,omitempty"`
 	Status       string             `json:"status"` // pending | exhausted | expired | revoked
 	Redemptions  []InviteRedemption `json:"redemptions"`
-	Servers      []string           `json:"servers,omitempty"` // optional operator hint
+	Servers      []string           `json:"servers,omitempty"`       // optional operator hint
+	GrantTTLSec  int                `json:"grant_ttl_sec,omitempty"` // how long each joiner's login lasts, if it ends
+	AddMember    bool               `json:"add_member,omitempty"`    // Name already exists: this adds Space to its login, and only its own token can redeem it
 }
 
 // CreateInvite creates a pending invite (admin). The secret is returned ONCE:
@@ -119,13 +126,37 @@ func (c *Client) RevokeInvite(id string) error {
 }
 
 // RemoveInviteMember revokes the grant an invite minted (EXT-40 §5.6) and
-// returns that grant's fingerprint.
+// returns that grant's fingerprint. RemoveInviteMemberDetail also says whether
+// only a workspace went.
 func (c *Client) RemoveInviteMember(id string) (fingerprint string, err error) {
-	var out struct {
-		Revoked string `json:"revoked"`
+	r, err := c.RemoveInviteMemberDetail(id)
+	return r.Revoked, err
+}
+
+// MemberRemoval is the answer to removing an invite's member. Space is set when
+// the login holds other workspaces: it lost that one and keeps working in the
+// rest (EXT-40 §5.7). Empty: the login ended.
+type MemberRemoval struct {
+	Revoked string `json:"revoked"`
+	Name    string `json:"name"`
+	Space   string `json:"space"`
+}
+
+// RemoveInviteMemberDetail is RemoveInviteMember with the whole answer.
+func (c *Client) RemoveInviteMemberDetail(id string) (MemberRemoval, error) {
+	return c.RemoveInviteMemberNamed(id, "")
+}
+
+// RemoveInviteMemberNamed removes the member of invite id that goes by name: the way to
+// answer 409 member_ambiguous, when the invite let in more than one agent. "" names none.
+func (c *Client) RemoveInviteMemberNamed(id, name string) (MemberRemoval, error) {
+	var out MemberRemoval
+	path := "/v1/admin/invites/" + url.PathEscape(id) + "/member"
+	if name != "" {
+		path += "?name=" + url.QueryEscape(name)
 	}
-	err = c.do("DELETE", "/v1/admin/invites/"+url.PathEscape(id)+"/member", nil, &out)
-	return out.Revoked, err
+	err := c.do("DELETE", path, nil, &out)
+	return out, err
 }
 
 // noRedirect is c's HTTP client with redirects refused outright: the join
@@ -158,7 +189,7 @@ func (c *Client) SupportsInvites(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	resp, err := c.noRedirect().Do(req)
+	resp, err := c.doResetOnce(c.noRedirect(), req)
 	if err != nil {
 		return false, err
 	}
@@ -168,13 +199,18 @@ func (c *Client) SupportsInvites(ctx context.Context) (bool, error) {
 	}
 	data, _ := readBounded(resp.Body)
 	if resp.StatusCode != 200 {
-		return false, nil
+		// Every coordd answers /v1/healthz: another answer (a proxy's 502, a 5xx) is no
+		// "older server", and saying so would send the person to update coordd (R-C23 P2-18).
+		return false, apiErrorFrom(resp.StatusCode, data)
 	}
 	var h struct {
 		Protocol     string   `json:"protocol"`
 		Capabilities []string `json:"capabilities"`
 	}
-	if json.Unmarshal(data, &h) != nil || h.Protocol != wire.ProtocolVersion {
+	if err := json.Unmarshal(data, &h); err != nil {
+		return false, fmt.Errorf("the server's /v1/healthz answer could not be read (%v): is this address an ACP server?", err)
+	}
+	if h.Protocol != wire.ProtocolVersion {
 		return false, nil
 	}
 	for _, s := range h.Capabilities {
@@ -192,6 +228,11 @@ type RedeemRequest struct {
 	Name      string      `json:"name,omitempty"`
 	RedeemKey string      `json:"redeem_key,omitempty"`
 	Client    *ClientInfo `json:"client,omitempty"`
+	// AsMember sends this client's own token with the redeem, for an invite that
+	// adds a workspace to an existing member (EXT-40 §5.7): only that member's
+	// token can redeem one. Set it only on a client built for the server the
+	// invite's trust check passed for: it is the one redeem that carries a token.
+	AsMember bool `json:"-"`
 }
 
 // ClientInfo optionally tells the daemon which harness and client version joined
@@ -202,7 +243,10 @@ type ClientInfo struct {
 }
 
 // Redeemed is the redeem response. Token is the member's own token, shown once.
+// Added: the invite added Space to the member's existing login, so Token is empty
+// and the login in use keeps working.
 type Redeemed struct {
+	Added       bool        `json:"added,omitempty"`
 	Token       string      `json:"token"`
 	Fingerprint string      `json:"fingerprint"`
 	Name        string      `json:"name"`
@@ -213,6 +257,8 @@ type Redeemed struct {
 		Name string `json:"name"`
 	} `json:"inviter"`
 	Retry bool `json:"retry"`
+	// ExpiresAt is when this login ends (RFC 3339). Empty: it does not end.
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 // NewRedeemKey returns a fresh retry key (192 bits, base64url): make ONE per
@@ -250,16 +296,14 @@ func redeemOutcomeUnknown(status int, e *APIError) bool {
 
 // retryAfter parses a Retry-After in seconds (0 if absent), capped at redeemMaxWait.
 func retryAfter(h http.Header) time.Duration {
-	n, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After")))
-	if err != nil || n <= 0 {
-		return 0
-	}
-	return min(time.Duration(n)*time.Second, redeemMaxWait)
+	d, _ := retryAfterWait(h, redeemMaxWait)
+	return d
 }
 
-// Redeem presents an invite (EXT-40 §5.4). It sends NO Authorization and NO
-// X-ACP-Space header: the secret is the credential and the space comes from the
-// invite. When the outcome is unknown (a transport failure with no response, or
+// Redeem presents an invite (EXT-40 §5.4). It sends NO Authorization (unless
+// r.AsMember, for an invite that adds a workspace to this client's own login)
+// and NO X-ACP-Space header: the secret is the credential and the space comes
+// from the invite. When the outcome is unknown (a transport failure with no response, or
 // a 502/503/504 / reason-less 5xx) it retries the same request (same
 // redeem_key) a bounded number of times, honouring Retry-After, and then
 // returns an error wrapping ErrNoResponse. A daemon refusal (an *APIError with
@@ -269,9 +313,13 @@ func retryAfter(h http.Header) time.Duration {
 // r.RedeemKey until the join succeeds or is refused, so a re-run is a retry.
 func (c *Client) Redeem(ctx context.Context, r RedeemRequest) (Redeemed, error) {
 	if r.RedeemKey == "" {
-		r.RedeemKey = NewRedeemKey()
+		r.RedeemKey = NewRedeemKey() // returned in a RedeemUnknownError, so a re-run can be a retry (R-C23 P2-19)
 	}
-	body, _ := json.Marshal(r)
+	unanswered := false         // a redeem went out and its answer was lost
+	body, err := marshalBody(r) // invalid UTF-8 text is refused before anything is sent
+	if err != nil {
+		return Redeemed{}, err
+	}
 	hc := c.noRedirect()
 	var last error
 	var wait time.Duration
@@ -282,7 +330,9 @@ func (c *Client) Redeem(ctx context.Context, r RedeemRequest) (Redeemed, error) 
 			}
 			select {
 			case <-ctx.Done():
-				return Redeemed{}, errors.Join(ErrNoResponse, last, ctx.Err())
+				// The tries so far went out with their answers lost: the key goes back, so a
+				// re-run is a retry of the same redeem (R-C27 P2-15).
+				return Redeemed{}, &RedeemUnknownError{RedeemKey: r.RedeemKey, Err: errors.Join(ErrNoResponse, last, ctx.Err())}
 			case <-time.After(wait):
 			}
 			wait = 0
@@ -293,13 +343,28 @@ func (c *Client) Redeem(ctx context.Context, r RedeemRequest) (Redeemed, error) 
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set(wire.HeaderProtocol, wire.ProtocolVersion)
+		if r.AsMember {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
 		resp, err := hc.Do(req)
 		if err != nil {
-			last = err
+			if trustFailure(err) {
+				// The TLS check refused: sending again can't help (R-C23 P2-19). If an earlier
+				// try went out with its answer lost, the outcome is still unknown, and the key
+				// goes back with it (R-C28 P0-10).
+				if unanswered {
+					return Redeemed{}, &RedeemUnknownError{RedeemKey: r.RedeemKey, Err: errors.Join(ErrNoResponse, last, err)}
+				}
+				return Redeemed{}, err
+			}
+			last, unanswered = err, true
 			continue
 		}
 		if rerr := redirected(resp); rerr != nil {
 			resp.Body.Close()
+			if unanswered { // an earlier try's outcome is still unknown: the key goes back (R-C30)
+				return Redeemed{}, &RedeemUnknownError{RedeemKey: r.RedeemKey, Err: errors.Join(ErrNoResponse, last, rerr)}
+			}
 			return Redeemed{}, rerr
 		}
 		data, rerr := readBounded(resp.Body)
@@ -307,24 +372,62 @@ func (c *Client) Redeem(ctx context.Context, r RedeemRequest) (Redeemed, error) 
 		if resp.StatusCode >= 300 {
 			ae := apiErrorFrom(resp.StatusCode, data)
 			if redeemOutcomeUnknown(resp.StatusCode, ae) {
-				last, wait = ae, retryAfter(resp.Header)
+				last, wait, unanswered = ae, retryAfter(resp.Header), true
 				continue
+			}
+			if unanswered && ae.Reason() == "invite_revoked" {
+				// D54 / R-C23 P2-17: an earlier try went out and its answer was lost, and the
+				// invite was revoked since. No token is ever minted after a revoke, so the
+				// answer stands; but that earlier try may have made the login.
+				ae.Message = "this invite was revoked after your first try, whose answer was lost: that try may have redeemed it and made your login, and its token cannot be sent now. Ask the admin to give that login a token (or a new invite); a retry cannot help"
+			}
+			if unanswered && !strings.HasPrefix(ae.Reason(), "invite_") {
+				// A refusal that says nothing of the invite (a 429, a proxy's 4xx) after a try
+				// whose answer was lost: the outcome is still unknown, and the key goes back.
+				return Redeemed{}, &RedeemUnknownError{RedeemKey: r.RedeemKey, Err: errors.Join(ErrNoResponse, last, ae)}
 			}
 			return Redeemed{}, ae
 		}
 		if rerr != nil { // the body died mid-read: the daemon applied it, we hold nothing
-			last = rerr
+			last, unanswered = rerr, true
 			continue
 		}
 		var out Redeemed
-		if err := json.Unmarshal(data, &out); err != nil || out.Token == "" {
-			last = errors.New("the daemon's redeem response has no token")
+		if err := json.Unmarshal(data, &out); err != nil || (out.Token == "" && !out.Added) {
+			last, unanswered = errors.New("the daemon's redeem response has no token"), true
 			continue
 		}
 		return out, nil
 	}
-	return Redeemed{}, errors.Join(ErrNoResponse, last)
+	return Redeemed{}, &RedeemUnknownError{RedeemKey: r.RedeemKey, Err: errors.Join(ErrNoResponse, last)}
 }
+
+// RedeemUnknownError is a redeem whose outcome is unknown: no answer came. Run Redeem again
+// with RedeemKey (the one it used, made for you when you gave none), and the server treats
+// it as a retry of the same redeem, never a second one. It matches ErrNoResponse.
+type RedeemUnknownError struct {
+	RedeemKey string
+	Err       error
+}
+
+// Error never prints RedeemKey: it is a credential (R-C27 P2-15). Take it from the field.
+func (e *RedeemUnknownError) Error() string {
+	return e.Err.Error() + " (to retry, redeem again with the same redeem key: RedeemUnknownError.RedeemKey)"
+}
+
+func (e *RedeemUnknownError) Unwrap() error { return e.Err }
+
+// trustFailure is a TLS trust refusal: the certificate is not trusted for this address.
+func trustFailure(err error) bool {
+	var ua x509.UnknownAuthorityError
+	var he x509.HostnameError
+	var ci x509.CertificateInvalidError
+	return errors.As(err, &ua) || errors.As(err, &he) || errors.As(err, &ci) || errors.Is(err, errPinMismatch)
+}
+
+// errPinMismatch is the certificate check a profile's pin refused: a trust failure, which
+// no retry can cure (R-C27 P2-15).
+var errPinMismatch = errors.New("pin mismatch")
 
 // Reason is the EXT-40 §9 machine-readable "reason" token of an error body
 // ("" when the daemon sent none).

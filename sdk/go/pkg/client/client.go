@@ -48,6 +48,11 @@ type Client struct {
 	capsMu       sync.Mutex
 	caps         map[string]bool // healthz capability list; nil until first probe
 	warnedNoChan bool            // one-time "no channels capability" warning fired
+
+	hubOnce sync.Once
+	hub     *eventHub       // the shared stream behind Subscribe, made on first use
+	tr      *http.Transport // the transport behind hc
+	limits  timeLimits      // one-shot calls only (D54); streams are not bound
 }
 
 // TLSOptions selects how the client trusts the daemon (ACP/1 §4.1). In order:
@@ -59,10 +64,15 @@ type Client struct {
 //   - Insecure: skip verification (dev only; §4.1 forbids it in production).
 //   - none of these: the system trust store, i.e. a publicly certified daemon such
 //     as one behind a TLS edge (a public cert renews too often to pin).
+//
+// Host is the host being dialed. NewTLS takes it from the base URL; a caller of
+// TLSConfig must set it for a Pin to verify: a TLS client sends no server name for an
+// IP address, so nothing else tells the pin's hostname check what was dialed.
 type TLSOptions struct {
 	CertPath string
 	Pin      string
 	Insecure bool
+	Host     string
 }
 
 // New builds a client. certPath pins the daemon's self-signed cert (recommended
@@ -99,18 +109,35 @@ func NewTLS(base, token, agent string, o TLSOptions) (*Client, error) {
 	tr := &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true}
 	return &Client{
 		base: base, token: token, agent: agent, session: hex.EncodeToString(sess),
-		hc: &http.Client{Timeout: 0, Transport: trustHint{tr}, CheckRedirect: refuseDowngrade},
+		hc:     &http.Client{Timeout: 0, Transport: trustHint{tr}, CheckRedirect: refuseDowngrade},
+		tr:     tr,
+		limits: timeLimits{headers: DefaultHeaderWait, stall: DefaultBodyStall},
 	}, nil
+}
+
+// BoundResponseHeaders ends a call whose server answers nothing within d of the request
+// going out, and 0 leaves it unbounded. The calls here take no context, so a caller that
+// gives up on one (acp-mount's wire deadline) has no other way to end it: against a server
+// that went silent, each would hold a goroutine and a connection for as long as the socket
+// lives. Set it before the first call. A stream that has begun is not bound by it.
+func (c *Client) BoundResponseHeaders(d time.Duration) {
+	if c.tr != nil {
+		c.tr.ResponseHeaderTimeout = d
+	}
 }
 
 // RedirectError is a redirect the client refused to follow. Location is the
 // target with any userinfo, query and fragment removed (it is shown to users).
 type RedirectError struct {
-	Status   int // the 3xx status, when known
-	Location string
+	Status    int // the 3xx status, when known
+	Location  string
+	OtherHost bool // the hop stays on TLS but goes to another host or port
 }
 
 func (e *RedirectError) Error() string {
+	if e.OtherHost {
+		return fmt.Sprintf("the server redirected to %s, another host, and acp does not send your login there", e.Location)
+	}
 	if e.Status != 0 {
 		return fmt.Sprintf("the server answered %d, redirecting to %s, and acp does not follow that redirect", e.Status, e.Location)
 	}
@@ -130,7 +157,10 @@ func redactedLocation(u *url.URL) string {
 // refuseDowngrade is the client-wide redirect policy. Go's default follows up
 // to 10 hops and re-sends Authorization to the SAME host even when the hop
 // drops https for http, which would put the bearer token on the wire in clear
-// (EXT-40 review F1, swept client-wide): a hop that leaves TLS is refused.
+// (EXT-40 review F1, swept client-wide): a hop that leaves TLS is refused. So is a hop
+// to another host or port: Go keeps Authorization for a subdomain and for a new port on
+// the same host, and no call that uses this policy is redirected by a real server (the
+// one redirect there is, a follower's for a live stream, FollowAwareness takes by hand).
 func refuseDowngrade(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errors.New("stopped after 10 redirects")
@@ -138,11 +168,14 @@ func refuseDowngrade(req *http.Request, via []*http.Request) error {
 	if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
 		return &RedirectError{Location: redactedLocation(req.URL)}
 	}
+	if via[0].URL.Host != req.URL.Host {
+		return &RedirectError{Location: redactedLocation(req.URL), OtherHost: true}
+	}
 	return nil
 }
 
 // TLSConfig builds the tls.Config for o (see TLSOptions).
-func TLSConfig(o TLSOptions) (*tls.Config, error) { return tlsConfig(o, "") }
+func TLSConfig(o TLSOptions) (*tls.Config, error) { return tlsConfig(o, o.Host) }
 
 // baseHost is the host part of base ("" if unparsable).
 func baseHost(base string) string {
@@ -214,7 +247,7 @@ func pinVerifier(want []byte, checkLeaf bool, host string) func(tls.ConnectionSt
 		leaf := cs.PeerCertificates[0]
 		got := sha256.Sum256(leaf.Raw)
 		if subtle.ConstantTimeCompare(got[:], want) != 1 {
-			return fmt.Errorf("certificate pin mismatch: the daemon presented sha256:%x, the profile pins sha256:%x", got, want)
+			return fmt.Errorf("certificate %w: the daemon presented sha256:%x, the profile pins sha256:%x", errPinMismatch, got, want)
 		}
 		if !checkLeaf {
 			return nil
@@ -227,12 +260,27 @@ func pinVerifier(want []byte, checkLeaf bool, host string) func(tls.ConnectionSt
 		if name == "" {
 			name = host
 		}
-		if err := leaf.VerifyHostname(name); err != nil { // "" never verifies: fail closed
-			return fmt.Errorf("the pinned certificate does not cover %q (its SANs must include the host you connect to; add it with coordd -hosts): %v", name, err)
+		if name == "" { // a caller that named no host: fail closed
+			return errors.New("the pinned certificate cannot be checked: the connection names no host (set TLSOptions.Host)")
+		}
+		if err := leaf.VerifyHostname(name); err != nil {
+			return &CertHostError{Host: name, Err: err}
 		}
 		return nil
 	}
 }
+
+// CertHostError is a pinned certificate that does not cover the host dialed.
+type CertHostError struct {
+	Host string
+	Err  error // the x509 detail: the names it does cover
+}
+
+func (e *CertHostError) Error() string {
+	return fmt.Sprintf("the pinned certificate does not cover %q (its SANs must include the host you connect to; add it with coordd -hosts): %v", e.Host, e.Err)
+}
+
+func (e *CertHostError) Unwrap() error { return e.Err }
 
 // trustHint adds the next step to a TLS trust failure: the commonest one is a
 // self-signed coordd reached with no cert or pin configured, which the system
@@ -255,6 +303,13 @@ func (t trustHint) RoundTrip(r *http.Request) (*http.Response, error) {
 	return nil, err
 }
 
+// CloseIdleConnections lets http.Client.CloseIdleConnections reach the transport.
+func (t trustHint) CloseIdleConnections() {
+	if c, ok := t.rt.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+}
+
 // plainLoopback reports whether base is an http:// URL whose host is this
 // machine (localhost or a loopback IP).
 func plainLoopback(base string) bool {
@@ -273,6 +328,12 @@ func plainLoopback(base string) bool {
 // SetSpace selects the isolated space (filesystem + channels) this client uses.
 // Empty = the daemon's default space. Returns the client for chaining.
 func (c *Client) SetSpace(space string) *Client { c.space = space; return c }
+
+// WithSpace returns a client for another space on the same server, with the same login.
+// c is unchanged.
+func (c *Client) WithSpace(space string) *Client {
+	return &Client{base: c.base, token: c.token, agent: c.agent, space: space, session: c.session, hc: c.hc, limits: c.limits}
+}
 
 // Space reports the client's current space ("" = default).
 func (c *Client) Space() string { return c.space }
@@ -349,9 +410,11 @@ func (c *Client) do(method, path string, in, out any) error {
 func (c *Client) doH(method, path string, headers map[string]string, in, out any) error {
 	var body io.Reader
 	if in != nil {
-		b, _ := json.Marshal(in)
+		b, err := marshalBody(in) // invalid UTF-8 text is refused here, before anything is sent
+		if err != nil {
+			return err
+		}
 		body = bytes.NewReader(b)
-		_ = body
 	}
 	req, err := c.req(method, path, body)
 	if err != nil {
@@ -363,7 +426,7 @@ func (c *Client) doH(method, path string, headers map[string]string, in, out any
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := c.send(req)
 	if err != nil {
 		return err
 	}
@@ -375,10 +438,18 @@ func (c *Client) doH(method, path string, headers map[string]string, in, out any
 	if err != nil {
 		return err
 	}
-	if out != nil && len(data) > 0 {
-		return json.Unmarshal(data, out)
+	if out == nil {
+		return nil
 	}
-	return nil
+	if len(data) == 0 {
+		if resp.StatusCode == http.StatusNoContent {
+			return nil
+		}
+		// A 200 with no body where one is expected is a broken answer (a proxy cut it
+		// off, say), never an empty success: out would be read as a real zero value.
+		return fmt.Errorf("acp: %s %s: the server answered %d with an empty body where a result was expected", method, path, resp.StatusCode)
+	}
+	return json.Unmarshal(data, out)
 }
 
 // apiErrorFrom builds the uniform *APIError from a server response (the
@@ -395,6 +466,9 @@ func apiErrorFrom(status int, body []byte) *APIError {
 	if msg == "" {
 		msg = strings.TrimSpace(string(body))
 	}
+	if status == http.StatusUnauthorized && e.Code == "grant_expired" {
+		msg += "; ask an admin for a new login, retrying cannot help"
+	}
 	return &APIError{Status: status, Message: msg, Current: e.Current, Raw: body}
 }
 
@@ -406,7 +480,7 @@ func (c *Client) doPaged(method, path string, out any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := c.send(req)
 	if err != nil {
 		return "", err
 	}
@@ -434,9 +508,69 @@ type APIError struct {
 	Raw     []byte
 }
 
-func (e *APIError) Error() string  { return fmt.Sprintf("acp %d: %s", e.Status, e.Message) }
+func (e *APIError) Error() string {
+	if e.SpaceNotFound() { // a sentence for the reader, not a fault: the server wrote it for them
+		return e.Message
+	}
+	return fmt.Sprintf("acp %d: %s", e.Status, e.Message)
+}
 func (e *APIError) Conflict() bool { return e.Status == http.StatusConflict }
 func (e *APIError) Locked() bool   { return e.Status == http.StatusLocked } // 423: resource is leased
+
+// CodeUnknownRoute is the code a server (from v0.2.6, R-S18) gives a 404 for a route it
+// does not have. An older server answered that with a 404 and no code.
+const CodeUnknownRoute = "unknown_route"
+
+// RouteMissing reports that the server has no such route: a 404 with code unknown_route,
+// or, from an older server, a 404 with no code at all. Any other code is the route's own
+// answer (a missing document, a pruned version, a mistyped workspace), never "no route".
+// Use it for a route an older server may lack: on an older server a route it does have
+// also answers some missing objects with an uncoded 404, which only that route can read.
+func (e *APIError) RouteMissing() bool {
+	if e.Status != http.StatusNotFound {
+		return false
+	}
+	code := e.Code()
+	return code == "" || code == CodeUnknownRoute
+}
+
+// IsRouteMissing is APIError.RouteMissing for any error.
+func IsRouteMissing(err error) bool {
+	var e *APIError
+	return errors.As(err, &e) && e.RouteMissing()
+}
+
+// SpaceNotFound reports a 404 space_not_found (acp-1 §7): no workspace of that name
+// exists on this server, because nothing has written to it yet, or an operator
+// removed it, or the name is mistyped. A 404 with any other code keeps its meaning
+// (a missing blob, document or message).
+//
+// A caller about to write treats it as an empty space at manifest version 0 in cas
+// mode (ManifestForWrite, FSModeForWrite, PullCRDTOpsForWrite), and its write then
+// creates the space. A caller that is only reading reports it: a mistyped name must
+// not look like an empty workspace. Nothing is gained by retrying.
+func (e *APIError) SpaceNotFound() bool {
+	return e.Status == http.StatusNotFound && e.Code() == "space_not_found"
+}
+
+// IsSpaceNotFound reports whether err is, or wraps, a SpaceNotFound refusal.
+func IsSpaceNotFound(err error) bool {
+	var e *APIError
+	return errors.As(err, &e) && e.SpaceNotFound()
+}
+
+// GrantExpired reports a 401 grant_expired (ext-7 §4.1.2): this login reached its end
+// (Grant.ExpiresAt, Redeemed.ExpiresAt) and every call with it is refused from now on.
+// It is not a lost connection: no retry can cure it, only a new login can.
+func (e *APIError) GrantExpired() bool {
+	return e.Status == http.StatusUnauthorized && e.Code() == "grant_expired"
+}
+
+// IsGrantExpired reports whether err is, or wraps, a GrantExpired refusal.
+func IsGrantExpired(err error) bool {
+	var e *APIError
+	return errors.As(err, &e) && e.GrantExpired()
+}
 
 // OverQuota reports a PERSISTENT space-quota refusal (507 Insufficient
 // Storage — ext-7 §5.2: max_events, max_docs, max_blob_bytes). The condition
@@ -474,6 +608,20 @@ func (e *APIError) BulkConfirmMismatch() bool {
 // retry with a confirmation (§5.4).
 func (e *APIError) BulkDenied() bool {
 	return e.Status == http.StatusForbidden && e.bulkCode() == "bulk_denied"
+}
+
+// BlobNotUploaded reports a 400 that says the daemon does not hold a blob the request
+// named (never uploaded, collected since, or a read-scoped token's possession lost on a
+// restart). Nothing was applied. It is retryable by anyone who holds the bytes: upload
+// them again (which also renews the blob's grace against collection) and resend.
+// fs.ops says so with the code blob_not_uploaded; POST /v1/commit with no code and the
+// text `blob <hash> for "<path>" not uploaded`, documented in API_REFERENCE.md.
+func (e *APIError) BlobNotUploaded() bool {
+	if e.Status != http.StatusBadRequest {
+		return false
+	}
+	return e.bulkCode() == "blob_not_uploaded" ||
+		(strings.HasPrefix(e.Message, "blob ") && strings.Contains(e.Message, " for \"") && strings.HasSuffix(e.Message, "\" not uploaded"))
 }
 
 // BulkVerdict extracts the authority's net-loss counts from a bulk refusal body
@@ -565,7 +713,7 @@ func (c *Client) hasCapability(name string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		resp, err := c.hc.Do(req)
+		resp, err := c.send(req)
 		if err != nil {
 			return false, err
 		}
@@ -607,6 +755,10 @@ type FollowOptions struct {
 	// Context, when set, bounds the stream: cancelling it closes the request, and
 	// the follow returns the context's error. nil = no bound (as before).
 	Context context.Context
+	// OnStreamOpen, when set, gets the log id and head the stream's own answer carried
+	// (wire.HeaderLogID, "" from a server older than v0.2.6; wire.HeaderLogHead, -1 when
+	// absent), just before OnOpen: the log this stream is on, with no second request (D55).
+	OnStreamOpen func(StreamOpen)
 }
 
 // Follow streams events from `from`, calling fn for each. Blocks until ctx-less
@@ -647,6 +799,13 @@ func (c *Client) followStream(from uint64, f *EventFilter, opts *FollowOptions, 
 	if resp.StatusCode >= 300 {
 		data := readBoundedBestEffort(resp.Body)
 		return apiErrorFrom(resp.StatusCode, data) // uniform taxonomy on stream open too
+	}
+	if opts != nil && opts.OnStreamOpen != nil {
+		head := int64(-1)
+		if n, err := strconv.ParseInt(resp.Header.Get(wire.HeaderLogHead), 10, 64); err == nil && n >= 0 {
+			head = n
+		}
+		opts.OnStreamOpen(StreamOpen{LogID: resp.Header.Get(wire.HeaderLogID), Head: head})
 	}
 	if opts != nil && opts.OnOpen != nil {
 		opts.OnOpen() // stream established, before the first event (M2)
@@ -873,7 +1032,7 @@ func (c *Client) PutBlob(r io.Reader) (string, int64, error) {
 		return "", 0, err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := c.hc.Do(req)
+	resp, err := c.send(req)
 	if err != nil {
 		return "", 0, err
 	}
@@ -889,7 +1048,12 @@ func (c *Client) PutBlob(r io.Reader) (string, int64, error) {
 		Hash string `json:"hash"`
 		Size int64  `json:"size"`
 	}
-	json.Unmarshal(data, &out)
+	if err := json.Unmarshal(data, &out); err != nil {
+		return "", 0, fmt.Errorf("blob upload: the server's answer can't be read: %w", err)
+	}
+	if out.Hash == "" {
+		return "", 0, errors.New("blob upload: the server's answer names no hash")
+	}
 	return out.Hash, out.Size, nil
 }
 
@@ -898,7 +1062,7 @@ func (c *Client) GetBlob(hash string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := c.send(req)
 	if err != nil {
 		return nil, err
 	}
@@ -907,8 +1071,11 @@ func (c *Client) GetBlob(hash string) (io.ReadCloser, error) {
 		resp.Body.Close()
 		return nil, apiErrorFrom(resp.StatusCode, data) // uniform taxonomy (404, 403, ...)
 	}
-	return resp.Body, nil
+	return VerifyBlob(hash, resp.Body), nil // the end of the stream checks it against hash
 }
+
+// ErrNoBlobURL: the daemon cannot mint share links.
+var ErrNoBlobURL = errors.New("daemon lacks the bloburl capability (older coordd, or started without -cap-key-file)")
 
 // BlobURL is a minted blob capability URL (acp-ext-3): a short-lived,
 // tokenless, signed URL granting read of exactly one blob. Treat it as a
@@ -935,7 +1102,7 @@ func (c *Client) MintBlobURL(hash string, ttlSec int) (BlobURL, error) {
 		return out, err
 	}
 	if !ok {
-		return out, fmt.Errorf("daemon lacks the bloburl capability (older coordd, or started without -cap-key-file)")
+		return out, ErrNoBlobURL
 	}
 	if err := c.do("POST", "/v1/blobs/"+hash+"/url", map[string]int{"ttl_sec": ttlSec}, &out); err != nil {
 		return out, err
@@ -949,17 +1116,39 @@ func (c *Client) MintBlobURL(hash string, ttlSec int) (BlobURL, error) {
 	return out, nil
 }
 
+// MissingBlobs returns the hashes the daemon does not hold. A space that does not
+// exist yet holds none of them (SpaceNotFound).
 func (c *Client) MissingBlobs(hashes []string) ([]string, error) {
 	var out struct {
 		Missing []string `json:"missing"`
 	}
 	err := c.do("POST", "/v1/blobs/has", map[string][]string{"hashes": hashes}, &out)
+	if IsSpaceNotFound(err) {
+		return append([]string(nil), hashes...), nil
+	}
 	return out.Missing, err
 }
 
 func (c *Client) Manifest() (wire.Manifest, error) {
 	var out wire.Manifest
 	return out, c.do("GET", "/v1/manifest", nil, &out)
+}
+
+// EmptySpaceManifest is what a space that does not exist yet holds: nothing, at
+// version 0, the base a first commit names (acp-1 §7.4).
+func EmptySpaceManifest() wire.Manifest {
+	return wire.Manifest{Entries: map[string]wire.ManifestEntry{}}
+}
+
+// ManifestForWrite is Manifest for a caller about to write: a space that does not
+// exist yet is an empty manifest at version 0, and the write creates it. A caller
+// that is only reading uses Manifest and reports the refusal (SpaceNotFound).
+func (c *Client) ManifestForWrite() (wire.Manifest, error) {
+	m, err := c.Manifest()
+	if IsSpaceNotFound(err) {
+		return EmptySpaceManifest(), nil
+	}
+	return m, err
 }
 
 func (c *Client) Commit(req wire.CommitRequest) (wire.Manifest, error) {
@@ -1022,6 +1211,16 @@ func (c *Client) PullCRDTOps(doc string, from int) ([]crdt.Op, int, int, error) 
 	// otherwise hijack the from= offset of any client that later pulls it.
 	err := c.do("GET", "/v1/crdt/ops?doc="+url.QueryEscape(doc)+"&from="+strconv.Itoa(from), nil, &out)
 	return out.Ops, out.Total, out.Epoch, err
+}
+
+// PullCRDTOpsForWrite is PullCRDTOps for a caller about to write: a space that does
+// not exist yet holds no ops at epoch 0, and the push creates it.
+func (c *Client) PullCRDTOpsForWrite(doc string, from int) ([]crdt.Op, int, int, error) {
+	ops, total, epoch, err := c.PullCRDTOps(doc, from)
+	if IsSpaceNotFound(err) {
+		return nil, 0, 0, nil
+	}
+	return ops, total, epoch, err
 }
 
 // CRDTText returns the daemon's materialized text for a document.
@@ -1191,6 +1390,19 @@ func (c *Client) Agents() ([]wire.Agent, error) {
 	return out, c.do("GET", "/v1/agents", nil, &out)
 }
 
+// IsMember asks the server whether name belongs to this workspace: a live login that
+// reaches it, or an open invite to it. known is false when the server cannot say: it
+// runs on one shared token, or it is older than v0.2.6.
+func (c *Client) IsMember(name string) (member, known bool) {
+	var out struct {
+		Member *bool `json:"member"`
+	}
+	if err := c.do("GET", "/v1/agents/member?name="+url.QueryEscape(name), nil, &out); err != nil || out.Member == nil {
+		return false, false
+	}
+	return *out.Member, true
+}
+
 // --- awareness (ext-9, capability "awareness"): the ephemeral tier ---
 
 // Every awareness method gates on the daemon's capability list (probed once,
@@ -1204,10 +1416,14 @@ func (c *Client) requireAwareness() error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("daemon lacks awareness capability (older coordd) — degrade explicitly (no cursors), do not poll")
+		return ErrNoAwareness
 	}
 	return nil
 }
+
+// ErrNoAwareness: the daemon answered and does not advertise the awareness capability.
+// Nothing changes that by asking again: degrade explicitly (no cursors), do not poll.
+var ErrNoAwareness = errors.New("daemon lacks awareness capability (older coordd) — degrade explicitly (no cursors), do not poll")
 
 // SetAwareness publishes the caller's own ephemeral state (cursor, status,
 // ...) for the optional session discriminator ("" = the actor's single
@@ -1220,7 +1436,7 @@ func (c *Client) SetAwareness(state any, ttlSec int, session string) (wire.Aware
 	if err := c.requireAwareness(); err != nil {
 		return out, err
 	}
-	raw, err := json.Marshal(state) // nil → "null" → explicit leave
+	raw, err := marshalBody(state) // nil → "null" → explicit leave; text check
 	if err != nil {
 		return out, err
 	}
@@ -1413,8 +1629,8 @@ func (c *Client) Compact(doc string) (int, error) {
 func (c *Client) Health() error {
 	req, _ := http.NewRequest("GET", c.base+"/v1/healthz", nil)
 	req.Header.Set("Authorization", "Bearer "+c.token)
-	c2 := &http.Client{Timeout: 10 * time.Second, Transport: c.hc.Transport}
-	resp, err := c2.Do(req)
+	c2 := &http.Client{Timeout: 10 * time.Second, Transport: c.hc.Transport, CheckRedirect: refuseDowngrade}
+	resp, err := c.doResetOnce(c2, req)
 	if err != nil {
 		return err
 	}
@@ -1424,6 +1640,19 @@ func (c *Client) Health() error {
 		return apiErrorFrom(resp.StatusCode, data) // uniform taxonomy
 	}
 	return rerr
+}
+
+// ServerVersion is the server's release as GET /v1/healthz reports it (e.g. "v0.2.6"), or ""
+// for a server that predates the field. It is for people (status screens, support); decide
+// behaviour from capabilities, not from the version.
+func (c *Client) ServerVersion() (string, error) {
+	var out struct {
+		Version string `json:"version"`
+	}
+	if err := c.do("GET", "/v1/healthz", nil, &out); err != nil {
+		return "", err
+	}
+	return out.Version, nil
 }
 
 // Grant is the caller's OWN grant as reported by GET /v1/whoami (ext-7 §4.5
@@ -1438,6 +1667,9 @@ type Grant struct {
 	// daemon predating ext-34. Lets a client warn its user up front (before a
 	// long push) instead of only at the 403/428.
 	Bulk string `json:"bulk,omitempty"`
+	// ExpiresAt is when this login ends (RFC 3339, ext-7 §4.1.2). Empty: it does not
+	// end, or the daemon predates v0.2.6. After it every call answers GrantExpired.
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 // GrantScope mirrors the daemon's scope shape: write prefixes (path_prefix),

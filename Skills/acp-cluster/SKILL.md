@@ -41,12 +41,12 @@ SHARED=<token>
 PEERS=n1=https://h1:8443,n2=https://h2:8443,n3=https://h3:8443
 
 # node 1 — bootstrap
-coordd -token $SHARED -addr 0.0.0.0:8443 -data /srv/acp -hosts h1,IP1,localhost,127.0.0.1 \
+coordd -token $SHARED -addr 0.0.0.0:8443 -data /srv/acp -hosts h1,IP1 \
        -node-id n1 -raft-addr IP1:8444 -raft-bootstrap -peers $PEERS
 # node 2, node 3 — join
-coordd -token $SHARED -addr 0.0.0.0:8443 -data /srv/acp -hosts h2,IP2,localhost,127.0.0.1 \
+coordd -token $SHARED -addr 0.0.0.0:8443 -data /srv/acp -hosts h2,IP2 \
        -node-id n2 -raft-addr IP2:8444 -join https://h1:8443 -peers $PEERS
-coordd -token $SHARED -addr 0.0.0.0:8443 -data /srv/acp -hosts h3,IP3,localhost,127.0.0.1 \
+coordd -token $SHARED -addr 0.0.0.0:8443 -data /srv/acp -hosts h3,IP3 \
        -node-id n3 -raft-addr IP3:8444 -join https://h1:8443 -peers $PEERS
 ```
 
@@ -87,10 +87,18 @@ follower are forwarded automatically; if a node dies, point the client at anothe
 - **Status / leader:** `GET /v1/cluster/status`.
 - **Add a node:** start it with `-join https://<any-member>`; it's added as a voter.
 - **Failover:** automatic — nothing to do; clients retry against another node.
-- **Rolling upgrade:** upgrade one **follower** at a time (stop → replace binary →
-  start); do the **leader last** (it steps down cleanly on SIGTERM).
+- **Rolling upgrade:** back up every node; find the leader (`GET /v1/cluster/status`) and **leave it running**;
+  upgrade one **follower** at a time (stop → replace binary → start), each back as a follower of the same leader, at
+  the new `command_schema_v`, with the leader's `events` count in `GET /v1/stats`, before the next; do the **leader
+  last**, once a majority runs the new version (stopping it hands the lead to an upgraded node). Why: a newer leader's
+  first command stops every older node (v0.2.6 sends one at once, its log epoch), so a newer node must never lead an
+  older majority; a restarted follower cannot take the lead from a healthy leader (raft pre-vote). **If the leader is
+  lost early** and the older nodes stop (`OPERATOR ACTION: refusing to apply …`, no leader, writes `503`): start each
+  stopped node on the new binary with the same flags and data; it applies what it stopped at; nothing is lost.
+  Proven on a 3-node in-process cluster with emulated older nodes (`TestTheDocumentedRollingUpgradeOrderKeepsTheMajority`,
+  `TestANewerLeaderTooEarlyStopsTheOldNodesAndUpgradingThemRecovers`); not yet with real v0.2.5 binaries.
 - **Backup:** snapshot each node's `-data`, or rely on replication + periodic off-host
-  copy of one node's data. To rebuild a node: wipe its `-data/raft`, restart with `-join`.
+  copy of one node's data. To rebuild a node: wipe its `-data/raft`, restart with `-join`; its old stores stay beside `spaces/` as `spaces.pre-restore-<time>` until you delete them.
 - **Auth for prod:** one login per agent (see below), not the shared key.
 
 ## Logins on a cluster (v0.2.4)
@@ -103,13 +111,17 @@ file; use the API or invites.
 To run one login per agent: start the first node with `-raft-bootstrap` on a **new** data folder and **without**
 `-token`. Its first start makes the admin login `owner` (token in `/srv/acp/owner.token`, 0600) and, when it first
 leads, replicates it to the cluster. Only that node mints; a node that joins never makes its own owner, and it
-receives the cluster's table. A joining node authenticates its join with its own `-token` value (e.g.
-`-token "$(cat owner.token)"`, copied from the first node), which must then be an **unscoped admin token**, because
-the shared key stops working once logins exist. (The shared-key recipe above, `-token $SHARED` on every node, is
+receives the cluster's table. A joining node authenticates its join with its own token (`-token-file`, `-token`, else
+`<data>/token`), which must then be an **unscoped admin login's token** — copy `owner.token` from the first node
+(0600) and start the joiner with `-token-file <that file>`, or put it in the joiner's `<data>/token` before its first
+start. Both keep it off the process list; `-token` on the command line does not, and the server warns about it —
+because the shared key stops working once logins exist. A joiner with the wrong token logs
+`cluster join: … refused this node's token (401) …` with what to do (v0.2.5; it used to give up silently). (The shared-key recipe above, `-token $SHARED` on every node, is
 unchanged.) (This order isn't covered by a
 published walkthrough yet; rehearse it on scratch machines.) Upgrade every node to v0.2.4 before the first write
 after upgrading: this release raises the replicated command and snapshot versions, and an older node stops rather
-than diverge.
+than diverge. v0.2.5 raises the command version again (6: live-text delete checks and workspace removal) — the
+same rule: upgrade every node, followers first, then the leader.
 
 ## Limits to know
 
@@ -127,10 +139,13 @@ than diverge.
 | Symptom | Fix |
 |---|---|
 | writes fail with "no leader available" | a follower has no `-peers` entry for the leader, or no quorum (majority down) |
-| node won't join | check raft port reachability + token; the join target forwards to the leader |
+| node won't join | read its log (`cluster join: …` says why); check raft port reachability + token (an admin login's token on a per-agent cluster); the join target forwards to the leader |
+| `503` "just elected leader and is still applying the log it inherited" | normal for a moment after an election (v0.2.5): a new leader takes writes only once it has applied everything before its term; retry after `Retry-After` (1 s). Reads are not affected |
 | split-brain worry | impossible with a correct odd-N quorum; never run an even number expecting HA |
 | slow writes | quorum fsync latency; keep nodes on a low-latency network; don't oversize the cluster |
 | a node fell far behind | it auto-catches up via snapshot install; if corrupt, wipe `-data/raft` + re-join |
+| start stops: `-data/raft is empty but -data/spaces holds data` | say which you mean: `-join <member>` rebuilds this node from the cluster, `-raft-bootstrap` makes this data the first node of a new cluster |
+| start stops: `not from the same point in time` | `spaces/` and `raft/` came from different backups: restore `-data` whole, or wipe `-data/raft` + re-join |
 
 Tested: deterministic-replay unit tests, in-process 3-node failover tests, and a live 3-process cluster
 (follower-forwarded writes, replication, leader-kill failover with continued writes).

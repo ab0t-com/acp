@@ -31,6 +31,16 @@ const (
 	// HeaderSession is a random per-client-process id used to detect two processes
 	// sharing one agent id (collision warning).
 	HeaderSession = "X-ACP-Session"
+	// HeaderLogID carries the space's log id ("<space part>.<epoch>") on GET /v1/events,
+	// the follow stream included. Absent when the server does not know it (an older server,
+	// or a node that has no epoch yet): read absent as unknown. The same id with a lower
+	// head is a node behind (wait); a new id is a log that may have been restored or
+	// rebuilt: re-read from the new head. A plain restart or a new cluster leader also
+	// gives a new id.
+	HeaderLogID = "X-ACP-Log-Id"
+	// HeaderLogHead carries the log's head when the read began: for the follow stream,
+	// the seq up to which the backlog is sent before live events follow.
+	HeaderLogHead = "X-ACP-Log-Head"
 
 	// DefaultSpace is used when no space is selected.
 	DefaultSpace = "default"
@@ -267,4 +277,7 @@ type ErrorResponse struct {
 	// Current is populated on 409 lease/commit conflicts so the client can
 	// reconcile without a second round-trip.
 	Current any `json:"current,omitempty"`
+	// RetrySafe is set on a 503 for a request the server did not act on, so sending it again
+	// cannot apply it twice, even a write with no Idempotency-Key (acp-1 §6.3.1).
+	RetrySafe bool `json:"retry_safe,omitempty"`
 }
